@@ -1,0 +1,60 @@
+# Orchestrator Configuration (public template)
+# =============================================
+# Script paths point to the scripts in YOUR repo. Environment variables are
+# expanded from ${VAR} or ${VAR|default}. Secret values are NOT stored here —
+# set LLM_API_KEY and TELEGRAM_BOT_TOKEN in the environment (start_orchestrator.sh
+# sources .env), or override via the ${VAR} placeholders below.
+
+telegram_bot_token: "${TELEGRAM_BOT_TOKEN}"
+telegram_chat_id: "${TELEGRAM_CHAT_ID}"
+
+# Any Anthropic-compatible LLM API (DeepSeek, OmniRoute, OpenAI-compatible
+# gateways, etc.). Set LLM_API_BASE to your provider's /v1 endpoint.
+llm_api_key: "${LLM_API_KEY}"
+llm_api_base: "${LLM_API_BASE|https://api.your-provider.com/v1}"
+llm_model: "${LLM_MODEL}"
+
+# Your project's paths.
+repo_dir: "${REPO_DIR|/path/to/your/repo}"
+work_dir: "${WORK_DIR|~/orchestrator_data}"
+git_repo_root: "${REPO_DIR|/path/to/your/repo}"
+
+state_file: "${WORK_DIR|~/orchestrator_data}/workflow_state.json"
+task_file: "${WORK_DIR|~/orchestrator_data}/agent_todo_list.json"
+settings_file: "${WORK_DIR|~/orchestrator_data}/workflow_settings.json"
+log_file: "${WORK_DIR|~/orchestrator_data}/orchestrator.log"
+
+scripts:
+  audit: "${REPO_DIR|/path/to/your/repo}/scripts/your_audit_script.py"
+  cross_eval: "${REPO_DIR|/path/to/your/repo}/scripts/your_cross_eval_script.py"
+  execution: "${REPO_DIR|/path/to/your/repo}/scripts/execute_master_plan.py"
+
+output_patterns:
+  audit: "multi_agent_audit_*.md"
+  plan: "master_plan_*.md"
+
+timeouts:
+  audit: 3600
+  cross_eval: 3600
+  execution: 21600
+  graphify: 300
+
+monitoring:
+  status_interval: 10
+  log_retention: 50
+
+error_handling:
+  attempt_llm_fix: true
+  # 0 = a halted phase (e.g. a step that exhausted the escalation ladder)
+  # pauses immediately for human assistance instead of auto-retrying.
+  auto_retry_count: 0
+  pause_on_error: true
+
+default_edit_mode: "restricted"
+
+graphify:
+  enabled: true
+  rebuild_after_execution_step: true
+  commands:
+    - ["graphify", ".", "--code-only"]
+    - ["graphify", "cluster-only", "."]
