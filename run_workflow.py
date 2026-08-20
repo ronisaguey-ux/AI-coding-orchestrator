@@ -2,7 +2,7 @@
 """
 PROJECT MASTER ORCHESTRATOR v1.0
 ================================
-Fully automated, self-adaptive, remotely controllable master orchestrator for your project.
+Fully automated, self-adaptive, remotely controllable master orchestrator for Project quantitative trading system.
 
 Features:
   - Infinite loop: audit → cross-eval → execute → analyze → graphify rebuild → repeat
@@ -34,6 +34,7 @@ import difflib
 import time
 import tempfile
 from datetime import datetime, timedelta
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 from collections import defaultdict
@@ -42,6 +43,19 @@ import subprocess
 from telegram import Update, Chat
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 from telegram.error import TelegramError
+
+# Repo root on sys.path so `core.*` resolves even when launched as a script
+# from another cwd (same trick main() applies at the bottom before the loop).
+import sys as _sys
+_repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _repo_root not in _sys.path:
+    _sys.path.insert(0, _repo_root)
+from core.sot_guardrails import (
+    EXPLICIT_CONSENT,
+    SOT_CORE_FILE_MARKERS,
+    SOT_CORE_PARAMS,
+    assert_core_mutation_allowed,
+)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -58,7 +72,7 @@ from telegram.error import TelegramError
 # LLM API key is passed through the environment so any LLM-based
 # tooling the fix touches works with the right credentials.
 SUMMON_LOG_FILE = os.path.join(
-    os.getenv("WORK_DIR", os.path.join(os.path.expanduser("~"), "orchestrator_data")),
+    os.getenv("WORK_DIR", "~/project_work"),
     "claude_summon.log",
 )
 
@@ -143,8 +157,16 @@ class OrchestratorConfig:
         return value
 
     @staticmethod
-    def load(config_path: str) -> Dict:
-        """Load configuration from YAML file."""
+    def load(config_path: str, require_telegram: bool = True) -> Dict:
+        """Load configuration from YAML file.
+
+        STEP 412/1566: the Telegram bot is an OPT-IN external component. With
+        require_telegram=True (the default, preserving pre-412 behavior) the
+        token must resolve from PROJECT_TELEGRAM_TOKEN / TELEGRAM_BOT_TOKEN
+        (env) or telegram_bot_token (config), and telegram_chat_id must be in
+        the config. With require_telegram=False the orchestrator runs
+        headless and the telegram keys are not required at all.
+        """
         if not os.path.exists(config_path):
             LOGGER.error(f"Config file not found: {config_path}")
             sys.exit(1)
@@ -155,7 +177,6 @@ class OrchestratorConfig:
         cfg = OrchestratorConfig._expand(cfg)
 
         required = [
-            'telegram_bot_token', 'telegram_chat_id',
             'llm_api_key',
             'repo_dir', 'work_dir',
             'scripts'
@@ -164,16 +185,24 @@ class OrchestratorConfig:
             if key not in cfg:
                 LOGGER.error(f"Missing required config key: {key}")
                 sys.exit(1)
-        if not cfg['telegram_bot_token'] or cfg['telegram_bot_token'] == "${TELEGRAM_BOT_TOKEN}":
-            LOGGER.error("TELEGRAM_BOT_TOKEN is empty or unexpanded. Set it in the environment or config.")
-            sys.exit(1)
+        if require_telegram:
+            _tok = (os.environ.get('PROJECT_TELEGRAM_TOKEN')
+                    or os.environ.get('TELEGRAM_BOT_TOKEN')
+                    or cfg.get('telegram_bot_token'))
+            if not _tok or _tok == "${TELEGRAM_BOT_TOKEN}":
+                LOGGER.error("PROJECT_TELEGRAM_TOKEN is required for --telegram-bot "
+                             "(set it in the environment or telegram_bot_token in the config).")
+                sys.exit(1)
+            if 'telegram_chat_id' not in cfg:
+                LOGGER.error("Missing required config key: telegram_chat_id")
+                sys.exit(1)
 
         # LLM key fallback: if the placeholder wasn't expanded, read the
         # standard tokens file used by the other pipeline scripts.
         if not cfg.get('llm_api_key') or cfg['llm_api_key'] in ("${LLM_API_KEY}", "None"):
             for cand in [
-                os.path.expanduser('~/.config/orchestrator/llm_api_key'),
-                os.path.expanduser('~/.config/orchestrator/llm_api_key'),
+                os.path.join(os.path.expanduser('~'), '.config', 'orchestrator', 'llm_api_key'),
+                '~/.config/orchestrator/llm_api_key',
             ]:
                 if os.path.exists(cand):
                     try:
@@ -252,7 +281,7 @@ class SettingsManager:
         # When set to a phase, the orchestrator pauses AFTER that phase
         # completes and waits for /resume. "cycle" pauses after a full cycle.
         "pause_after": "none",
-        # Strict escalation is the default: the engine tries OmniRoute (5) ->
+        # Strict escalation is the default: the engine tries LLM lane (5) ->
         # fast tier (2) -> reasoning tier (2), then HALTS for human
         # assistance. "continue" is an emergency override only (records the
         # failed step and skips it) and is never used automatically.
@@ -269,6 +298,9 @@ class SettingsManager:
         # "on" commits any plan changes to the self-run workflow scripts on a
         # dedicated branch and merges back only after the cycle completes.
         "selfmod_branching": "on",
+        # EXPLICIT_CONSENT lets a selfmod plan mutate SOT core params/files;
+        # empty (the default) fails closed. Set in workflow_settings.json.
+        "selfmod_consent": "",
         # The readme is now refreshed by dedicated plan steps appended by the
         # cross-eval (they document the plan's own changes). The orchestrator
         # auto-update is off by default to avoid double work.
@@ -720,16 +752,16 @@ FUNDAMENTALS = (
     "## HARD RULES (always in context)\n"
     "- A plan step is NEVER skipped. The pipeline only advances after a step is "
     "executed AND verified AND committed.\n"
-    "- Strict escalation ladder per step: OmniRoute 5-agent team (5 attempts) -> "
-    "fast tier (2 retries) -> reasoning tier (2 retries) -> HALT for "
-    "human assistance.\n"
+    "- Escalation per step (08-20 cost-slash: Pro tier removed, flash-only): "
+    "webchat-expert lane (free) -> fast tier (paid, 2 retries) -> HALT "
+    "for human assistance.\n"
     "- Settings (settings.json, re-read before every phase): loop_mode=full|once, "
     "pause_after=none|audit|cross_eval|execution|cycle, on_step_failure=continue|halt, "
     "max_cycles=int, notify_interval=sec>=60, edit_mode=restricted|full.\n"
     "- Live orchestrator state is provided in the CONTEXT block; answer progress "
     "questions from it, never from memory. If the CONTEXT says ALL_STEPS_DONE: YES, "
     "the plan is COMPLETE — never report any specific step number (641, etc.) or "
-    "claim work remains; say all 661 steps are done.\n"
+    "claim work remains; say all steps are done.\n"
     "- The orchestrator notifies on phase start, ~50% done, and finish for audit, "
     "cross-eval+plan, and execution.\n"
     "- You can call file tools (view_file, list_dir, grep_code, read_plan_step, "
@@ -740,9 +772,33 @@ FUNDAMENTALS = (
     + TIER_INSTRUCTION + "\n\n" + CONTEXT_INSTRUCTION
 )
 
+# 08-20 (audit 4.1/3.1/roadmap 1.2): byte-identical static system prompts per
+# effort level, cached — LLM's 50x prefix-cache discount requires the
+# system prefix to never change between calls. Live snapshots are appended as
+# a trailing user message (see direct_query), never inside the system message.
+_STATIC_SYSTEM_CACHE = {}
+
+
+def _static_system(effort: int) -> str:
+    if effort not in _STATIC_SYSTEM_CACHE:
+        _STATIC_SYSTEM_CACHE[effort] = "\n\n".join(
+            b.rstrip() for b in (FUNDAMENTALS,
+                                 EFFORT_INSTRUCTIONS[effort],
+                                 LLMAgent.TOOL_INSTRUCTION) if b and b.strip())
+    return _STATIC_SYSTEM_CACHE[effort]
+
+
+# Exact token counting (audit tool #8 / roadmap 2.4): tiktoken cl100k_base
+# when installed, else the old len//3 estimate.
+try:
+    import tiktoken
+    _TK_ENC = tiktoken.get_encoding("cl100k_base")
+except Exception:
+    _TK_ENC = None
+
 
 class LLMAgent:
-    """Self-tuning LLM agent.
+    """Self-tuning LLM LLM agent.
 
     Runs on the Flash tier by default. It may request an upgrade to the Pro
     (reasoner) tier for hard tasks, and may command a downgrade back to Flash
@@ -897,7 +953,7 @@ class LLMAgent:
                 if mode == 'restricted' and not any(a in path for a in
                         ('parallel_agents.py', 'parallel_agent_cross_eval.py', 'execute_master_plan.py')):
                     return "ERROR: restricted edit_mode — only the 3 workflow scripts are editable."
-                if 'run_workflow.py' in path or 'config' in path:
+                if 'run_workflow.py' in path or 'project_config' in path:
                     return "ERROR: orchestrator/config files are not editable."
                 start = int(args.get("start_line", 1) or 1)
                 end = int(args.get("end_line", start) or start)
@@ -1048,9 +1104,15 @@ class LLMAgent:
 
     @staticmethod
     def _estimate_tokens(text: str) -> int:
-        """Rough token estimate (~3 chars per token for code/JSON-heavy text)."""
+        """Token estimate — tiktoken cl100k_base when available (audit tool
+        #8), else the len//3 fallback. Exact counts prevent context overflows."""
         if not text:
             return 0
+        if _TK_ENC is not None:
+            try:
+                return len(_TK_ENC.encode(text))
+            except Exception:
+                pass
         return max(1, len(text) // 3)
 
     @classmethod
@@ -1183,13 +1245,9 @@ class LLMAgent:
     # LLM pricing per 1M tokens. Cache hits are ~50x cheaper (hybrid /
     # sparse attention), which is why we always keep fundamentals + snapshot
     # in the prompt — a warm cache is the cheapest path.
-    # Prices per 1M tokens for COST REPORTING only (no functional effect).
-    # Update these for your provider, keyed by the model names from
-    # LLM_MODEL_FAST / LLM_MODEL_REASONER. Cache hits are typically ~50x
-    # cheaper — a warm prompt cache is the cheapest path.
     PRICING = {
-        "your-fast-model": {"in_hit": 0.0, "in_miss": 0.0, "out": 0.0},
-        "your-reasoning-model": {"in_hit": 0.0, "in_miss": 0.0, "out": 0.0},
+        "your-fast-model": {"in_hit": 0.0028, "in_miss": 0.14, "out": 0.28},
+        "your-reasoning-model": {"in_hit": 0.003625, "in_miss": 0.435, "out": 0.87},
     }
 
     def _accumulate_usage(self, usage: Dict):
@@ -1230,7 +1288,7 @@ class LLMAgent:
         prompt = (
             "You document the Project quantitative trading codebase. For EACH file below "
             "produce exactly one numbered entry:\n"
-            "#N. {REPO_DIR}/<relative path>\n"
+            "#N. ~/project/<relative path>\n"
             "Purpose: <one line — what the module does>\n"
             "Mechanism: <1-2 lines — how it works>\n"
             "I/O: <one line — inputs -> outputs>\n\n"
@@ -1455,20 +1513,22 @@ Be concise and factual.
         # Append this turn to the conversation, then trim to the window.
         self.history.append({"role": "user", "content": user_query})
 
-        system = (FUNDAMENTALS
-                  + f"\n\n{EFFORT_INSTRUCTIONS[effort]}"
-                  + f"\n\n{self.TOOL_INSTRUCTION}")
-        if context_snapshot:
-            system = f"{system}\n\n=== CONTEXT (fresh) ===\n{context_snapshot}\n=== END CONTEXT ==="
-
+        # 08-20 (audit 4.1/3.1): the system message is byte-identical across
+        # calls (prefix-cache hit). The live snapshot goes in a TRAILING user
+        # message — never inside the system prompt (a changing prefix kills
+        # the cache on every call).
+        system = _static_system(effort)
         snapshot_tokens = self._estimate_tokens(context_snapshot or "")
-        self._ctx_overhead = self._estimate_tokens(FUNDAMENTALS) + snapshot_tokens
+        self._ctx_overhead = self._estimate_tokens(system) + snapshot_tokens
 
         # Rolling history trimmed to the current budget. Fundamentals are always
         # prepended as system and never trimmed. Tool loads and conversation all
         # share the same rolling window.
         messages = [{"role": "system", "content": system}] + \
                    self._trimmed_history(reserve_tokens=snapshot_tokens)
+        if context_snapshot:
+            messages.append({"role": "user",
+                             "content": f"=== CONTEXT (fresh) ===\n{context_snapshot}\n=== END CONTEXT ==="})
 
         # PROACTIVE GROUNDING: when the user asks a creative/grounding question
         # about the codebase (analogy, metaphor, summary, explain), put the real
@@ -1505,9 +1565,9 @@ Be concise and factual.
                     "Content-Type": "application/json",
                 }
 
-                # Tool-capable chat model. your-reasoning-model (Pro tier) does NOT
+                # Tool-capable chat model. reasoner-model (Pro tier) does NOT
                 # support function calling, so the self-directing chat agent always
-                # runs on your-fast-model — otherwise tools silently vanish and the
+                # runs on chat-model — otherwise tools silently vanish and the
                 # agent answers codebase questions from memory alone. The tier
                 # system still drives the pipeline's escalation; for interactive
                 # chat, working tools beat a reasoning model that can't call them.
@@ -1538,7 +1598,7 @@ Be concise and factual.
                         timeout=aiohttp.ClientTimeout(total=90)
                     )
                     if resp.status == 400:
-                        # your-reasoning-model (Pro tier) does not support tools — retry without.
+                        # reasoner-model (Pro tier) does not support tools — retry without.
                         resp = await session.post(
                             f"{self.api_base}/chat/completions",
                             headers=headers,
@@ -1752,20 +1812,32 @@ class WorkflowExecutor:
         self.config = config
         self.state = state_manager
         self.logger = LOGGER
+        # 2026-08-14 (user HARD RULE): web-verified date fetched before each
+        # phase; every dated artifact is labelled from this, never stale
+        # constants. Set by the phase loop; consumed by _base_env.
+        self._verified_date = None
     
     async def run_audit(self, settings: Dict = None) -> Tuple[bool, str]:
-        """Run audit script (parallel_agents.py)."""
+        """Run audit script (parallel_agents.py OR the webchat parallel audit)."""
         self.state.update(phase="audit", phase_start_time=datetime.now().isoformat())
 
-        script_path = self.config['scripts']['audit']
+        # 2026-08-16 (user directive): LLM+Gemini webchat parallel audit is
+        # the default pipeline; the LLM lane rotation is retained (off) behind
+        # the webchat_pipeline_enabled flag.
+        webchat_on = self.config.get('webchat_pipeline_enabled', False)
+        if webchat_on and self.config.get('scripts', {}).get('audit_webchat'):
+            script_path = self.config['scripts']['audit_webchat']
+        else:
+            script_path = self.config['scripts']['audit']
         self.logger.info(f"Starting audit phase: {script_path}")
 
         # Run a FRESH audit by default: --resume would skip passes that already
         # have cached summary.json, "completing" in seconds with no new AI work.
         # Set settings fresh_audit=off to allow cached-resume.
         extra = [] if (settings or {}).get('fresh_audit', 'on') != 'off' else ["--resume"]
+        timeout = 21600 if webchat_on else 14400   # webchat audit: resumable, give it room
         try:
-            result = await self._run_script(script_path, timeout=14400,
+            result = await self._run_script(script_path, timeout=timeout,
                                             env_extra=self._base_env(settings),
                                             extra_args=extra)
             
@@ -1806,17 +1878,125 @@ class WorkflowExecutor:
         for k in list(env):
             if os.environ.get(k):
                 env[k] = os.environ[k]
+        # 2026-08-14 (user HARD RULE): artifact labels must come from the
+        # web-verified date fetched before this phase — never hardcoded or
+        # stale constants. parallel_agents.py reads AUDIT_VERSION,
+        # parallel_agent_cross_eval.py reads PLAN_VERSION.
+        if getattr(self, '_verified_date', None):
+            label = f"{self._verified_date.month}_{self._verified_date.day}"
+            env["AUDIT_VERSION"] = label
+            env["PLAN_VERSION"] = label
         return env
+
+    WEB_TIME_SOURCES = [
+        # timeapi.io — verified reachable from this box (2026-08-14).
+        "https://timeapi.io/api/Time/current/zone?timeZone=America/New_York",
+        # worldtimeapi /api/ip returns the caller's LOCAL timezone+datetime
+        # (unreachable from this box as of 08-14; kept as a secondary).
+        "https://worldtimeapi.org/api/ip",
+    ]
+    # Last-resort web-time sources: the HTTP `Date:` header of ANY reachable
+    # HTTPS host (RFC 7231 — server's UTC time). Still web-verified — never
+    # trust a possibly-drifted local clock without at least one web attempt.
+    DATE_HEADER_SOURCES = ["https://example.com", "https://api.github.com"]
+
+    async def _fetch_web_date(self) -> datetime:
+        """2026-08-14 (user HARD RULE): before every phase the orchestrator
+        must demand the correct current time from the web — local clock drift
+        and hardcoded version constants have produced wrongly-labelled
+        artifacts (master_plan_8_4.md was regenerated on 08-14 but
+        named 8_4). Returns the web-verified LOCAL datetime. Falls back to the
+        local clock with a loud warning so a dead time API never silently
+        mislabels output."""
+        for url in self.WEB_TIME_SOURCES:
+            try:
+                timeout = aiohttp.ClientTimeout(total=8)
+                async with aiohttp.ClientSession() as sess:
+                    async with sess.get(url, timeout=timeout) as resp:
+                        if resp.status != 200:
+                            continue
+                        j = await resp.json()
+                        raw = j.get("datetime") or j.get("dateTime") or ""
+                        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+                        return dt.astimezone()
+            except Exception as e:
+                self.logger.warning(f"web time source {url} failed: {e}")
+        for url in self.DATE_HEADER_SOURCES:
+            try:
+                async with aiohttp.ClientSession() as sess:
+                    async with sess.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                        dh = resp.headers.get("Date")
+                        if dh:
+                            return parsedate_to_datetime(dh).astimezone()
+            except Exception as e:
+                self.logger.warning(f"date-header source {url} failed: {e}")
+        local = datetime.now()
+        self.logger.error(
+            f"⚠️ WEB TIME FETCH FAILED — labeling with LOCAL clock "
+            f"({local:%Y-%m-%d %H:%M}). Artifact dates may be wrong.")
+        return local
+
+    def _last_execution_finish(self) -> float:
+        """Epoch seconds of the most recent 'PLAN EXECUTION PIPELINE FINISHED'
+        marker in plan_execution.log. 0.0 when none — meaning no execution has
+        ever finished, so any existing plan is unexecuted (fresh)."""
+        try:
+            log_path = os.path.join(self.config.get('work_dir', '/tmp'),
+                                    'plan_execution.log')
+            if not os.path.exists(log_path):
+                return 0.0
+            last = 0.0
+            with open(log_path, 'r', errors='replace') as f:
+                for line in f:
+                    m = re.match(
+                        r'\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\].*PLAN EXECUTION PIPELINE FINISHED',
+                        line)
+                    if m:
+                        last = datetime.strptime(
+                            m.group(1), '%Y-%m-%d %H:%M:%S').timestamp()
+            return last
+        except Exception as e:
+            self.logger.warning(f"execution-finish scan failed: {e}")
+            return 0.0
 
     async def run_cross_eval(self, settings: Dict = None) -> Tuple[bool, str]:
         """Run cross-eval and plan generation script."""
         self.state.update(phase="cross_eval", phase_start_time=datetime.now().isoformat())
 
-        script_path = self.config['scripts']['cross_eval']
+        # 2026-08-14 (user HARD RULE: "the plan is supposed to be running, not
+        # cross eval"): NEVER re-run the expensive 300-subagent synthesis when
+        # a plan already exists that is NEWER than the last finished execution
+        # — i.e. a fresh, unexecuted plan. Regenerating it (or re-verifying
+        # accepted findings) is pure waste; this is why cycle 326 sat in
+        # cross_eval for hours while master_plan_8_4.md (written
+        # 2026-08-14 19:32) sat unexecuted.
+        plan_path = self._find_latest_file(
+            self.config['work_dir'], "master_plan_*.md")
+        if plan_path:
+            plan_ts = os.path.getmtime(plan_path)
+            finish_ts = self._last_execution_finish()
+            if plan_ts > finish_ts:
+                plan_dt = datetime.fromtimestamp(plan_ts)
+                finish_dt = datetime.fromtimestamp(finish_ts)
+                self.logger.info(
+                    f"⏭️ Skipping cross_eval: fresh unexecuted plan exists "
+                    f"({os.path.basename(plan_path)}, plan {plan_dt:%Y-%m-%d %H:%M} "
+                    f"> last execution finish {finish_dt:%Y-%m-%d %H:%M}).")
+                self.state.update(last_plan_file=plan_path)
+                return True, plan_path
+
+        # 2026-08-16 (user directive): LLM+Gemini webchat cross-eval is the
+        # default; the 300-subagent swarm (parallel_agent_cross_eval.py) is
+        # retained (off) behind the webchat_pipeline_enabled flag.
+        webchat_on = self.config.get('webchat_pipeline_enabled', False)
+        if webchat_on and self.config.get('scripts', {}).get('cross_eval_webchat'):
+            script_path = self.config['scripts']['cross_eval_webchat']
+        else:
+            script_path = self.config['scripts']['cross_eval']
         self.logger.info(f"Starting cross-eval phase: {script_path}")
 
         try:
-            result = await self._run_script(script_path, timeout=14400,
+            result = await self._run_script(script_path, timeout=21600,
                                             env_extra=self._base_env(settings),
                                             extra_args=["--resume"])
             
@@ -1851,7 +2031,10 @@ class WorkflowExecutor:
         script_path = self.config['scripts']['execution']
         self.logger.info(f"Starting execution phase: {script_path}")
 
-        exec_args = ["--resume"]
+        # 2026-08-14 (fix vacuous precheck skips): run every pending step
+        # for real — step_already_verified marks steps complete without work
+        # when verification commands are no-ops (grep no-match treated as pass).
+        exec_args = ["--resume", "--no-precheck"]
         if (settings or {}).get('on_step_failure', 'continue') == 'continue':
             exec_args.append("--continue-on-failure")
 
@@ -2109,9 +2292,34 @@ class WorkflowExecutor:
 # TELEGRAM BOT HANDLERS
 # ─────────────────────────────────────────────────────────────────────────────
 
+class _NullTelegram:
+    """Headless stand-in for TelegramBot (STEP 412/1566).
+
+    The Telegram bot is an opt-in external component: without --telegram-bot
+    the orchestrator must still run, but every Telegram call site (~25
+    send_message call sites in MasterOrchestrator plus the main loop's
+    _want_restart/_stop_permanent/_relay_outbox) needs a receiver. This stub
+    satisfies the full surface with no-ops and zero network I/O.
+    """
+    _want_restart = False
+    _stop_permanent = False
+
+    async def initialize(self):
+        return None
+
+    def attach_orchestrator(self, orchestrator: "MasterOrchestrator"):
+        return None
+
+    async def send_message(self, text: str, parse_mode: str = "Markdown"):
+        return None
+
+    async def _relay_outbox(self):
+        return None
+
+
 class TelegramBot:
     """Telegram bot for remote control and monitoring."""
-    
+
     def __init__(
         self,
         token: str,
@@ -2738,7 +2946,7 @@ Last Error: {st.get('last_error') or 'None'}
             if not any(allowed in file_path for allowed in allowed_files):
                 await self.send_message("❌ Restricted mode: only the 3 workflow scripts are editable. Use `/edit_mode full` for others.")
                 return
-        if 'run_workflow.py' in file_path or 'config' in file_path:
+        if 'run_workflow.py' in file_path or 'project_config' in file_path:
             await self.send_message("❌ Cannot edit orchestrator or config files.")
             return
 
@@ -3398,7 +3606,7 @@ Last Error: {st.get('last_error') or 'None'}
         checks = [
             ("Orchestrator", self._proc_running("run_workflow.py")),
             ("Engine", self._proc_running("execute_master_plan.py")),
-            ("OmniRoute", self._port_open(20128)),
+            ("LLM lane", self._port_open(20128)),
         ]
         lines = ["💚 **Health**"]
         for name, ok in checks:
@@ -3425,7 +3633,7 @@ Last Error: {st.get('last_error') or 'None'}
             f"ℹ️ **Version**\nGit: {gitlog or 'n/a'}\n"
             f"Orchestrator: {'running' if self._proc_running('run_workflow.py') else 'down'}\n"
             f"Engine: {'running' if self._proc_running('execute_master_plan.py') else 'down'}\n"
-            f"OmniRoute (20128): {'up' if self._port_open(20128) else 'down'}\n"
+            f"LLM lane (20128): {'up' if self._port_open(20128) else 'down'}\n"
             f"Python: {sys.version.split()[0]}"
         )
 
@@ -3692,7 +3900,7 @@ Last Error: {st.get('last_error') or 'None'}
             self.llm._save_state()
             await self.send_message(f"🔺 Conversational agent forced to reasoning tier.")
         await self.cmd_retry(update, context)
-        await self.send_message(f"🔺 Step {n} will re-run through the full escalation ladder (OmniRoute → Flash → Pro).")
+        await self.send_message(f"🔺 Step {n} will re-run through the full escalation ladder (primary lane → fast tier).")
 
     async def cmd_error(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         st = self.state.state
@@ -4104,7 +4312,7 @@ Last Error: {st.get('last_error') or 'None'}
     #   - /message_claude <text>  -> writes to claude_inbox.json for me to read
     #   - this session writes replies to claude_outbox.json; a background
     #     watcher in the orchestrator forwards them to Telegram.
-    RELAY_DIR = os.getenv("WORK_DIR", os.path.join(os.path.expanduser("~"), "orchestrator_data"))
+    RELAY_DIR = os.getenv("WORK_DIR", "~/project_work")
     CLAUDE_INBOX = os.path.join(RELAY_DIR, "claude_inbox.json")
     CLAUDE_OUTBOX = os.path.join(RELAY_DIR, "claude_outbox.json")
 
@@ -4177,6 +4385,12 @@ Last Error: {st.get('last_error') or 'None'}
             # Malformed / unreadable → hand the file back for diagnosis.
             os.replace(claimed, self.CLAUDE_OUTBOX)
             return
+        if isinstance(items, dict):
+            # Some writers emit a single dict instead of a list — normalize
+            # it so items[0] never raises TypeError (2026-08-20: a dict claim
+            # was silently deleted by the finally-remove below, killing the
+            # message with only a DEBUG log).
+            items = [items]
         if not items:
             try:
                 os.remove(pending)
@@ -4258,6 +4472,12 @@ class MasterOrchestrator:
         self._last_notify = 0.0
         self.logger = LOGGER  # safety: ensure logger is always available
 
+
+    async def _fetch_web_date(self):
+        """Delegate to the WorkflowExecutor's web-date fetcher (the loop calls
+        self._fetch_web_date() but the implementation lives on the executor)."""
+        return await self.executor._fetch_web_date()
+
     async def _notify(self, text: str, settings: Dict):
         """Send a Telegram message, throttled to settings['notify_interval']."""
         if settings.get('notifications', 'on') == 'off':
@@ -4313,9 +4533,9 @@ class MasterOrchestrator:
     async def _notify_phase_progress(self, phase: str, settings: Dict):
         """Send one 50%-done message for a work phase, computed from its state file.
 
-        audit:      work_dir/audit_state.json
-        cross_eval: work_dir/cross_eval_state.json
-        execution:  work_dir/plan_execution_state.json
+        audit:      audits_plans/audit_state.json
+        cross_eval: audits_plans/cross_eval_state.json
+        execution:  audits_plans/plan_execution_state.json
         """
         audits = self.config.get('work_dir', '/tmp')
         state_files = {
@@ -4379,13 +4599,55 @@ class MasterOrchestrator:
         low = text.lower()
         return any(s in low for s in self._SELF_RUN_SCRIPTS)
 
+    def _plan_sot_core_changes(self, plan_path: Optional[str]) -> set:
+        """Return the SOT core params/files the plan text references.
+
+        A selfmod plan may name a core parameter (e.g. ``bias``) or the
+        source file that defines it (e.g. ``config/core.py``); both are
+        treated as SOT-core mutations requiring explicit consent."""
+        if not plan_path or not os.path.exists(plan_path):
+            return set()
+        try:
+            with open(plan_path, "r", errors="replace") as f:
+                text = f.read()
+        except Exception:
+            return set()
+        low = text.lower()
+        touched = set()
+        for param in SOT_CORE_PARAMS:
+            if re.search(rf"\b{re.escape(param)}\b", low):
+                touched.add(param)
+        for marker in SOT_CORE_FILE_MARKERS:
+            if marker.lower() in low:
+                touched.add(marker)
+        return touched
+
     async def _maybe_start_selfmod(self, settings: Dict, cycle_num: int) -> bool:
         """If selfmod_branching is on and the plan touches self-run scripts,
         ensure a dedicated branch is checked out (idempotent across restarts).
         Returns True when a selfmod branch is active."""
+        # STEP 254/1566: fail closed before ANY mutation — even with branching
+        # off, execution would otherwise apply the plan's changes on the
+        # current branch. A plan touching SOT core params/files without
+        # EXPLICIT_CONSENT raises PermissionError (caught by the outer loop,
+        # which pauses the orchestrator).
+        plan = self.state.state.get('last_plan_file')
+        if self._plan_is_selfmod(plan):
+            touched = self._plan_sot_core_changes(plan)
+            if touched:
+                consent = settings.get('selfmod_consent') or ''
+                try:
+                    assert_core_mutation_allowed({t: True for t in touched}, consent)
+                except PermissionError as e:
+                    await self.telegram.send_message(
+                        f"🛑 **Self-modification refused** — the plan touches SOT core "
+                        f"parameters/files ({sorted(touched)}) but `selfmod_consent` is "
+                        f"not `EXPLICIT_CONSENT`. Execution paused; set the consent token "
+                        f"in settings to allow."
+                    )
+                    raise
         if settings.get('selfmod_branching', 'on') != 'on':
             return False
-        plan = self.state.state.get('last_plan_file')
         if not self._plan_is_selfmod(plan):
             # a selfmod branch left pending from a previously halted cycle
             # (execution failed, plan regenerated non-selfmod): merge it now.
@@ -4430,7 +4692,7 @@ class MasterOrchestrator:
     # "documented features" list. As execution creates/changes files, the
     # readme goes stale — so after every successful execution phase we refresh
     # the entries for new/changed files and commit it.
-    README_REL = os.path.join("docs", "project_context.md")
+    README_REL = os.path.join("docs", "project_readme.md")
     README_EXT = ('.py', '.dart', '.yaml', '.jinja2', '.html', '.json', '.ini', '.md')
 
     def _readme_path(self) -> str:
@@ -4480,7 +4742,7 @@ class MasterOrchestrator:
                 if any(x in full for x in ('legacy', 'env', '.venv', 'node_modules', 'site-packages')):
                     continue
                 rel = os.path.relpath(full, project)
-                key = f"{REPO_DIR}/{rel}"
+                key = f"~/project/{rel}"
                 cands.append((key, full))
 
         new_files = [(k, f) for k, f in cands if k not in entries]
@@ -4541,6 +4803,8 @@ class MasterOrchestrator:
         )
 
     async def run(self):
+        if self.running:
+            raise RuntimeError("Workflow orchestrator already running")
         """Main orchestrator loop. Re-reads settings.json before every phase."""
         self.running = True
         self.state.update(running=True, start_time=datetime.now().isoformat())
@@ -4615,6 +4879,20 @@ class MasterOrchestrator:
                         await asyncio.sleep(1)
 
                     settings = self.settings.get()  # pick up Telegram edits mid-cycle
+
+                    # 2026-08-14 (user HARD RULE): demand the real date from
+                    # the web BEFORE every phase. Artifact labels (audit/plan
+                    # filenames) come from this — never stale constants or a
+                    # possibly-drifted local clock.
+                    try:
+                        self._verified_date = await self._fetch_web_date()
+                        self.logger.info(
+                            f"📅 Web-verified time before {phase}: "
+                            f"{self._verified_date:%Y-%m-%d %H:%M} "
+                            f"(label {self._verified_date.month}_{self._verified_date.day})")
+                    except Exception as e:
+                        self._verified_date = None
+                        self.logger.warning(f"web date fetch failed: {e}")
 
                     # Notify only for the work phases the user cares about:
                     # audit, cross_eval+plan, execution (not graphify/analyze).
@@ -4889,10 +5167,18 @@ async def main():
         action='store_true',
         help='Show current status and exit'
     )
+    parser.add_argument(
+        '--telegram-bot',
+        action='store_true',
+        help='Enable the Telegram bot (STEP 412/1566: opt-in external '
+             'component; headless by default). Requires PROJECT_TELEGRAM_TOKEN '
+             'or TELEGRAM_BOT_TOKEN in the environment, or '
+             'telegram_bot_token + telegram_chat_id in the config.'
+    )
 
     args = parser.parse_args()
 
-    config = OrchestratorConfig.load(args.config)
+    config = OrchestratorConfig.load(args.config, require_telegram=args.telegram_bot)
 
     log_file = config.get('log_file', '/tmp/orchestrator.log')
     setup_logging(log_file)
@@ -4926,21 +5212,37 @@ async def main():
                                                   os.path.join(config.get('work_dir', '/tmp'),
                                                                'workflow_settings.json')))
 
-    telegram_bot = TelegramBot(
-        token=config['telegram_bot_token'],
-        chat_id=config['telegram_chat_id'],
-        config=config,
-        state_manager=state_manager,
-        task_manager=task_manager,
-        llm_agent=llm_agent,
-        script_editor=script_editor,
-        workflow_executor=executor,
-        git_manager=git_manager,
-        settings_manager=settings_manager
-    )
+    if args.telegram_bot:
+        # STEP 412/1566: explicit opt-in gate. Token resolution precedence:
+        # PROJECT_TELEGRAM_TOKEN (plan-named env var), then the deployment's
+        # TELEGRAM_BOT_TOKEN, then the config file value (already validated by
+        # OrchestratorConfig.load). The guard below is the documented contract —
+        # load() exits first when no token resolves.
+        telegram_token = (os.environ.get('PROJECT_TELEGRAM_TOKEN')
+                          or os.environ.get('TELEGRAM_BOT_TOKEN')
+                          or config.get('telegram_bot_token'))
+        if not telegram_token:
+            raise SystemExit('PROJECT_TELEGRAM_TOKEN is required for --telegram-bot')
+        config['telegram_bot_token'] = telegram_token
+        telegram_bot = TelegramBot(
+            token=telegram_token,
+            chat_id=config['telegram_chat_id'],
+            config=config,
+            state_manager=state_manager,
+            task_manager=task_manager,
+            llm_agent=llm_agent,
+            script_editor=script_editor,
+            workflow_executor=executor,
+            git_manager=git_manager,
+            settings_manager=settings_manager
+        )
 
-    # Give the chat agent the file-tool context so it can view/edit files itself.
-    llm_agent.bind_tools(telegram_bot)
+        # Give the chat agent the file-tool context so it can view/edit files itself.
+        llm_agent.bind_tools(telegram_bot)
+    else:
+        # Headless: no bot, no network I/O — the NullTelegram stub satisfies
+        # every send_message / _relay_outbox / restart-flag call site.
+        telegram_bot = _NullTelegram()
 
     await telegram_bot.initialize()
 
@@ -4988,5 +5290,29 @@ async def main():
             await asyncio.sleep(3)
 
 
+def _check_recursion_guard():
+    import os, sys, atexit
+    lock_path = "/tmp/project_workflow.lock"
+    try:
+        with open(lock_path, 'r') as f:
+            pid = int(f.read().strip())
+        try:
+            os.kill(pid, 0)
+            print(f"ERROR: Another Project workflow process (PID {pid}) is already running. Exiting.", file=sys.stderr)
+            sys.exit(1)
+        except OSError:
+            pass
+    except FileNotFoundError:
+        pass
+    with open(lock_path, 'w') as f:
+        f.write(str(os.getpid()))
+    def _remove_lock():
+        try:
+            os.remove(lock_path)
+        except Exception:
+            pass
+    atexit.register(_remove_lock)
+
 if __name__ == '__main__':
+    _check_recursion_guard()
     asyncio.run(main())
