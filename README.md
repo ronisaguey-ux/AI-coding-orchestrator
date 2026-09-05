@@ -1,103 +1,152 @@
 # AI Coding Orchestrator
 
-A fully automated, self-adaptive master orchestrator for AI-driven software projects. It runs an infinite loop of **audit → cross-eval → execute → analyze → graphify rebuild** over your repository, powered by any Anthropic-compatible LLM API, with a Telegram bot for remote control.
+A high-throughput, multi-lane autonomous fix-executor and escalation solver for code audit and remediation plans.
 
-## Features
+The orchestrator density-packs independent plan findings into disjoint-file batches, drives multi-lane LLM execution with automatic fallback and failover, applies byte-exact modifications with atomic file updates, performs strict in-process verification, and drains stalled steps via an autonomous 3-tier escalation solver.
 
-- **Infinite improvement loop**: audits the repo for bugs/security issues, cross-validates findings with multi-agent review, executes plan steps (writing real code), and rebuilds project graphs after each step.
-- **LLM self-adaptation**: a reasoning tier analyzes failures and rewrites workflow scripts when needed.
-- **Telegram remote control**: start/pause/resume, live status, and a direct LLM chat interface from your phone.
-- **State checkpointing**: every step is persisted — crash-safe resume with `--resume`.
-- **Persistent task board** (`agent_todo_list.json`) tracking work across runs.
-- **Error recovery**: LLM-based diagnosis and fixes when a plan step fails.
+---
 
-## Requirements
+## Key Components
 
-- Python 3.10+
-- An LLM API that speaks the OpenAI-compatible `/v1` chat format (DeepSeek, OmniRoute, OpenAI-compatible gateways, etc.)
-- Optional: a Telegram bot token for remote control
+- **`orch_config.py`**: Layered configuration engine (`defaults < profile < config file < environment < CLI`). Location-derived roots allow cloning and execution without path editing.
+- **`orch_lanes.py`**: Multi-lane routing across local gateways, routers, and free pools (e.g. DeepSeek, Gemini, OmniRoute, OpenRouter Free). Distinguishes transport failure (`ok=False`) from considered empty model output, preventing premature escalations. Features per-model cooldowns, SSE parsing, and dead-lane parking.
+- **`orch_verify.py`**: In-process AST and syntax verification (replaces unsafe execution mechanisms) with strict allowlisting for model-proposed verification commands.
+- **`orchestrator.py`**: Main execution engine. Density-packs up to `group_cap` disjoint steps into a single model round, applies edits with atomic locking and rolling backups, and runs local test verification.
+- **`escalation_solver.py`**: Autonomous 3-tier solver for steps that exceed normal retry bounds:
+  - **Tier 1 (RETRY)**: Re-runs the step against healthy lanes with fresh file context.
+  - **Tier 2 (REPAIR)**: Re-runs quoting previous verifier or anchor failures back to the model.
+  - **Tier 3 (PERSONA)**: Bounded escalation persona that can repair plan steps, supply sandboxed verification commands, or declare moot findings `obsolete` with filesystem-verified evidence.
 
-## Setup
+---
+
+## Installation & Setup
 
 ```bash
-git clone <this-repo>
+git clone https://github.com/ronisaguey-ux/AI-coding-orchestrator.git
 cd AI-coding-orchestrator
-python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Create the environment file (gitignored by default):
+### Configuration
+
+Copy the example configuration file and adjust for your workspace:
 
 ```bash
-mkdir -p ~/.config/orchestrator
-cat > ~/.config/orchestrator/orchestrator.env <<'EOF'
-LLM_API_KEY=your-api-key
-LLM_API_BASE=https://api.your-provider.com/v1
-LLM_MODEL=your-model-name
-TELEGRAM_BOT_TOKEN=your-bot-token
-TELEGRAM_CHAT_ID=your-chat-id
-REPO_DIR=/path/to/your/project
-WORK_DIR=~/orchestrator_data
-EOF
+cp orch.example.yaml orch.yaml
+# Or place in ~/.config/orch/orch.yaml
 ```
+
+Check the resolved configuration at any time without side effects:
+
+```bash
+python3 orchestrator.py --dry-run
+# Or print the resolved options:
+python3 orch_config.py
+```
+
+---
 
 ## Usage
 
-```bash
-./start_orchestrator.sh                 # resume from last state (execution phase)
-./start_orchestrator.sh --phase audit   # start the full loop at the audit phase
-./start_orchestrator.sh --status        # show orchestrator status and exit
-```
-
-Or run directly:
+### Running the Orchestrator
 
 ```bash
-python3 run_workflow.py --config config_workflow.yaml
-python3 run_workflow.py --resume
-python3 run_workflow.py --status
+# Run against the configured plan and state
+python3 orchestrator.py
+
+# Resume from existing state
+python3 orchestrator.py --resume
+
+# Run a specific batch
+python3 orchestrator.py --batch 1
+
+# Focus on a single finding ID
+python3 orchestrator.py --only-step STEP-042
+
+# Dry-run mode (zero writes, zero side effects)
+python3 orchestrator.py --dry-run
 ```
 
-## Configuration
-
-All configuration lives in `config_workflow.yaml`. Secret values are never stored there — every secret is a `${ENV_VAR}` placeholder expanded from the environment.
-
-| Variable | Required | Description |
-|---|---|---|
-| `LLM_API_KEY` | ✅ | API key for your LLM provider |
-| `LLM_API_BASE` | ✅ | Base URL of the OpenAI-compatible `/v1` endpoint |
-| `LLM_MODEL` | ✅ | Model name (e.g. `deepseek-v4-flash`, `gpt-4o`) |
-| `TELEGRAM_BOT_TOKEN` | ❌ | Bot token (skip to run without remote control) |
-| `TELEGRAM_CHAT_ID` | ❌ | Chat ID to send status messages to |
-| `REPO_DIR` | ✅ | Absolute path of the project being orchestrated |
-| `WORK_DIR` | ❌ | Working directory for state files (default: next to `REPO_DIR`) |
-
-## Running it cheaply with OmniRoute
-
-[OmniRoute](https://github.com/your-fork-or-upstream/omniroute) is a free, self-hosted LLM router that load-balances requests across free model providers. Point the orchestrator at it for near-zero-cost plan execution:
+### Running the Escalation Solver
 
 ```bash
-LLM_API_BASE=http://127.0.0.1:20128/v1   # OmniRoute's local endpoint
-LLM_API_KEY=anything                     # OmniRoute does not validate keys locally
-LLM_MODEL=auto                           # OmniRoute routes per its own config
+# Solve up to 5 escalated steps
+python3 escalation_solver.py --limit 5
+
+# Dry-run solver on a specific step
+python3 escalation_solver.py --step STEP-042 --dry-run
+
+# Run live solver on a specific step
+python3 escalation_solver.py --step STEP-042
+
+# Continuous drain loop
+python3 escalation_solver.py --watch --interval 300
 ```
 
-Example: a full `audit → cross-eval → execute` cycle on a medium repo runs for pennies instead of dollars — OmniRoute only calls your paid provider for the reasoning-heavy steps you explicitly route there.
+---
 
-## How it works (high level)
+## Configuration Profiles
 
-1. **Audit** — spawns parallel reviewer agents over the repo's modules; findings are scored and deduplicated into an audit report.
-2. **Cross-eval** — a synthesis pass validates the findings and produces the action list.
-3. **Execute** — runs the plan steps one at a time, with git-safe staging, per-step verification (tests/lints), and auto-rollback on failure.
-4. **Analyze** — measures progress and feeds the result back into the next plan.
-5. **Graphify rebuild** — regenerates the project structure graph after each step.
+Profiles can be selected via `ORCH_PROFILE=<name>` or the `--profile` flag:
 
-## Safety notes
+| Profile | Group Cap | Parallel | Max Rounds | Lane Timeout | Escalation Batch | Description |
+| --- | --- | --- | --- | --- | --- | --- |
+| `default` | 5 | 3 | 3 | 240s | 5 | Balanced execution for standard workloads |
+| `max-throughput` | 5 | 3 | 3 | 180s | 8 | Aggressive batching and shorter retry cycles |
+| `low-memory` | 2 | 1 | 3 | 240s | 2 | Constrained memory footprints (`min_avail_mb=1200`, smaller context caps) |
+| `conservative` | 1 | 1 | 3 | 300s | 5 | Single-step execution, 20s lane cooldown, wake-only escalation |
+| `debug` | 1 | 1 | 3 | 240s | 5 | `dry_run=True`, verbose logging, state backups |
 
-- The orchestrator commits to git — run it only on repositories you want it to modify, and keep the default `--resume` behavior so state is never lost.
-- Pin `MASTER_PLAN_FILE` in `start_orchestrator.sh` when you want the executor locked to a specific plan.
-- The pipeline is fail-closed on state corruption: it halts for manual review rather than overwriting.
+---
+
+## Configuration Options
+
+| Option | Default | Tuned by profiles | Description |
+| --- | --- | --- | --- |
+| `base_dir` | `'<repo>/.orch'` | — | Plans/state directory |
+| `dry_run` | `False` | debug | Resolve and print actions without side effects |
+| `escalation_allow_plan_edit` | `True` | conservative | Escalation persona may rewrite a broken plan step |
+| `escalation_allow_verify_edit` | `True` | conservative | Escalation persona may relax/repair the verify command |
+| `escalation_batch` | `5` | max-throughput, low-memory | Escalated steps handled per solver pass |
+| `escalation_policy` | `'auto-fix'` | conservative | wake \| auto-fix \| queue-only |
+| `escalation_queue` | `''` | — | Escalation queue JSON (default: <base>/escalation_queue.json) |
+| `escalation_rounds` | `3` | — | Escalation-solver attempts per step |
+| `exec_state` | `''` | — | Executor state JSON (default: <base>/exec_state.json) |
+| `file_ctx_cap` | `24000` | low-memory | Per-file FILE CONTENTS cap in characters |
+| `files_per_step` | `2` | — | Files inlined per step in a group prompt |
+| `group_cap` | `5` | max-throughput, low-memory, conservative, debug | Max INDEPENDENT steps packed into one lane call |
+| `lane_connect_timeout` | `15` | — | Connection timeout in seconds |
+| `lane_health_probe` | `True` | — | Probe lanes at startup and park the dead ones |
+| `lane_max_hops` | `4` | — | Different lanes tried before a call is declared failed |
+| `lane_retries` | `3` | max-throughput | Attempts per model before moving to the next model |
+| `lane_timeout` | `240` | max-throughput, conservative | Per-request lane timeout in seconds (was an unbounded 900s total) |
+| `log_dir` | `'/tmp'` | — | Directory for orchestrator logs |
+| `max_prompt_chars` | `80000` | low-memory | Hard cap on the user prompt sent to a lane |
+| `max_rounds` | `3` | conservative | Execute/verify rounds before a step escalates |
+| `min_avail_mb` | `600` | low-memory | Pause when available memory falls below this many MB |
+| `min_lane_gap_seconds` | `0` | conservative | Minimum seconds between two calls on the same lane |
+| `parallel` | `3` | max-throughput, low-memory, conservative, debug | Batch groups in flight at once |
+| `plan_json` | `''` | — | Master plan JSON (default: <base>/plan.json) |
+| `ram_pct_cap` | `90` | — | Hard ceiling: pause above this system RAM percentage |
+| `repo_dir` | `'<repo>'` | — | Repository the fixes are applied to |
+| `state_backups` | `True` | debug | Keep a .bak of state before each atomic write |
+| `swarm_cap` | `4` | — | Hard concurrency ceiling — never raised at runtime |
+| `verbose` | `False` | debug | Verbose lane/step logging |
+| `wake_log` | `'/tmp/main_wake.log'` | — | Wake-chain log the escalation signal appends to |
+| `workers` | `8` | low-memory | Legacy worker hint (batch packing width) |
+
+---
+
+## Safety & Guardrails
+
+- **Hard Concurrency Ceiling**: `swarm_cap` is hard-limited to 4 to prevent resource exhaustion.
+- **Memory Watchdog**: Pauses passes if available system memory falls below `min_avail_mb` or overall usage exceeds `ram_pct_cap`.
+- **State Locking**: State operations utilize file locking (`fcntl.flock`) and atomic writes (temporary file + `fsync` + rename) with automatic `.bak` backups.
+- **Process Mutual Exclusion**: Escalation solver actively detects running orchestrator instances to eliminate concurrent modification collisions.
+- **Verification Sandboxing**: Model-suggested verification commands are strictly checked against a command allowlist and stripped of shell expansion characters.
+
+---
 
 ## License
 
-MIT
->>>>>>> 5774c6c (Sanitized orchestrator release: run_workflow + config + start script (no secrets))
+MIT License. See [LICENSE](LICENSE) for details.
