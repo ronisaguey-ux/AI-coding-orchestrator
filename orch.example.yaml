@@ -1,0 +1,38 @@
+# orch.example.yaml — example deployment configuration.
+#
+# Precedence (lowest to highest):
+#   code defaults < this file < environment variables < CLI flags / runtime overrides.
+#
+# Print what resolves with:  python3 orch_config.py
+
+# --- roots -------------------------------------------------------------------
+# By default repo_dir is location-derived from this repository root,
+# and base_dir defaults to <repo>/.orch (or sibling plans/ directory).
+repo_dir: .
+base_dir: ./.orch
+
+# --- deployment files --------------------------------------------------------
+plan_json: ./.orch/plan.json
+exec_state: ./.orch/exec_state.json
+escalation_queue: ./.orch/escalation_queue.json
+wake_log: /tmp/main_wake.log
+
+# --- execution tuning --------------------------------------------------------
+# group_cap: 5           # Max independent steps packed into one lane call
+# parallel: 3            # Batch groups in flight at once (must not exceed swarm_cap)
+# max_rounds: 3          # Execute/verify rounds before a step escalates
+# swarm_cap: 4           # Concurrency ceiling (never exceed 4)
+
+# --- escalation policy -------------------------------------------------------
+# escalation_policy: auto-fix      # Options: wake | auto-fix | queue-only
+# escalation_rounds: 3            # Attempts per step in solver
+# escalation_batch: 5             # Escalated steps handled per solver pass
+# escalation_allow_plan_edit: true
+# escalation_allow_verify_edit: true
+
+# --- lane behaviour ----------------------------------------------------------
+# lane_timeout: 240               # Per-request lane timeout in seconds
+# lane_connect_timeout: 15        # Connection timeout in seconds
+# lane_retries: 3                 # Attempts per model
+# lane_max_hops: 4                # Lanes tried before failure
+# lane_health_probe: true         # Probe lanes at startup and park dead ones
