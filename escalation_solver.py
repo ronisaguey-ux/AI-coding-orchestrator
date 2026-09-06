@@ -61,6 +61,25 @@ import orch_verify
 LOG_PREFIX = "[esc]"
 
 
+def _banned_path(path: str) -> bool:
+    """Self-settings ban: never apply edits under ~/.claude (settings.json,
+    .claude.json, hooks, mcp configs) — those are off-limits for automation."""
+    pp = Path(path).expanduser().resolve()
+    claude = (Path.home() / ".claude").resolve()
+    return pp == claude or claude in pp.parents
+
+
+def _guard_edits(edits) -> list:
+    out = []
+    for e in edits or []:
+        if _banned_path(str(e.get("file", ""))):
+            log(f"SKIPPED banned settings edit: {e.get('file')}")
+            continue
+        out.append(e)
+    return out
+
+
+
 def log(msg: str) -> None:
     ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
     print(f"{LOG_PREFIX} {ts} {msg}", flush=True)
@@ -119,7 +138,7 @@ PERSONA_SYSTEM = (
 def is_executor_active() -> bool:
     """Return True if an execution engine process is running."""
     try:
-        res = subprocess.run(["pgrep", "-f", "orchestrato[r]|execute_8_27_engin[e]"],
+        res = subprocess.run(["pgrep", "-f", "execute_8_27_engin[e]"],
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         return res.returncode == 0
     except OSError:

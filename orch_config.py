@@ -10,7 +10,7 @@ through here, so the gateway envs and the engine options read the SAME source.
 Profiles (``ORCH_PROFILE``) are named presets applied on top of the defaults and
 below the config file, so a profile never overrides an explicit user setting.
 
-    ORCH_PROFILE=max-throughput python3 orchestrator.py --resume
+    ORCH_PROFILE=max-throughput python3 execute_8_27_engine.py --resume
 
 Config file search order (first hit wins) — override with ``ORCH_CONFIG``:
     ./orch.yaml, ./orch.json, ~/.config/orch/orch.yaml,
@@ -28,17 +28,17 @@ import os
 from pathlib import Path
 from typing import Any
 
-# Location-derived so a clone needs no edit.
-_REPO_ROOT = Path(__file__).resolve().parent
+# scripts/orch_config.py -> <repo>. Location-derived so a clone needs no edit.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
 REPO_DEFAULT = str(_REPO_ROOT)
 
 
 def _base_default() -> str:
-    """Plans/state directory: sibling ``plans`` or ``audits_plans`` if present,
-    else ``<repo>/.orch``."""
-    for cand in (_REPO_ROOT.parent / "plans", _REPO_ROOT.parent / "audits_plans"):
-        if cand.is_dir():
-            return str(cand)
+    """Plans/state directory: a sibling ``audits_plans`` when one exists (the
+    layout the orchestrator was grown in), else ``<repo>/.orch``."""
+    sibling = _REPO_ROOT.parent / "audits_plans"
+    if sibling.is_dir():
+        return str(sibling)
     return str(_REPO_ROOT / ".orch")
 
 
@@ -71,6 +71,8 @@ DEFAULTS: dict[str, tuple[Any, type, str]] = {
     "lane_max_hops":     (4, int, "Different lanes tried before a call is declared failed"),
     "lane_health_probe": (True, bool, "Probe lanes at startup and park the dead ones"),
     "min_lane_gap_seconds": (0, int, "Minimum seconds between two calls on the same lane"),
+    "lanes_extra": ([], list, "Extra lanes: [{name,url,models,cool_base,cool_esc,auth}] appended to the pool"),
+    "exclude_lanes": ([], list, "Lane names to leave out of the pool (e.g. a lane waiting for login)"),
     "max_prompt_chars":  (80000, int, "Hard cap on the user prompt sent to a lane"),
     "file_ctx_cap":      (24000, int, "Per-file FILE CONTENTS cap in characters"),
     "files_per_step":    (2, int, "Files inlined per step in a group prompt"),
@@ -83,6 +85,10 @@ DEFAULTS: dict[str, tuple[Any, type, str]] = {
     "escalation_batch":  (5, int, "Escalated steps handled per solver pass"),
 
     # safety / memory
+    # This box idles near 78% used with ~3 GB genuinely available, so a 75%
+    # ceiling parked every pass before it started. Absolute headroom is the
+    # signal that actually predicts pressure; the percentage stays as a hard
+    # backstop well below the OOM band.
     "ram_pct_cap":       (90, int, "Hard ceiling: pause above this system RAM percentage"),
     "min_avail_mb":      (600, int, "Pause when available memory falls below this many MB"),
     "swarm_cap":         (4, int, "Hard concurrency ceiling — never raised at runtime"),
@@ -195,6 +201,11 @@ class Config:
     # derived paths -------------------------------------------------------
     @property
     def plan_path(self) -> Path:
+        # A deployment's plan/state filenames are deployment data, not code
+        # defaults: set `plan_json`/`exec_state` in the config file. Getting
+        # this wrong is silent — a plan that does not cover the state file
+        # resolves only the ids it happens to share (a 263-step plan once
+        # matched 7 of 52 escalated ids), so the resolver misses the rest.
         return Path(self._values["plan_json"] or
                     Path(self._values["base_dir"]) / "plan.json")
 
@@ -217,7 +228,7 @@ class Config:
         return "\n".join(rows)
 
 
-# Legacy env names still honoured so existing setups keep working.
+# Legacy env names still honoured so existing systemd units keep working.
 ENV_ALIASES = {
     "repo_dir": ["ORCH_REPO_DIR"],
     "plan_json": ["PLAN_JSON"],
@@ -311,14 +322,10 @@ def markdown_table() -> str:
              "| --- | --- | --- | --- |"]
     for k in sorted(DEFAULTS):
         d, _t, h = DEFAULTS[k]
-        if k == "repo_dir":
-            val_str = "`'<repo>'`"
-        elif k == "base_dir":
-            val_str = "`'<repo>/.orch'`"
-        else:
-            val_str = f"`{d!r}`"
+        # descriptions carry literal pipes ("wake | auto-fix"), which would
+        # otherwise open a new table column
         desc = h.replace("|", "\\|")
-        lines.append(f"| `{k}` | {val_str} | {', '.join(tuned.get(k, [])) or '—'} | {desc} |")
+        lines.append(f"| `{k}` | `{d!r}` | {', '.join(tuned.get(k, [])) or '—'} | {desc} |")
     return "\n".join(lines)
 
 
