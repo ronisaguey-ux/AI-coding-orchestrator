@@ -74,7 +74,7 @@ class Lane:
         return now >= self.dead_until and bool(self.available_models(now))
 
 
-def default_lanes() -> list[Lane]:
+def default_lanes(cfg=None) -> list[Lane]:
     key = _openrouter_key()
     lanes = [
         Lane("openrouter", "https://openrouter.ai/api/v1/chat/completions",
@@ -87,6 +87,14 @@ def default_lanes() -> list[Lane]:
         Lane("gemini", "http://127.0.0.1:8085/v1/chat/completions",
              ["gemini 3.7 flash webchat"], 300, 900),
     ]
+    if cfg is not None:
+        for extra in (cfg.lanes_extra or []):
+            lanes.append(Lane(extra.get("name", "extra"), extra["url"],
+                              extra.get("models", ["anymodel"]),
+                              extra.get("cool_base", 90), extra.get("cool_esc", 270),
+                              extra.get("auth", "")))
+    if cfg is not None and cfg.exclude_lanes:
+        lanes = [ln for ln in lanes if ln.name not in cfg.exclude_lanes]
     return [ln for ln in lanes if ln.name != "openrouter" or ln.auth]
 
 
@@ -221,13 +229,40 @@ def parse_json_object(text: str) -> dict:
     return {}
 
 
+# ------------------------------------------------- webchat health signals ---
+# Failures a webchat gateway raises about ITS OWN tab/queue state rather than
+# about the request. They clear on their own, so the right response is "use a
+# different lane for now", never "retry this exact lane twice more".
+_WEBCHAT_TRANSIENT = (
+    ("stranded in composer", "stranded composer"),
+    ("webchat send failed", "send did not commit"),
+    ("send mutex", "account mutex contention"),
+    ("still generating from a previous request", "tab busy"),
+    ("composer stayed empty", "composer never took the text"),
+    ("send button vanished", "composer re-render"),
+)
+
+
+def _is_webchat_transient(body: str) -> bool:
+    low = (body or "").lower()
+    return any(sig in low for sig, _ in _WEBCHAT_TRANSIENT)
+
+
+def _transient_reason(body: str) -> str:
+    low = (body or "").lower()
+    for sig, reason in _WEBCHAT_TRANSIENT:
+        if sig in low:
+            return reason
+    return "unknown"
+
+
 # -------------------------------------------------------------- lane pool ---
 class LanePool:
     """Round-robin pool that hops lanes until one actually answers."""
 
     def __init__(self, cfg, lanes: list[Lane] | None = None, log=print):
         self.cfg = cfg
-        self.lanes = lanes if lanes is not None else default_lanes()
+        self.lanes = lanes if lanes is not None else default_lanes(cfg)
         self.log = log
         self._idx = 0
         self._lock = asyncio.Lock()
@@ -355,6 +390,20 @@ class LanePool:
                             break
                         if resp.status in (400, 401, 403, 404, 422):
                             self._cool_model(lane, model, escalated=True)
+                            break
+                        # 09-05: a webchat gateway that reports a stranded
+                        # composer / send-mutex contention is telling us the
+                        # TAB is unhealthy right now, not that the request was
+                        # bad. Retrying in place walks straight back into the
+                        # same tab and burns another full gateway timeout
+                        # (~60-90s each) before the hop happens. Treat it as a
+                        # lane-health signal: cool this lane briefly and hop to
+                        # a sibling immediately, so one flaky lane slows the
+                        # pass instead of killing the batch.
+                        if _is_webchat_transient(body):
+                            self.log(f"[lanes] {lane.name} webchat transient "
+                                     f"({_transient_reason(body)}) — hopping now")
+                            self._cool_model(lane, model)
                             break
                         if attempt < retries:
                             await asyncio.sleep(3 * attempt)
