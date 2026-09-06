@@ -37,7 +37,7 @@ MAX_ROUNDS = 3
 # auto-routes to whatever :free model is available; (url, model, cool_base, cool_esc, auth)
 OPENROUTER_KEY = ""
 try:
-    OPENROUTER_KEY = Path("/home/roni/.claude/openrouter.token").read_text().strip()
+    OPENROUTER_KEY = Path(os.environ.get("OPENROUTER_TOKEN_FILE", "~/.openrouter.token")).expanduser().read_text().strip()
 except Exception:
     pass
 
