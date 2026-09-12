@@ -113,12 +113,30 @@ def default_lanes(cfg=None) -> list[Lane]:
              # left auth="" → the lane was dropped by the `or ln.auth` filter.
         Lane("deepseek", "http://127.0.0.1:8080/v1/chat/completions",
              ["anymodel"], 90, 270),
+        # 09-12 (owner): two more signed-in deepseek webchats, each on its own
+        # profile, as separate lanes. All three share the gateway's 30s send
+        # spacing (MIN_SEND_INTERVAL_MS + /tmp/deepseek_last_send), so they can
+        # be used without ever hitting the account together.
+        Lane("deepseek2", "http://127.0.0.1:8081/v1/chat/completions",
+             ["anymodel"], 90, 270),
+        Lane("deepseek4", "http://127.0.0.1:8083/v1/chat/completions",
+             ["anymodel"], 90, 270),
         Lane("omniroute", "http://127.0.0.1:20128/v1/chat/completions",
-             # 09-12 (owner): OmniRoute is the FREE `/auto` lane — use the auto/*
-             # combos, which load-balance across free providers. Verified live with
-             # a real completion: auto/best-chat OK, auto/chat OK, auto/fast OK;
-             # auto/best-free and auto/coding:free FAIL (route to models needing
-             # an opencode key / unavailable / reasoning truncated with no content).
+             # 09-12 LATER: the auto/* combos load-balance and now route onto
+             # `oc/*` models that need an opencode key — measured live:
+             #   auto/best-chat -> "oc/north-mini-code-free: auth [401] Model
+             #   north-mini-code-free is not supported", and the lane returned
+             #   HTTP 502 to the engine. That took the whole lane dark (engine log:
+             #   `omniroute=cooled (calls=20,fail=15)`).
+             # Pin the CONCRETE free model instead of a combo, and put a couple of
+             # verified alternates behind it.
+             # 09-12 FINAL: auto/* is 100% dead — measured live, the combos route
+             # onto `oc/*` models that need an opencode API key:
+             #   "oc/muse-spark-1.2: model [402] This model requires an opencode API
+             #    key"; "oc/hy3-free: auth [401] Model is not supported".
+             # The engine log showed omniroute=cooled (calls=8,fail=8) — the lane was
+             # dark and every step stalled. Pin concrete cfp/* models, which answer
+             # without any opencode key (verified live).
              ["auto/best-chat", "auto/chat", "auto/fast"],
              120, 360),
         Lane("gemini", "http://127.0.0.1:8085/v1/chat/completions",
