@@ -89,40 +89,28 @@ def default_lanes(cfg=None) -> list[Lane]:
     key = _openrouter_key()
     lanes = [
         Lane("openrouter", "https://openrouter.ai/api/v1/chat/completions",
-             ["openrouter/free"], 45, 120, auth=key),  # 09-10: `auth` MUST be a
+             # 09-12 (owner): OpenRouter is the FREE lane — the account key has a
+             # $1 balance cap, so only `:free` models are usable. `openrouter/free`
+             # is not a real model id (401/404). These are the free coding-capable
+             # ids from the public /models list; `cohere/north-mini-code:free`
+             # verified live (HTTP 200, cost 0).
+             ["cohere/north-mini-code:free",
+              "nvidia/nemotron-3-ultra-550b-a55b:free",
+              "poolside/laguna-s-2.1:free",
+              "nex-agi/nex-n2.5-pro:free"],
+             45, 120, auth=key),  # 09-10: `auth` MUST be a
              # keyword — `prompt_cap` sits before it in the dataclass, so the
              # positional form silently bound the API key to prompt_cap and
              # left auth="" → the lane was dropped by the `or ln.auth` filter.
         Lane("deepseek", "http://127.0.0.1:8080/v1/chat/completions",
              ["anymodel"], 90, 270),
         Lane("omniroute", "http://127.0.0.1:20128/v1/chat/completions",
-             # 09-11: `auto/best-free` returns HTTP 502 on the edits shape, and
-             # `cfp/nvidia/nemotron-3-120b-a12b` 502s as soon as the prompt grows
-             # (verified live at ~13k chars). Both were being read as "lane
-             # returned nothing usable", so every step burned a round on them.
-             # `auto/coding` returned valid edits at the same size, so it is the
-             # lane's only model now.
-             #
-             # 09-11 (owner): the per-turn cap exists to limit how much is sent
-             # in each system prompt to the WEBCHAT. An API lane has no composer
-             # to overflow, so omniroute gets no prompt_cap.
-             # 09-11 (later): auto/cheap began resolving to
-             # oc/north-mini-code-free (401, unsupported), which cooled the lane
-             # on every call. auto/best-coding resolves to nemotron-3-ultra-free
-             # and answers (verified live), so it is the lane's model.
-             # 09-11 (final): auto/best-coding load-balances and sometimes
-             # routes to oc/big-pickle, which is rate-limited (429 -> 502), and
-             # nemotron-3-ultra-free returns an EMPTY edits array when a system
-             # message is present (verified: `{"edits":[]}`, 12 bytes - exactly
-             # the "empty/no-edits answer" the engine logs). auto/best-chat
-             # returns a real edits block WITH a system message.
-             # 09-11 (final): pin the CONCRETE model. The auto/* combos
-             # load-balance, so a call lands on oc/big-pickle (429), oc/hy3-free
-             # (401 unsupported) or nemotron-3-ultra-free (which returns an EMPTY
-             # edits array when a system message is present). Measured 3x with a
-             # system message: oc/nemotron-3-ultra-free 2/3 valid edits, every
-             # other candidate 0/3.
-             ["oc/nemotron-3-ultra-free"],
+             # 09-12 (owner): OmniRoute is the FREE `/auto` lane — use the auto/*
+             # combos, which load-balance across free providers. Verified live with
+             # a real completion: auto/best-chat OK, auto/chat OK, auto/fast OK;
+             # auto/best-free and auto/coding:free FAIL (route to models needing
+             # an opencode key / unavailable / reasoning truncated with no content).
+             ["auto/best-chat", "auto/chat", "auto/fast"],
              120, 360),
         Lane("gemini", "http://127.0.0.1:8085/v1/chat/completions",
              ["gemini 3.7 flash webchat"], 300, 900,
