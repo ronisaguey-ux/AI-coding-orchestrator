@@ -102,7 +102,12 @@ def default_lanes(cfg=None) -> list[Lane]:
              ["nvidia/nemotron-3-ultra-550b-a55b:free",
               "poolside/laguna-s-2.1:free",
               "nex-agi/nex-n2.5-pro:free"],
-             45, 120, auth=key),  # 09-10: `auth` MUST be a
+             45, 120, prompt_cap=12000, auth=key),  # 09-12: the engine ships a
+             # ~60K-char system prompt. The free models answer a small prompt fine
+             # (verified live) but return EMPTY on the full one, which the engine
+             # reads as 'empty/no-edits' and ladder-cools the model — so the lane
+             # went dark and every step stalled. Cap the prompt like the gemini lane.
+             # 09-10: `auth` MUST be a
              # keyword — `prompt_cap` sits before it in the dataclass, so the
              # positional form silently bound the API key to prompt_cap and
              # left auth="" → the lane was dropped by the `or ln.auth` filter.
