@@ -94,8 +94,12 @@ def default_lanes(cfg=None) -> list[Lane]:
              # is not a real model id (401/404). These are the free coding-capable
              # ids from the public /models list; `cohere/north-mini-code:free`
              # verified live (HTTP 200, cost 0).
-             ["cohere/north-mini-code:free",
-              "nvidia/nemotron-3-ultra-550b-a55b:free",
+             # 09-12: re-measured with max_tokens=20 — cohere/north-mini-code:free
+             # returns EMPTY content (the whole budget goes to reasoning), which the
+             # engine reads as "empty/no-edits" and hops on. It was ladder-cooling
+             # first (streak 3) and stalling every step. The three below return real
+             # content; thinkingmachines/inkling:free is agentic-harness-only (error).
+             ["nvidia/nemotron-3-ultra-550b-a55b:free",
               "poolside/laguna-s-2.1:free",
               "nex-agi/nex-n2.5-pro:free"],
              45, 120, auth=key),  # 09-10: `auth` MUST be a
@@ -114,13 +118,16 @@ def default_lanes(cfg=None) -> list[Lane]:
              120, 360),
         Lane("gemini", "http://127.0.0.1:8085/v1/chat/completions",
              ["gemini 3.7 flash webchat"], 300, 900,
-             prompt_cap=4000),   # 09-12: 15000 -> 6000 -> 4000. Measured on the
-                                # live gateway: total prompt (system ~1958 + user)
+             prompt_cap=2500),   # 09-12: 15000 -> 6000 -> 4000 -> 2500. Measured on
+                                # the live gateway: total prompt (system ~1958 + user)
                                 # answered at 6276 chars, hung at 7960 and 9687, and
-                                # wedged the tab at 16960. The safe total is ~6300,
-                                # so the user slice is capped at 4000.
-                                # Cap the per-turn context to what it can answer,
-                                # so it stays green instead of cooking its ladder.
+                                # wedged the tab at 16960. But that measurement was on
+                                # a FRESH thread — once the gemini tab carries a long
+                                # conversation, 5960-6037-char prompts hung for ~6 min
+                                # (observed 05:04:08 -> 05:10:09 with no response) and
+                                # the engine logged `gemini failed (timeout after 420s)`
+                                # 38 times. 2500 keeps the total near 4450, inside the
+                                # reliably-answerable zone on a warm thread.
     ]
     if cfg is not None:
         for extra in (cfg.lanes_extra or []):
