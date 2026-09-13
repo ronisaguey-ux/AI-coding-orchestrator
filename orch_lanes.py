@@ -112,15 +112,21 @@ def default_lanes(cfg=None) -> list[Lane]:
              # positional form silently bound the API key to prompt_cap and
              # left auth="" → the lane was dropped by the `or ln.auth` filter.
         Lane("deepseek", "http://127.0.0.1:8080/v1/chat/completions",
-             ["anymodel"], 90, 270),
+             ["anymodel"], 90, 270, prompt_cap=12000),
         # 09-12 (owner): two more signed-in deepseek webchats, each on its own
         # profile, as separate lanes. All three share the gateway's 30s send
         # spacing (MIN_SEND_INTERVAL_MS + /tmp/deepseek_last_send), so they can
         # be used without ever hitting the account together.
+        # prompt_cap: deepseek is a WEBCHAT lane — the engine's default ~71K-char
+        # group prompt is pasted straight into the tab's composer, and the tab
+        # then sits on "Waiting for response..." forever (measured 09-12: a
+        # 71370-char send at 14:15:14 never returned; the engine blocked on it,
+        # batch 1 never completed, green stayed flat). Cap it like gemini and
+        # openrouter: the small prompts (557-1104 chars) answered in 3-6s.
         Lane("deepseek2", "http://127.0.0.1:8081/v1/chat/completions",
-             ["anymodel"], 90, 270),
+             ["anymodel"], 90, 270, prompt_cap=12000),
         Lane("deepseek4", "http://127.0.0.1:8083/v1/chat/completions",
-             ["anymodel"], 90, 270),
+             ["anymodel"], 90, 270, prompt_cap=12000),
         Lane("omniroute", "http://127.0.0.1:20128/v1/chat/completions",
              # 09-12 LATER: the auto/* combos load-balance and now route onto
              # `oc/*` models that need an opencode key — measured live:
@@ -268,6 +274,72 @@ def extract_content(body: str) -> tuple[str, str]:
     return "".join(chunks), ""
 
 
+def _repair_loose_json(cand: str) -> dict:
+    """Repair the JSON webchat models actually emit.
+
+    09-12: real edits were being thrown away. Measured on the engine's own dump
+    (/tmp/lane_empty_debug.jsonl): 8 of the last real-edit replies failed a
+    strict parse, every one of them for the same two reasons —
+      * a RAW control character inside a string value (a real newline from a
+        multi-line old_string/new_string),
+      * an unescaped inner quote: a docstring written as `\"\"\"` instead of
+        `\\\"\\\"\\\"`.
+    Both make json.loads refuse the document, so parse_json_object returned {} and
+    the engine recorded a genuine edit as "empty/no-edits answer" and hopped.
+
+    Walk the text once. Inside a string, escape control characters, and treat a
+    quote as the string's END only when the next non-space character is
+    structural (one of , : } ]) — anything else is content the model forgot to
+    escape, so escape it here.
+    """
+    out: list[str] = []
+    in_str = esc = False
+    expect_key = True   # a string that follows '{' or ',' is a KEY; after ':' it is a VALUE
+    is_key = False
+    i, n = 0, len(cand)
+    while i < n:
+        ch = cand[i]
+        if in_str:
+            if esc:
+                out.append(ch); esc = False; i += 1; continue
+            if ch == "\\":
+                out.append(ch); esc = True; i += 1; continue
+            if ch == "\n":
+                out.append("\\n"); i += 1; continue
+            if ch == "\r":
+                out.append("\\r"); i += 1; continue
+            if ch == "\t":
+                out.append("\\t"); i += 1; continue
+            if ch == '"':
+                j = i + 1
+                while j < n and cand[j] in " \t\r\n":
+                    j += 1
+                nxt = cand[j] if j < n else ""
+                # A KEY ends at `":`. A VALUE ends at `"` followed by , } or ].
+                # Anything else is an unescaped quote the model meant as CONTENT
+                # — e.g. `"old_string": "  "fixP1B1R0F1": {...` where the inner
+                # `":` is text, not a separator. Treating that as a terminator is
+                # what made the repair give up on real edits.
+                ends = (nxt == ":" ) if is_key else (nxt in ",}]" or nxt == "")
+                if ends:
+                    out.append('"'); in_str = False; i += 1; continue
+                out.append('\\"'); i += 1; continue
+            out.append(ch); i += 1; continue
+        if ch == '"':
+            in_str = True; is_key = expect_key
+            out.append(ch); i += 1; continue
+        if ch == ":":
+            expect_key = False
+        elif ch in "{,":
+            expect_key = True
+        out.append(ch); i += 1
+    try:
+        obj = json.loads("".join(out))
+        return obj if isinstance(obj, dict) else {}
+    except json.JSONDecodeError:
+        return {}
+
+
 def _lenient_edits(text: str) -> dict:
     """Read {"edits":[...]} out of a reply that is not valid JSON.
 
@@ -358,8 +430,12 @@ def parse_json_object(text: str) -> dict:
                     except json.JSONDecodeError:
                         # Model emitted Python source with unescaped quotes /
                         # newlines inside a JSON string (gemini does this on
-                        # nearly every reply). Read the fields out by their
-                        # key markers instead of discarding the whole answer.
+                        # nearly every reply). Repair the escapes and re-parse;
+                        # if that still fails, read the fields out by their key
+                        # markers instead of discarding the whole answer.
+                        repaired = _repair_loose_json(cand)
+                        if repaired and repaired.get("edits"):
+                            return repaired
                         lenient = _lenient_edits(stripped[start:])
                         if lenient:
                             return lenient
