@@ -17,7 +17,7 @@ import argparse, asyncio, json, os, re, subprocess, sys, time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import orch_config, orch_lanes, orch_verify
+import config as orch_config, lanes as orch_lanes, verify as orch_verify
 
 # 09-05: the whole engine now resolves through orch_config (defaults < file <
 # env < CLI), so the gateway envs and the engine options read ONE source.

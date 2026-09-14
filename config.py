@@ -63,6 +63,16 @@ DEFAULTS: dict[str, tuple[Any, type, str]] = {
     "parallel":          (3, int, "Batch groups in flight at once"),
     "workers":           (8, int, "Legacy worker hint (batch packing width)"),
     "max_rounds":        (3, int, "Execute/verify rounds before a step escalates"),
+    # A lane that reports the work is ALREADY THERE (already satisfied / already
+    # present / already implemented / no change needed) is reporting the step
+    # done, not failed. What to do with that verdict:
+    #   "green"    (default) — count the step green and move on
+    #   "escalate" — park it in the terminal escalated bucket for review
+    #   "pending"  — leave it pending (re-attempt later; NOT recommended, it
+    #                re-asks lanes that have already answered)
+    # Set from orch.yaml as `already_satisfied_action: green`.
+    "already_satisfied_action": ("green", str, "Verdict for a lane that says the work is already present: green | escalate | pending"),
+    "already_satisfied_phrases": ([], list, "Extra lower-case phrases that count as an already-satisfied verdict (appended to the built-in list)"),
 
     # lane behaviour
     "lane_timeout":      (240, int, "Per-request lane timeout in seconds (was an unbounded 900s total)"),

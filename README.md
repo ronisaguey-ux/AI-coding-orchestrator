@@ -8,11 +8,13 @@ The orchestrator density-packs independent plan findings into disjoint-file batc
 
 ## Key Components
 
-- **`orch_config.py`**: Layered configuration engine (`defaults < profile < config file < environment < CLI`). Location-derived roots allow cloning and execution without path editing.
-- **`orch_lanes.py`**: Multi-lane routing across local gateways, routers, and free pools (e.g. DeepSeek, Gemini, OmniRoute, OpenRouter Free). Distinguishes transport failure (`ok=False`) from considered empty model output, preventing premature escalations. Features per-model cooldowns, SSE parsing, and dead-lane parking.
-- **`orch_verify.py`**: In-process AST and syntax verification (replaces unsafe execution mechanisms) with strict allowlisting for model-proposed verification commands.
-- **`orchestrator.py`**: Main execution engine. Density-packs up to `group_cap` disjoint steps into a single model round, applies edits with atomic locking and rolling backups, and runs local test verification.
-- **`escalation_solver.py`**: Autonomous 3-tier solver for steps that exceed normal retry bounds:
+- **`audit.py`**: Audit stage — parses the multi-agent audit report into a structure-preserving JSON consumed by the cross-eval stage.
+- **`cross_eval.py`**: Cross-evaluation & plan-synthesis stage — deploys parallel subagents to validate, deduplicate and root-cause audit findings into a master remediation plan.
+- **`config.py`**: Layered configuration engine (`defaults < profile < config file < environment < CLI`). Location-derived roots allow cloning and execution without path editing.
+- **`lanes.py`**: Multi-lane routing across local gateways, routers, and free pools (e.g. DeepSeek, Gemini, OmniRoute, OpenRouter Free). Distinguishes transport failure (`ok=False`) from considered empty model output, preventing premature escalations. Features per-model cooldowns, SSE parsing, and dead-lane parking.
+- **`verify.py`**: In-process AST and syntax verification (replaces unsafe execution mechanisms) with strict allowlisting for model-proposed verification commands.
+- **`execute.py`**: Main execution engine. Density-packs up to `group_cap` disjoint steps into a single model round, applies edits with atomic locking and rolling backups, and runs local test verification.
+- **`escalation.py`**: Autonomous 3-tier solver for steps that exceed normal retry bounds:
   - **Tier 1 (RETRY)**: Re-runs the step against healthy lanes with fresh file context.
   - **Tier 2 (REPAIR)**: Re-runs quoting previous verifier or anchor failures back to the model.
   - **Tier 3 (PERSONA)**: Bounded escalation persona that can repair plan steps, supply sandboxed verification commands, or declare moot findings `obsolete` with filesystem-verified evidence.
@@ -39,9 +41,9 @@ cp orch.example.yaml orch.yaml
 Check the resolved configuration at any time without side effects:
 
 ```bash
-python3 orchestrator.py --dry-run
+python3 execute.py --dry-run
 # Or print the resolved options:
-python3 orch_config.py
+python3 config.py
 ```
 
 ---
@@ -52,35 +54,35 @@ python3 orch_config.py
 
 ```bash
 # Run against the configured plan and state
-python3 orchestrator.py
+python3 execute.py
 
 # Resume from existing state
-python3 orchestrator.py --resume
+python3 execute.py --resume
 
 # Run a specific batch
-python3 orchestrator.py --batch 1
+python3 execute.py --batch 1
 
 # Focus on a single finding ID
-python3 orchestrator.py --only-step STEP-042
+python3 execute.py --only-step STEP-042
 
 # Dry-run mode (zero writes, zero side effects)
-python3 orchestrator.py --dry-run
+python3 execute.py --dry-run
 ```
 
 ### Running the Escalation Solver
 
 ```bash
 # Solve up to 5 escalated steps
-python3 escalation_solver.py --limit 5
+python3 escalation.py --limit 5
 
 # Dry-run solver on a specific step
-python3 escalation_solver.py --step STEP-042 --dry-run
+python3 escalation.py --step STEP-042 --dry-run
 
 # Run live solver on a specific step
-python3 escalation_solver.py --step STEP-042
+python3 escalation.py --step STEP-042
 
 # Continuous drain loop
-python3 escalation_solver.py --watch --interval 300
+python3 escalation.py --watch --interval 300
 ```
 
 ---

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""orchestrator.py — multi-lane fix-executor for audit and remediation plans.
+"""execute.py — multi-lane fix-executor for audit and remediation plans.
 
 Executes a master plan JSON against a repository using multi-lane LLM
 routing (local gateways, free models, or API endpoints), with per-step
@@ -20,9 +20,9 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import orch_config
-import orch_lanes
-import orch_verify
+import config as orch_config
+import lanes as orch_lanes
+import verify as orch_verify
 
 CFG = orch_config.load()
 BASE = Path(CFG.base_dir)

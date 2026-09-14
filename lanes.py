@@ -127,7 +127,8 @@ def default_lanes(cfg=None) -> list[Lane]:
              ["anymodel"], 90, 270, prompt_cap=12000),
         Lane("deepseek4", "http://127.0.0.1:8083/v1/chat/completions",
              ["anymodel"], 90, 270, prompt_cap=12000),
-        Lane("omniroute", "http://127.0.0.1:20128/v1/chat/completions",
+        # PULLED 09-13: every auto/* combo now 402/401 on an oc/* model
+        # Lane("omniroute", "http://127.0.0.1:20128/v1/chat/completions",
              # 09-12 LATER: the auto/* combos load-balance and now route onto
              # `oc/*` models that need an opencode key — measured live:
              #   auto/best-chat -> "oc/north-mini-code-free: auth [401] Model
@@ -143,11 +144,106 @@ def default_lanes(cfg=None) -> list[Lane]:
              # The engine log showed omniroute=cooled (calls=8,fail=8) — the lane was
              # dark and every step stalled. Pin concrete cfp/* models, which answer
              # without any opencode key (verified live).
-             ["auto/best-chat", "auto/chat", "auto/fast"],
-             120, 360),
+             # 09-13: verified live — auto/fast and auto/cheap both answer (HTTP
+             # 200, content "PONG"); auto/best-chat and auto/chat still route onto
+             # oc/* models that need an opencode key (402/401).
+             # 09-13 later: `auto/fast` REGRESSED — it now routes to
+             # `oc/muse-spark-1.2`, which returns
+             # `402: This model requires an opencode API key`. `auto/best-free`
+             # routes to the same dead model. Verified live: `auto/coding:free`
+             # and `auto/cheap` both answer with real content; `auto/fast` now
+             # returns an unparseable body. Keep only the two that answer.
+             # 09-13 LATEST: `auto/coding:free` ALSO regressed — measured live in
+             # the engine log: `omniroute failed (http 502: oc/muse-spark-1.2:
+             # model [402] This model requires an opencode API key)`, followed by
+             # `omniroute/auto/coding:free ladder-cooled 1200s`. Every auto/*
+             # combo load-balances onto `oc/*` sooner or later. Pin ONLY
+             # `auto/cheap`, which is the one combo still answering; if it goes
+             # the same way, drop the lane rather than keep a 1200s cooldown loop.
+        # 09-14: RE-ENABLED. The lane was pulled when every auto/* combo routed
+        # onto an `oc/*` model needing an opencode key. Verified live again:
+        # `auto/cheap` answers HTTP 200 in 0.7-2.0s with real content ("PONG"),
+        # 3/3 calls, model reported as `big-pickle`. That is the one combo that
+        # still answers; if it regresses the same way, pull it again rather than
+        # keep a cooldown loop.
+        # 09-14 (regressed again): `auto/cheap` now 502s with
+        # `oc/muse-spark-1.2: model — [402]: requires an opencode API key`.
+        # Same failure mode as 09-13. PULLED until a real model answers.
+        # Lane("omniroute", "http://127.0.0.1:20128/v1/chat/completions",
+        #      ["auto/cheap"],
+        #      120, 360, prompt_cap=12000),
+        # 09-13 (owner): OrcaRouter — OpenAI-compatible API lane, key verified.
+        # Free models unlocked after the owner linked GitHub. Measured live:
+        # deepseek/deepseek-v4-flash-free answered the ENGINE'S edits contract in
+        # 1.5s with a correct edit ({"edits":[...]}), and orcarouter/free,
+        # tencent/hy3-free, z-ai/glm-5.3-flash-free all returned 200. This is an
+        # API lane: no browser tab, no per-account mutex, no anti-ban gap — it can
+        # take many concurrent calls, so it is the real throughput lever.
+        Lane("orcarouter", "https://api.orcarouter.ai/v1/chat/completions",
+             ["deepseek/deepseek-v4-flash-free", "orcarouter/free",
+              "tencent/hy3-free", "z-ai/glm-5.3-flash-free"],
+             45, 120, prompt_cap=24000,
+             auth="sk-orca-KNVShgXMQpSKanLRM8BFK6ZKyVCFoN3IhIdnZxubslG"),
+        # 09-13 (owner): Bitdeer AI Cloud Model Studio — OpenAI-compatible API
+        # lane, key named "oculus" in their console. Base URL taken from the
+        # model page's "API Interfaces" tab (api-inference.bitdeer.ai).
+        # Verified live: /v1/models returns 200, and
+        # deepseek-ai/DeepSeek-V4-Flash answered "PONG" (200, real completion).
+        # NOTE: the $5 voucher is scope-limited — deepseek-ai/DeepSeek-V4.1-Flash
+        # returns `insufficient balance` while V4-Flash bills fine, so only the
+        # models that actually bill are listed here. Like orcarouter this is an
+        # API lane: no tab, no mutex, no anti-ban gap.
+        Lane("bitdeer", "https://api-inference.bitdeer.ai/v1/chat/completions",
+             ["deepseek-ai/DeepSeek-V4-Flash"],
+             60, 180, prompt_cap=24000,
+             auth="AIni2RlIlDeDOEclStU3"),
+        # 09-13 (owner): ChatGPT webchat lane (Free account, text chat only —
+        # image analysis is capped but text is unlimited). Gateway :8087 on the
+        # owner's CDP 9224 Chrome. Four harness bugs had to be fixed first
+        # (browser.js commit 6dab23d + the empty-phantom-row fix): the composer
+        # selector, the assistant message role, a viewportSize crash, and the
+        # send click that never submitted. Verified live: 2/2 "PONG" in ~18s.
+        # 09-13: Kimi webchat lane. Gateway :8086 on CDP 9230. Two harness bugs
+        # had to be fixed first: Kimi's `.chat-input-editor` ignores
+        # execCommand('selectAll'/'delete') (its draft survived a full reload at
+        # 1787 chars, so every send appended after it), and its assistant turns
+        # are `.chat-content-item-assistant`, which the default message selector
+        # does not match. Verified live: HTTP 200 returning "PONG" in 7.7s.
+        # 09-13: PULLED FROM THE POOL. Kimi's composer restores a saved
+        # per-conversation draft (measured 6811 -> 21176 chars as sends
+        # appended to it), so the prompt is never the leading text and the
+        # gateway wedges to its hard cap on every draw. Clearing in the same
+        # CDP session as the insert (commit 9f3ecbf) did NOT hold — the draft
+        # came back. Re-enable only after a hand-driven send is confirmed with
+        # an empty composer on a FRESH conversation.
+        # Lane("kimi", "http://127.0.0.1:8086/v1/chat/completions",
+        #      ["kimi k2 webchat"], 90, 270,
+        #      prompt_cap=12000),
+        # 09-13: TEMPORARILY OUT OF THE POOL. The account is Free and the tab
+        # shows "Messages limit reached", so every send returns an EMPTY
+        # assistant node and never completes. Measured live: the gateway sat at
+        # outstandingMs=361319 with the assistant row at 0 chars and not growing,
+        # while the engine held a slot on it for the full 400s lane_timeout — a
+        # capped lane is worse than a missing one. Re-add when the cap resets.
+        # 09-14 (owner): RE-ENABLED. The lane was pulled because the reader grabbed
+        # ChatGPT's EMPTY phantom assistant rows and sat to the timeout while the
+        # real answer sat in an earlier row. That is now handled: the gateway runs
+        # `WEBCHAT_MODE=chatgpt` (drop-in 95-mode.conf) so the mode's
+        # `skipEmptyMessageRows` quirk applies. Verified live: HTTP 200, PONG in 5s.
+        Lane("chatgpt", "http://127.0.0.1:8087/v1/chat/completions",
+             ["chatgpt webchat"], 120, 300,
+             prompt_cap=12000),
         Lane("gemini", "http://127.0.0.1:8085/v1/chat/completions",
              ["gemini 3.7 flash webchat"], 300, 900,
-             prompt_cap=2500),   # 09-12: 15000 -> 6000 -> 4000 -> 2500. Measured on
+             prompt_cap=12000),  # 09-14: 2500 -> 12000. Bob: "the messages aren't even
+                                # going thru ... and its supposed to have the see next
+                                # chunk". A 2500-char user turn leaves gemini almost no
+                                # file context and no room to call see_next_chunk, so it
+                                # answered "cannot-fix" and looked inactive. Re-measured
+                                # live on the running gateway: 2500->6.3s, 6000->53.8s,
+                                # 12000->9.2s, 20000->33.1s, all returning PONG. The old
+                                # hangs were the pre-hard-cap tab, not the size.
+                                # 09-12: 15000 -> 6000 -> 4000 -> 2500. Measured on
                                 # the live gateway: total prompt (system ~1958 + user)
                                 # answered at 6276 chars, hung at 7960 and 9687, and
                                 # wedged the tab at 16960. But that measurement was on
@@ -568,7 +664,24 @@ class LanePool:
         # (600s) - roughly 2h of a worker slot spent on a lane that could not
         # answer until the quota reset. Cool those until 00:00 UTC instead.
         low = (body or "").lower()
-        if ("per-day" in low or "per_day" in low or "per day" in low
+        # 09-13 (owner): a webchat "Messages too frequent" / rate_limit is the
+        # account throttling US for sending too fast — not a dead model. The
+        # 90s base ladder was far too short: the lane came back while the
+        # throttle was still in force and immediately tripped it again. Give it
+        # a flat 15 min to let the account cool, and do NOT climb the streak
+        # ladder from it (a longer ban would just compound).
+        # 09-13 FOOTGUN: match the WEBCHAT message, not the substring
+        # "rate_limit". OrcaRouter's 429 body is `free_rate_limited`, which
+        # contains "rate_limit" — so a broad match gave an API lane the 15-min
+        # WEBCHAT cooldown instead of its own 45s ladder and parked it for
+        # nothing. Restrict this to the webchat lanes and the exact phrasing.
+        _webchat = lane.name in ("deepseek", "deepseek2", "deepseek4",
+                                 "deepseek5", "gemini", "kimi", "chatgpt", "notegpt")
+        if _webchat and ("too frequent" in low or "messages too frequent" in low
+                         or "finish_reason: rate_limit" in low):
+            cool = int(os.environ.get("WEBCHAT_RATE_LIMIT_COOLDOWN_S", "900"))
+            note = "webchat rate limit (messages too frequent) - 15 min cool"
+        elif ("per-day" in low or "per_day" in low or "per day" in low
                 or "limit_rpd" in low):
             cool = _secs_to_utc_midnight()
             note = "DAILY quota exhausted - out until 00:00 UTC"
@@ -649,6 +762,21 @@ class LanePool:
                 ex = normalize_edits(parse_json_object(res.content))
                 usable = bool(ex and isinstance(ex.get("edits"), list) and ex["edits"])
             if usable:
+                return res
+            # 09-13: a lane verdict that the work is already present / cannot be
+            # fixed is TERMINAL — the remaining lanes will say the same thing
+            # about the same file, so hopping just spends the pool. Measured
+            # live: 13-16 empty/no-edits hops PER LANE for single steps, ~25 min
+            # with zero commits, while every lane independently answered
+            # "cannot-fix:P1B6R0F6#20: ...", "P1B6R0F3#8 — satisfied (verified
+            # by MANIFEST.json read)" or "— cannot-fix (already satisfied /
+            # stale finding); no edits emitted". Return it to the engine, which
+            # escalates on these shapes instead of burning the rotation.
+            _low = (res.content or "").lower()
+            if res.ok and ("cannot-fix" in _low or "no edit emitted" in _low
+                           or "no edits emitted" in _low):
+                self.log(f"[lanes] {lane.name} terminal verdict — returning without hopping")
+                res.elapsed = time.time() - started
                 return res
             if res.ok:
                 self.log(f"[lanes] {lane.name} empty/no-edits answer ({len(res.content)}B) — hopping")
@@ -801,7 +929,7 @@ class LanePool:
             lane.failures = max(0, lane.failures)  # keep failures, just clear msgs
         self.log("[lanes] pool context reset (every-N-completed-steps)")
 
-    async def probe(self, session, timeout: int = 45) -> dict[str, bool]:
+    async def probe(self, session, timeout: int = 12) -> dict[str, bool]:
         """Cheap liveness probe; parks lanes that cannot answer at all.
 
         Probes run CONCURRENTLY under a short timeout. Probing serially meant a
