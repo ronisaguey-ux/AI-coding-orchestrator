@@ -267,6 +267,12 @@ async def save_state_serialized(st: dict) -> None:
                     continue
                 dstat = drec.get("status")
                 sstat = srec.get("status")
+                # 09-14 (worker): NEVER resurrect a step this run re-opened on
+                # purpose. Without this, one stale write of the old terminal
+                # record is enough for the merge to adopt it back into memory
+                # and make the re-open undo itself.
+                if sid in _REOPENED_THIS_RUN and dstat in TERMINAL:
+                    continue
                 # on disk already terminal, this snapshot is not -> keep disk
                 if dstat in TERMINAL and sstat not in TERMINAL:
                     ssteps[sid] = drec
@@ -1672,6 +1678,16 @@ def recover_orphaned_executing(st: dict) -> int:
 # reason is not in the list below and the step stays terminal.
 REOPEN_VERSION = "2026-09-14.worker.1"
 
+# 09-14 (worker): steps THIS process deliberately re-opened. The merge in
+# save_state_serialized keeps a TERMINAL status on disk over a non-terminal one
+# in memory — which is right for a stale snapshot, but WRONG for a step this run
+# re-opened on purpose: a single stale write of the old `escalated` record puts
+# it back on disk, the merge then adopts it into memory, and the engine
+# propagates it forever. Observed live: `escalated` flip-flopped 0 <-> 502 and
+# the 155 no-reason records kept returning minutes after a clean re-open.
+# A step in this set is never resurrected from disk by the merge.
+_REOPENED_THIS_RUN: set[str] = set()
+
 _REOPEN_NOT_A_VERDICT = (
     "timeout after", "timed out",
     "ClientConnectorError", "Cannot connect to host", "Connect call failed",
@@ -1712,6 +1728,7 @@ def reopen_dead_escalations(st: dict) -> int:
         rec["status"] = "pending"
         rec["rounds"] = 0                 # the old rounds were spent on a bug
         rec["reopened_by_startup"] = REOPEN_VERSION
+        _REOPENED_THIS_RUN.add(sid)
         rec["reopened_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
         rec["reopened_from_reason"] = (reason or "NONE (silent escalation)")[:200]
         rec.pop("last_lane_error", None)  # stale errors re-trigger the guards
