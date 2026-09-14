@@ -54,9 +54,9 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import orch_config
-import orch_lanes
-import orch_verify
+import config as orch_config
+import lanes as orch_lanes
+import verify as orch_verify
 
 LOG_PREFIX = "[esc]"
 
