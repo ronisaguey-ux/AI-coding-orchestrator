@@ -123,6 +123,20 @@ def _dahl_key() -> str:
     return ""
 
 
+def _cerebras_key() -> str:
+    """Cerebras Cloud key: $CEREBRAS_API_KEY, else ~/.config/orch/cerebras_key.txt."""
+    tok = os.environ.get("CEREBRAS_API_KEY", "").strip()
+    if tok:
+        return tok
+    p = Path(os.path.expanduser("~/.config/orch/cerebras_key.txt"))
+    if p.exists():
+        try:
+            return p.read_text(encoding="utf-8").strip()
+        except OSError:
+            return ""
+    return ""
+
+
 def default_lanes(cfg=None) -> list[Lane]:
     key = _openrouter_key()
     lanes = [
@@ -313,6 +327,35 @@ def default_lanes(cfg=None) -> list[Lane]:
                                         "AppleWebKit/537.36 (KHTML, like Gecko) "
                                         "Chrome/140.0.0.0 Safari/537.36")})]
           if _dahl_key() else []),
+        # 09-14 (owner): Cerebras Cloud — OpenAI-compatible, extremely fast
+        # inference. https://api.cerebras.ai/v1
+        #
+        # OPT-IN ONLY: set ORCH_CEREBRAS=1 to put it in the pool. It is NOT on by
+        # default because the supplied key currently has NO CREDIT — measured
+        # 2026-09-14, with the Cloudflare UA applied so the request really lands:
+        #   gpt-oss-120b  -> HTTP 402 "Payment required to access this resource.
+        #                    Visit your billing tab."
+        #   qwen-3.8-27b  -> HTTP 402 (same)
+        #   gemma-4-31b   -> HTTP 404 "Model does not exist or you do not have
+        #                    access to it."
+        # /v1/models lists all three, so the ids are right; the account just
+        # cannot bill. Per the rule that killed the omniroute lane, a lane that
+        # can never serve a real prompt is worse than a missing one — every draw
+        # would be a guaranteed failure and a wasted hop. Add billing (or a key
+        # with credit), then set ORCH_CEREBRAS=1 and it joins the pool.
+        #
+        # Like dahl, Cerebras sits behind Cloudflare and rejects a Python
+        # user-agent: the SAME request returned `403 error code: 1010` with
+        # aiohttp/urllib's default UA and got through to a real 402/404 with the
+        # browser UA below. 1010 is Cloudflare's browser-integrity block.
+        *([Lane("cerebras", "https://api.cerebras.ai/v1/chat/completions",
+                ["gpt-oss-120b", "qwen-3.8-27b"],
+                60, 180, prompt_cap=24000, timeout=120,
+                auth=_cerebras_key(),
+                headers={"User-Agent": ("Mozilla/5.0 (X11; Linux x86_64) "
+                                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                        "Chrome/140.0.0.0 Safari/537.36")})]
+          if _cerebras_key() and os.environ.get("ORCH_CEREBRAS", "0") == "1" else []),
         Lane("gemini", "http://127.0.0.1:8085/v1/chat/completions",
              ["gemini 3.7 flash webchat"], 300, 900,
              prompt_cap=12000, timeout=330),  # gw HARD_CAP_MS=300000 + 30s  # 09-14: 2500 -> 12000. Bob: "the messages aren't even

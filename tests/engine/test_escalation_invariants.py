@@ -432,3 +432,30 @@ def test_a_deliberate_reopen_is_not_resurrected_by_the_merge():
             mem[sid] = drec
     assert mem["T#1"]["status"] == "pending", "the re-open was undone by the merge"
     execute._REOPENED_THIS_RUN.clear()
+
+
+def test_cerebras_lane_is_opt_in_while_the_key_has_no_credit(monkeypatch):
+    """A lane that cannot serve a real prompt must not be in the pool.
+
+    Measured 2026-09-14 with the Cloudflare UA applied: every Cerebras model
+    returned HTTP 402 "Payment required to access this resource" (gemma-4-31b
+    404s). That is the omniroute failure mode — a guaranteed failure and a
+    wasted hop on every draw — so the lane ships behind ORCH_CEREBRAS=1.
+    """
+    monkeypatch.delenv("ORCH_CEREBRAS", raising=False)
+    names = [l.name for l in orch_lanes.default_lanes(execute.CFG)]
+    assert "cerebras" not in names, "a lane with no credit is in the default pool"
+
+    monkeypatch.setenv("ORCH_CEREBRAS", "1")
+    if not orch_lanes._cerebras_key():
+        pytest.skip("no cerebras key configured on this box")
+    lanes = {l.name: l for l in orch_lanes.default_lanes(execute.CFG)}
+    assert "cerebras" in lanes
+    c = lanes["cerebras"]
+    assert c.headers and "Python" not in c.headers.get("User-Agent", ""), (
+        "Cerebras 403s (Cloudflare 1010) on a Python user-agent")
+
+
+def test_no_cerebras_key_is_hardcoded():
+    src = Path(orch_lanes.__file__).read_text(encoding="utf-8")
+    assert "csk-" not in src, "a cerebras API key looks hardcoded in the source"
