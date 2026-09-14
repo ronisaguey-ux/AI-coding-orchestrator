@@ -400,3 +400,35 @@ def test_no_api_key_is_hardcoded_for_dahl():
     src = Path(orch_lanes.__file__).read_text(encoding="utf-8")
     assert "dahl_" not in src.replace("dahl_key", "").replace("_dahl_key", ""), (
         "a dahl API key looks hardcoded in the source")
+
+
+def test_a_deliberate_reopen_is_not_resurrected_by_the_merge():
+    """The merge must not undo a re-open this run performed on purpose.
+
+    save_state_serialized keeps a TERMINAL status found on disk over a
+    non-terminal one in memory. That is right for a stale snapshot, but for a
+    step this run deliberately re-opened it means a single stale write of the
+    old `escalated` record gets adopted back into memory and propagated —
+    observed live as `escalated` flip-flopping 0 <-> 502 with the 155 no-reason
+    records returning minutes after a clean re-open.
+    """
+    execute._REOPENED_THIS_RUN.clear()
+    st = {"steps": {"T#1": _esc("timeout after 600s")}}
+    assert execute.reopen_dead_escalations(st) == 1
+    assert "T#1" in execute._REOPENED_THIS_RUN
+
+    # simulate the merge seeing the OLD terminal record still on disk
+    disk = {"T#1": {"status": "escalated", "rounds": 3,
+                    "escalated_reason": "timeout after 600s"}}
+    mem = st["steps"]
+    TERMINAL = ("green", "escalated", "obsolete", "blocked")
+    for sid, srec in mem.items():
+        drec = disk.get(sid)
+        if not isinstance(drec, dict):
+            continue
+        if sid in execute._REOPENED_THIS_RUN and drec.get("status") in TERMINAL:
+            continue
+        if drec.get("status") in TERMINAL and srec.get("status") not in TERMINAL:
+            mem[sid] = drec
+    assert mem["T#1"]["status"] == "pending", "the re-open was undone by the merge"
+    execute._REOPENED_THIS_RUN.clear()
