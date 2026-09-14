@@ -546,12 +546,28 @@ class EscalationSolver:
                   watch: bool = False) -> int:
         import aiohttp
 
+        # 09-13: this used to skip the WHOLE pass whenever an executor process
+        # existed. The executor runs continuously, so the solver skipped 1,205
+        # consecutive passes and its 654-step backlog was never drained — the
+        # timer fired every ~3 min for nothing.
+        # `is_executor_active()` is the wrong question: what actually collides is
+        # a concurrent STATE WRITE. The executor rewrites the state file every few
+        # seconds mid-step, so skip only when it wrote very recently; otherwise
+        # proceed. Both writers already do atomic os.replace + flock, so the worst
+        # case is re-doing a step, never a truncated file.
         if is_executor_active():
-            log("executor running — skipping pass to avoid collision")
-            return 0
+            try:
+                age = time.time() - self.state_path.stat().st_mtime
+            except OSError:
+                age = 999
+            if age < 10:
+                log(f"executor writing state {age:.0f}s ago — skipping this pass")
+                return 0
+            log(f"executor running but state is {age:.0f}s stale — proceeding")
 
         state = read_state(self.state_path)
         steps = state["steps"]
+        changed: dict = {}  # step records THIS pass owns; see _commit_state
         escalated = [k for k, v in steps.items()
                      if v.get("status") == "escalated"]
         if only:
@@ -572,7 +588,13 @@ class EscalationSolver:
         index = load_plan_index(self.cfg.plan_path, set(batch))
         resolved = 0
 
-        timeout = aiohttp.ClientTimeout(total=int(self.cfg.lane_timeout) + 60)
+        # 09-14: lane_timeout+60 under the conservative profile is 360s PER REQUEST,
+        # and a step runs several tiers — so ONE step could exceed the 1500s pass
+        # budget and the 1800s unit timeout before the budget check ever ran again
+        # (measured: 1.28s CPU over 30min wall, SIGTERM'd mid-write). The solver is a
+        # drain, not a hero: cap each request so a step fits the budget, and let the
+        # next tick pick up where it stopped.
+        timeout = aiohttp.ClientTimeout(total=min(int(self.cfg.lane_timeout) + 60, 150))
         async with aiohttp.ClientSession(timeout=timeout) as session:
             if bool(self.cfg.lane_health_probe):
                 health = await self.pool.probe(session)
@@ -580,7 +602,18 @@ class EscalationSolver:
                     log("ABORT: no lane is answering — refusing to burn the backlog")
                     return 2
 
+            # 09-13: the unit is oneshot with TimeoutStartSec=1800 and the pass had
+            # NO wall-clock budget, so a run of slow lane calls (ClientTimeout is
+            # lane_timeout+60 per request, times several tiers per step) overran the
+            # 30 min and systemd SIGTERM'd it mid-backlog — measured 939ms CPU over
+            # 15min wall, i.e. blocked, never finishing. Stop cleanly with time to
+            # spare so the state write completes and the next timer tick resumes.
+            pass_deadline = time.time() + float(self.cfg.get("escalation_pass_budget_s", 1500))
             for sid in batch:
+                if time.time() >= pass_deadline:
+                    log(f"pass budget spent — stopping early with {len(batch) - resolved} "
+                        f"step(s) left for the next tick")
+                    break
                 pct, avail_mb = memory_state()
                 min_avail = float(self.cfg.get("min_avail_mb", 600))
                 if avail_mb < min_avail or pct > float(self.cfg.ram_pct_cap):
@@ -613,8 +646,9 @@ class EscalationSolver:
                         rec["resolved_by"] = "escalation_solver:preflight"
                         rec["escalation_result"] = {"tier": "preflight",
                                                     "reason": why[:400]}
-                        write_state(self.state_path, state,
-                                    bool(self.cfg.state_backups))
+                        changed[sid] = rec
+                        self._commit_state(changed)
+                        changed.clear()
                         self._write_queue()
                     continue
 
@@ -661,7 +695,9 @@ class EscalationSolver:
                         "final": outcome["final"],
                         "detail": str(last.get("detail"))[:300],
                     }
-                write_state(self.state_path, state, bool(self.cfg.state_backups))
+                changed[sid] = rec
+                self._commit_state(changed)
+                changed.clear()
                 # Flush the audit trail per step, not at exit: a systemd stop or
                 # a timeout mid-pass used to discard every record but the ones
                 # already on disk, leaving solved steps with no explanation.
@@ -675,6 +711,25 @@ class EscalationSolver:
         log(f"lane health: {self.pool.health_report()}")
         log(f"resolved {resolved}/{len(batch)} this pass")
         return 0
+
+    def _commit_state(self, changed: dict) -> None:
+        """Write ONLY the steps this solver changed, onto a fresh read.
+
+        09-13: this pass used to hold a state snapshot for its whole run
+        (measured 9 min 28 s) and then `write_state(snapshot)` — clobbering
+        every executor update that landed in between. Measured: green fell
+        2782 -> 2776 and pending rose 10802 -> 10811 after one pass, i.e. the
+        executor's finished steps were rolled back to pending and had to be
+        redone. Re-read under the same flock, apply only our own step records,
+        and leave every other step exactly as the executor left it.
+        """
+        if not changed:
+            return
+        fresh = read_state(self.state_path)
+        fresh_steps = fresh.setdefault("steps", {})
+        for sid, rec in changed.items():
+            fresh_steps[sid] = rec
+        write_state(self.state_path, fresh, bool(self.cfg.state_backups))
 
     def _write_queue(self) -> None:
         """Append audit entries not yet on disk. Safe to call after every step."""

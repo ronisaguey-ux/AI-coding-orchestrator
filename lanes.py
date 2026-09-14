@@ -70,6 +70,18 @@ class Lane:
     prompt_cap: int | None = None  # 09-09 (Bob 6365): per-turn char cap for
                                    # webchat lanes (gemini timeout guard)
     auth: str = ""
+    # 09-14 (worker, B4): PER-LANE call timeout. Until now every lane shared the
+    # single global `cfg.lane_timeout` (400s), while the positional `45, 120` /
+    # `300, 900` args above are cool_base/cool_esc — COOLDOWNS, not timeouts. So
+    # a fast API lane that answers in ~5s held a worker slot for the full 400s
+    # when it hung, and a webchat lane that legitimately needs 400s+ was
+    # guillotined whenever the global was lowered. Measured on the live state:
+    # 269 escalated steps carry a `timeout after Ns` reason spread across NINE
+    # different values (120/150/200/240/280/300/400/420/600) — that spread is
+    # the global being retuned over and over for whichever lane was hurting.
+    # ALWAYS pass this as a keyword: `prompt_cap` and `auth` precede it, and a
+    # positional arg silently bound the API key to prompt_cap once already.
+    timeout: int | None = None
     # runtime health
     dead_until: float = 0.0
     model_dead: dict[str, float] = field(default_factory=dict)
@@ -102,7 +114,7 @@ def default_lanes(cfg=None) -> list[Lane]:
              ["nvidia/nemotron-3-ultra-550b-a55b:free",
               "poolside/laguna-s-2.1:free",
               "nex-agi/nex-n2.5-pro:free"],
-             45, 120, prompt_cap=12000, auth=key),  # 09-12: the engine ships a
+             45, 120, prompt_cap=12000, auth=key, timeout=120),  # 09-12: the engine ships a
              # ~60K-char system prompt. The free models answer a small prompt fine
              # (verified live) but return EMPTY on the full one, which the engine
              # reads as 'empty/no-edits' and ladder-cools the model — so the lane
@@ -112,7 +124,7 @@ def default_lanes(cfg=None) -> list[Lane]:
              # positional form silently bound the API key to prompt_cap and
              # left auth="" → the lane was dropped by the `or ln.auth` filter.
         Lane("deepseek", "http://127.0.0.1:8080/v1/chat/completions",
-             ["anymodel"], 90, 270, prompt_cap=12000),
+             ["anymodel"], 90, 270, prompt_cap=12000, timeout=270),
         # 09-12 (owner): two more signed-in deepseek webchats, each on its own
         # profile, as separate lanes. All three share the gateway's 30s send
         # spacing (MIN_SEND_INTERVAL_MS + /tmp/deepseek_last_send), so they can
@@ -124,9 +136,9 @@ def default_lanes(cfg=None) -> list[Lane]:
         # batch 1 never completed, green stayed flat). Cap it like gemini and
         # openrouter: the small prompts (557-1104 chars) answered in 3-6s.
         Lane("deepseek2", "http://127.0.0.1:8081/v1/chat/completions",
-             ["anymodel"], 90, 270, prompt_cap=12000),
+             ["anymodel"], 90, 270, prompt_cap=12000, timeout=270),
         Lane("deepseek4", "http://127.0.0.1:8083/v1/chat/completions",
-             ["anymodel"], 90, 270, prompt_cap=12000),
+             ["anymodel"], 90, 270, prompt_cap=12000, timeout=270),
         # PULLED 09-13: every auto/* combo now 402/401 on an oc/* model
         # Lane("omniroute", "http://127.0.0.1:20128/v1/chat/completions",
              # 09-12 LATER: the auto/* combos load-balance and now route onto
@@ -182,7 +194,7 @@ def default_lanes(cfg=None) -> list[Lane]:
         Lane("orcarouter", "https://api.orcarouter.ai/v1/chat/completions",
              ["deepseek/deepseek-v4-flash-free", "orcarouter/free",
               "tencent/hy3-free", "z-ai/glm-5.3-flash-free"],
-             45, 120, prompt_cap=24000,
+             45, 120, prompt_cap=24000, timeout=120,
              auth="sk-orca-KNVShgXMQpSKanLRM8BFK6ZKyVCFoN3IhIdnZxubslG"),
         # 09-13 (owner): Bitdeer AI Cloud Model Studio — OpenAI-compatible API
         # lane, key named "oculus" in their console. Base URL taken from the
@@ -195,7 +207,7 @@ def default_lanes(cfg=None) -> list[Lane]:
         # API lane: no tab, no mutex, no anti-ban gap.
         Lane("bitdeer", "https://api-inference.bitdeer.ai/v1/chat/completions",
              ["deepseek-ai/DeepSeek-V4-Flash"],
-             60, 180, prompt_cap=24000,
+             60, 180, prompt_cap=24000, timeout=120,
              auth="AIni2RlIlDeDOEclStU3"),
         # 09-13 (owner): ChatGPT webchat lane (Free account, text chat only —
         # image analysis is capped but text is unlimited). Gateway :8087 on the
@@ -232,10 +244,10 @@ def default_lanes(cfg=None) -> list[Lane]:
         # `skipEmptyMessageRows` quirk applies. Verified live: HTTP 200, PONG in 5s.
         Lane("chatgpt", "http://127.0.0.1:8087/v1/chat/completions",
              ["chatgpt webchat"], 120, 300,
-             prompt_cap=12000),
+             prompt_cap=12000, timeout=210),  # gw HARD_CAP_MS=180000 + 30s
         Lane("gemini", "http://127.0.0.1:8085/v1/chat/completions",
              ["gemini 3.7 flash webchat"], 300, 900,
-             prompt_cap=12000),  # 09-14: 2500 -> 12000. Bob: "the messages aren't even
+             prompt_cap=12000, timeout=330),  # gw HARD_CAP_MS=300000 + 30s  # 09-14: 2500 -> 12000. Bob: "the messages aren't even
                                 # going thru ... and its supposed to have the see next
                                 # chunk". A 2500-char user turn leaves gemini almost no
                                 # file context and no room to call see_next_chunk, so it
@@ -681,6 +693,16 @@ class LanePool:
                          or "finish_reason: rate_limit" in low):
             cool = int(os.environ.get("WEBCHAT_RATE_LIMIT_COOLDOWN_S", "900"))
             note = "webchat rate limit (messages too frequent) - 15 min cool"
+        elif "free_rate_limited" in low or "free model capacity" in low:
+            # 09-14: OrcaRouter's 429 is a SITE-WIDE free pool, not our
+            # per-key quota — "Free model capacity is limited right now."
+            # The 45s/345s ladder put the lane straight back into rotation
+            # while the pool was still full, so every hop burned a worker
+            # slot on a guaranteed 429 (measured 4 cooled models cycling all
+            # afternoon). Cool it out long enough that a pick is actually
+            # worth making; it recovers on its own.
+            cool = int(os.environ.get("FREE_POOL_COOLDOWN_S", "1800"))
+            note = "free pool capacity full - 30 min cool"
         elif ("per-day" in low or "per_day" in low or "per day" in low
                 or "limit_rpd" in low):
             cool = _secs_to_utc_midnight()
@@ -808,8 +830,10 @@ class LanePool:
             return LaneResult(ok=False, lane=lane.name,
                               error="all models of this lane are cooled")
 
+        # 09-14 (worker, B4): per-lane budget, falling back to the global.
+        lane_budget = int(lane.timeout or self.cfg.lane_timeout)
         timeout = aiohttp.ClientTimeout(
-            total=int(self.cfg.lane_timeout),
+            total=lane_budget,
             connect=int(self.cfg.lane_connect_timeout))
         retries = max(1, int(self.cfg.lane_retries))
         max_chars = int(self.cfg.max_prompt_chars)
@@ -817,16 +841,44 @@ class LanePool:
         last_status = 0
 
         for model in models:
-            msgs: list[dict] = [{"role": "system", "content": system[:60000]}]
+            # 09-14 (worker, B5): `prompt_cap` is a promise about what this lane
+            # can swallow, but it was applied to the USER turn ONLY. The system
+            # message got a flat [:60000] and every history turn got
+            # [:max_prompt_chars] (80000) — so a lane advertising prompt_cap=12000
+            # could legitimately be handed system + 6 history turns + user far
+            # past its cap. That is the same failure mode as the omniroute lane
+            # that answered `[502] Prompt too long (max 6000 characters)` on 83
+            # steps: the engine enforced a cap the payload never respected.
+            # Bound EVERY component, and the total, against the lane's cap.
+            _cap = lane.prompt_cap or max_chars
+            _sys = system[:min(60000, _cap)]
+            msgs: list[dict] = [{"role": "system", "content": _sys}]
+            _budget = max(0, _cap - len(_sys))
             if history:
                 # prior assistant/user turns (same task) so an API lane remembers
                 # why the previous attempt failed instead of re-trying blind.
-                for turn in history[-6:]:
+                # History is the FIRST thing sacrificed when the budget is tight:
+                # it is context, the current user turn is the actual task.
+                _hist_budget = _budget // 3
+                _turns = []
+                for turn in reversed(history[-6:]):   # newest first
                     r = str(turn.get("role") or "")
                     c = str(turn.get("content") or "")
-                    if r in ("assistant", "user") and c:
-                        msgs.append({"role": r, "content": c[:max_chars]})
-            msgs.append({"role": "user", "content": _cap_user(user, max_chars, lane.prompt_cap)})
+                    if r not in ("assistant", "user") or not c:
+                        continue
+                    if _hist_budget <= 0:
+                        break
+                    c = c[:min(max_chars, _hist_budget)]
+                    _hist_budget -= len(c)
+                    _turns.append({"role": r, "content": c})
+                _turns.reverse()                      # restore chronological order
+                msgs.extend(_turns)
+                _budget -= sum(len(t["content"]) for t in _turns)
+            # NEVER pass a falsy cap here: `_cap_user` treats None/0 as
+            # "no cap" and would hand the lane the whole untruncated prompt —
+            # the exact bug this block exists to prevent. Floor it instead.
+            msgs.append({"role": "user",
+                         "content": _cap_user(user, max_chars, max(512, _budget))})
             payload = {
                 "model": model,
                 "messages": msgs,
@@ -900,7 +952,8 @@ class LanePool:
                             await asyncio.sleep(3 * attempt)
                 except asyncio.TimeoutError:
                     lane.failures += 1
-                    last_err = f"timeout after {self.cfg.lane_timeout}s"
+                    last_err = (f"timeout after {lane_budget}s"
+                                f"{'' if lane.timeout is None else ' (per-lane budget)'}")
                     self._cool_model(lane, model, escalated=True)
                     break  # a hanging gateway must not be retried in place
                 except Exception as exc:  # aiohttp connection errors
