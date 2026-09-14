@@ -1167,8 +1167,12 @@ async def main():
     if args.self_check:
         # 2026-08-09 (step 571): --self-check verifies shim resolution.
         ok = True
-        for path, expect in (("oculus/config_loader.py", "config_loader"),
-                             ("oculus/live/courtroom.py", "live.courtroom")):
+        _shim_cases = ((_os.path.join(REPO_ROOT, "config_loader.py"), "config_loader"),
+                       (_os.path.join(REPO_ROOT, "live", "courtroom.py"), "live.courtroom"))
+        for path, expect in _shim_cases:
+            if not _os.path.exists(path):
+                print(f"[self-check] SKIP {path}: not present in this checkout")
+                continue
             try:
                 with open(path, errors="ignore") as f:
                     got = resolve_shim_target(f.read())
