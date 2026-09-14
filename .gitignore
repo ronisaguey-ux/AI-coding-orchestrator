@@ -16,3 +16,6 @@ orchestrator_data/
 agent_todo_list.json
 claude_*_inbox.json
 claude_*_outbox.json
+
+# VibeDoctor scan artifacts
+.vibedoctor/
