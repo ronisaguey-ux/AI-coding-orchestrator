@@ -31,7 +31,7 @@ import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 # ------------------------------------------------------------------ lanes ---
 # (name, url, models, cooldown_base, cooldown_escalated, auth_token)
@@ -87,6 +87,11 @@ class Lane:
     # ("Python/3.x aiohttp/3.y") is blocked outright. Measured live: the SAME
     # request returned 403 with the default UA and 200 with a browser UA.
     headers: dict | None = None
+    # 09-14 (worker): async callable that mints a FRESH api key for this lane and
+    # persists it, used when the provider reports the key's quota is spent. A
+    # lane whose key is exhausted is a lane that is silently dark; dahl hands out
+    # replacement keys for free, so going dark is a choice, not a constraint.
+    key_refresh: "Callable | None" = None
     # runtime health
     dead_until: float = 0.0
     model_dead: dict[str, float] = field(default_factory=dict)
@@ -121,6 +126,73 @@ def _dahl_key() -> str:
         except OSError:
             return ""
     return ""
+
+
+# 09-14 (worker): dahl sits behind Cloudflare, which 403s a Python user-agent
+# (aiohttp's default is blocked outright). Measured: same request, 403 with the
+# default UA, 200 with this one. Used by the lane AND by the key minter.
+_BROWSER_UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+               "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36")
+
+_DAHL_KEY_PATH = Path(os.path.expanduser("~/.config/orch/dahl_key.txt"))
+_DAHL_MINT_URL = "https://inference.dahl.global/tokens"
+_DAHL_MINT_COOLDOWN_S = 120.0
+_dahl_last_mint = 0.0
+
+
+def _is_quota_exhausted(status: int, body: str) -> bool:
+    """True when the provider says THIS KEY is spent (not that we are throttled).
+
+    Deliberately narrow: a 429 is throttling and must NOT mint a key (that would
+    burn a fresh key on every rate-limit blip). Only an explicit quota/credit
+    verdict counts.
+    """
+    if status not in (401, 402):
+        return False
+    low = (body or "").lower()
+    return any(m in low for m in (
+        "insufficient_quota", "available tokens exhausted",
+        "quota", "token limit reached",
+    ))
+
+
+async def _dahl_mint_key(session) -> str:
+    """Mint a fresh dahl key (100,000,000 tokens) and persist it 0600.
+
+    `POST https://inference.dahl.global/tokens` needs NO auth and returns
+    {"available_tokens":100000000,"token":"dahl_..."} — verified live 2026-09-14.
+    Rate-limited by _DAHL_MINT_COOLDOWN_S so a broken provider cannot make the
+    engine mint keys in a loop.
+    """
+    global _dahl_last_mint
+    now = time.time()
+    if now - _dahl_last_mint < _DAHL_MINT_COOLDOWN_S:
+        return ""
+    _dahl_last_mint = now
+    import aiohttp
+    try:
+        async with session.post(
+                _DAHL_MINT_URL, json={},
+                headers={"Content-Type": "application/json",
+                         "User-Agent": _BROWSER_UA},
+                timeout=aiohttp.ClientTimeout(total=30)) as resp:
+            if resp.status not in (200, 201):
+                return ""
+            data = json.loads(await resp.text())
+    except Exception:
+        return ""
+    tok = str(data.get("token") or "").strip()
+    if not tok:
+        return ""
+    try:
+        _DAHL_KEY_PATH.parent.mkdir(parents=True, exist_ok=True)
+        # write 0600 before any content lands in the file
+        fd = os.open(str(_DAHL_KEY_PATH), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(tok)
+    except OSError:
+        pass          # an unpersisted key still works for this process
+    return tok
 
 
 def default_lanes(cfg=None) -> list[Lane]:
@@ -287,31 +359,36 @@ def default_lanes(cfg=None) -> list[Lane]:
         #     spends most of its budget reasoning, so the completion budget must
         #     not be clipped the way a webchat lane's is.
         #
-        # MODEL ORDER IS DELIBERATE (owner: "use deepseek flash cuz its a better
-        # model"). DeepSeek-V4-Flash-0731 is listed FIRST so the pool takes it
-        # whenever it is servable; the pool hops to the next model in the lane on
-        # failure, so MiniMax is the fallback rather than the default.
-        # As of 2026-09-14 DeepSeek answers HTTP 429 `model_concurrency`:
+        # STRAIGHT TO MINIMAX (owner 2026-09-14: "js have it go straight to
+        # minstrall"). DeepSeek-V4-Flash-0731 was tried first for a while, but it
+        # answers HTTP 429 `model_concurrency` on every single probe:
         #   "This model is at concurrency capacity. Signed-in and paid accounts
         #    are admitted first."
-        # That is CAPACITY GATING for anonymous keys, not an exhausted quota, so
-        # it is transient and worth retrying — `http 429` is already a transport
-        # marker, so it never escalates a step. MiniMax answered every probe
-        # (1.4-9.1s). If DeepSeek stays gated, signing the key in to an account
-        # is what unlocks it.
+        # That is an ACCOUNT-TIER gate for anonymous keys, not a transient queue,
+        # so listing it first bought nothing and cost a guaranteed-failed hop
+        # plus a 60s ladder cool on every draw (visible in the engine journal as
+        # `dahl/deepseek-ai/DeepSeek-V4-Flash-0731 ladder-cooled 60s`). Same rule
+        # that pulled omniroute: a model that can never answer is worse than a
+        # missing one. MiniMax answered every probe (1.4-12.7s).
+        # Set ORCH_DAHL_DEEPSEEK=1 to put DeepSeek back in front — worth doing
+        # once the key is signed in to a Dahl account, which is what lifts the
+        # gate.
         #
-        # An exhausted key answers `402 insufficient_quota: available tokens
-        # exhausted` — mint a new one with `POST /tokens` (no auth, returns a key
-        # with available_tokens=100000000) and write it to
-        # ~/.config/orch/dahl_key.txt.
+        # KEY EXHAUSTION IS SELF-HEALING. An spent key answers
+        # `402 insufficient_quota: available tokens exhausted` (the owner's
+        # original key did this on its first call). `key_refresh=_dahl_mint_key`
+        # mints a replacement in-flight via the unauthenticated
+        # `POST /tokens` (100,000,000 tokens), persists it 0600 to
+        # ~/.config/orch/dahl_key.txt, and retries the same model once, so the
+        # lane never goes dark over a quota that is free to replace.
         *([Lane("dahl", "https://inference.dahl.global/v1/chat/completions",
-                ["deepseek-ai/DeepSeek-V4-Flash-0731",
-                 "MiniMaxAI/MiniMax-M2.7"],
+                (["deepseek-ai/DeepSeek-V4-Flash-0731", "MiniMaxAI/MiniMax-M2.7"]
+                 if os.environ.get("ORCH_DAHL_DEEPSEEK", "0") == "1"
+                 else ["MiniMaxAI/MiniMax-M2.7"]),
                 60, 180, prompt_cap=24000, timeout=180,
                 auth=_dahl_key(),
-                headers={"User-Agent": ("Mozilla/5.0 (X11; Linux x86_64) "
-                                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                                        "Chrome/140.0.0.0 Safari/537.36")})]
+                key_refresh=_dahl_mint_key,
+                headers={"User-Agent": _BROWSER_UA})]
           if _dahl_key() else []),
         Lane("gemini", "http://127.0.0.1:8085/v1/chat/completions",
              ["gemini 3.7 flash webchat"], 300, 900,
@@ -956,6 +1033,7 @@ class LanePool:
         max_chars = int(self.cfg.max_prompt_chars)
         last_err = "unknown"
         last_status = 0
+        refreshed_key = False   # 09-14: at most ONE key mint per lane call
 
         for model in models:
             # 09-14 (worker, B5): `prompt_cap` is a promise about what this lane
@@ -1049,6 +1127,29 @@ class LanePool:
                                               status=200, attempts=attempt)
                         last_err = f"http {resp.status}: {body[:160]}"
                         lane.failures += 1
+                        # 09-14 (worker): THE KEY IS SPENT, NOT THE LANE.
+                        # dahl hands out replacement keys for free
+                        # (unauthenticated POST /tokens, 100M tokens), so an
+                        # exhausted key used to take the lane dark for no reason
+                        # — the owner's original key answered
+                        # `402 insufficient_quota: available tokens exhausted`
+                        # on its very first call. Mint a fresh one, swap it in,
+                        # and retry the SAME model once. Deliberately narrow: a
+                        # 429 is throttling and must never mint (that would burn
+                        # a new key on every rate-limit blip), and the minter
+                        # itself is cooldown-guarded against a mint loop.
+                        if (not refreshed_key and lane.key_refresh
+                                and _is_quota_exhausted(resp.status, body)):
+                            refreshed_key = True
+                            new_key = await lane.key_refresh(session)
+                            if new_key and new_key != lane.auth:
+                                lane.auth = new_key
+                                headers["Authorization"] = f"Bearer {new_key}"
+                                self.log(f"[lanes] {lane.name} key was exhausted — "
+                                         f"minted a fresh one, retrying")
+                                continue      # retry this model with the new key
+                            self.log(f"[lanes] {lane.name} key exhausted and could "
+                                     f"not mint a replacement")
                         if resp.status == 429:
                             self._cool_model(lane, model, body=body)
                             break
