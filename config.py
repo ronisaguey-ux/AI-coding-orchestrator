@@ -10,7 +10,7 @@ through here, so the gateway envs and the engine options read the SAME source.
 Profiles (``ORCH_PROFILE``) are named presets applied on top of the defaults and
 below the config file, so a profile never overrides an explicit user setting.
 
-    ORCH_PROFILE=max-throughput python3 execute_8_27_engine.py --resume
+    ORCH_PROFILE=max-throughput python3 execute.py --resume
 
 Config file search order (first hit wins) — override with ``ORCH_CONFIG``:
     ./orch.yaml, ./orch.json, ~/.config/orch/orch.yaml,
