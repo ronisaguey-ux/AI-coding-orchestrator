@@ -17,7 +17,9 @@ These are unit tests over the real modules — no network, no state file writes.
 """
 import importlib
 import os
+import re
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -375,8 +377,9 @@ def test_dahl_lane_is_configured_correctly_when_a_key_is_present():
     assert d.headers and "User-Agent" in d.headers
     assert "Python" not in d.headers["User-Agent"], (
         "a Python user-agent is 403'd by the Cloudflare in front of dahl")
-    assert d.models[0].startswith("deepseek-ai/"), (
-        "owner asked for DeepSeek Flash first; MiniMax is the fallback")
+    assert d.models[0] == "MiniMaxAI/MiniMax-M2.7", (
+        "owner asked for the lane to go straight to MiniMax; DeepSeek is "
+        "account-gated and only cost a guaranteed-failed hop")
     assert d.auth, "lane present without a key"
     assert d.timeout
 
@@ -397,9 +400,12 @@ def test_lane_extra_headers_are_actually_sent():
 
 def test_no_api_key_is_hardcoded_for_dahl():
     """The dahl key lives in ~/.config/orch/dahl_key.txt or $DAHL_API_KEY."""
+    # Match a real KEY (dahl_ + a long random tail), not identifiers like
+    # _dahl_key / _dahl_mint_key / _DAHL_MINT_URL. The previous string-replace
+    # hack tripped over every new dahl_* symbol.
     src = Path(orch_lanes.__file__).read_text(encoding="utf-8")
-    assert "dahl_" not in src.replace("dahl_key", "").replace("_dahl_key", ""), (
-        "a dahl API key looks hardcoded in the source")
+    leaked = re.findall(r"dahl_[A-Za-z0-9]{20,}", src)
+    assert not leaked, f"a dahl API key looks hardcoded in the source: {leaked}"
 
 
 def test_a_deliberate_reopen_is_not_resurrected_by_the_merge():
@@ -432,3 +438,59 @@ def test_a_deliberate_reopen_is_not_resurrected_by_the_merge():
             mem[sid] = drec
     assert mem["T#1"]["status"] == "pending", "the re-open was undone by the merge"
     execute._REOPENED_THIS_RUN.clear()
+
+
+# ------------------------------------------------- dahl key self-heal -------
+@pytest.mark.parametrize("status,body,expected", [
+    (402, '{"error":{"code":"insufficient_quota","message":"available tokens exhausted"}}', True),
+    (401, '{"error":{"message":"quota exceeded"}}', True),
+    # A 429 is THROTTLING, not a spent key. Minting here would burn a fresh
+    # 100M-token key on every rate-limit blip.
+    (429, '{"error":{"code":"free_rate_limited","message":"capacity is limited"}}', False),
+    (429, '{"error":{"code":"model_concurrency","message":"at concurrency capacity"}}', False),
+    (200, '{"choices":[]}', False),
+    (500, '{"error":"boom"}', False),
+    (402, '{"error":{"message":"card declined"}}', False),   # 402 without a quota verdict
+])
+def test_only_a_spent_key_triggers_a_mint(status, body, expected):
+    assert orch_lanes._is_quota_exhausted(status, body) is expected
+
+
+def test_dahl_goes_straight_to_minimax_by_default(monkeypatch):
+    """DeepSeek is account-gated (429 model_concurrency on every probe), so
+    listing it first only bought a guaranteed-failed hop plus a 60s ladder cool."""
+    monkeypatch.delenv("ORCH_DAHL_DEEPSEEK", raising=False)
+    lanes = {l.name: l for l in orch_lanes.default_lanes(execute.CFG)}
+    if "dahl" not in lanes:
+        pytest.skip("no dahl key configured on this box")
+    assert lanes["dahl"].models == ["MiniMaxAI/MiniMax-M2.7"]
+
+    monkeypatch.setenv("ORCH_DAHL_DEEPSEEK", "1")
+    lanes = {l.name: l for l in orch_lanes.default_lanes(execute.CFG)}
+    assert lanes["dahl"].models[0].startswith("deepseek-ai/"), (
+        "the opt-in must put DeepSeek back in front")
+
+
+def test_dahl_lane_can_refresh_its_own_key():
+    lanes = {l.name: l for l in orch_lanes.default_lanes(execute.CFG)}
+    if "dahl" not in lanes:
+        pytest.skip("no dahl key configured on this box")
+    assert lanes["dahl"].key_refresh is orch_lanes._dahl_mint_key
+
+
+def test_key_minting_is_cooldown_guarded_against_a_loop():
+    """A provider stuck on 402 must not make the engine mint keys forever."""
+    import asyncio
+
+    class _Boom:
+        def post(self, *a, **k):
+            raise AssertionError("minted inside the cooldown window")
+
+    orch_lanes._dahl_last_mint = time.time()          # pretend we just minted
+    got = asyncio.run(orch_lanes._dahl_mint_key(_Boom()))
+    assert got == "", "minted again inside the cooldown window"
+    orch_lanes._dahl_last_mint = 0.0                  # restore for other tests
+
+
+def test_mint_cooldown_is_a_real_interval():
+    assert orch_lanes._DAHL_MINT_COOLDOWN_S >= 60
