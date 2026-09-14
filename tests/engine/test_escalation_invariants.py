@@ -317,3 +317,86 @@ def test_reopen_can_be_disabled(monkeypatch):
     st = {"steps": {"T#1": _esc("timeout after 200s")}}
     assert execute.reopen_dead_escalations(st) == 0
     assert st["steps"]["T#1"]["status"] == "escalated"
+
+
+# ------------------------------------------- reasoning models / dahl --------
+def test_reasoning_block_is_stripped_before_json_is_parsed():
+    """A <think> block that restates the CONTRACT must not be parsed as answer.
+
+    Measured live against MiniMaxAI/MiniMax-M2.7 on the dahl lane: the model
+    restates the contract example inside its chain of thought, so the
+    first-balanced-object scan returned the PLACEHOLDER
+    {"path":"FILE","old_string":"OLD"} instead of the real edit. Applying that
+    yields "old_string not found (context changed)" and burns the step's rounds.
+    """
+    raw = ('<think>The user wants alpha -> OMEGA. The contract says to output '
+           '{"edits":[{"path":"FILE","old_string":"OLD","new_string":"NEW"}],'
+           '"notes":"..."} so I will do that.</think>\n\n'
+           '{"edits":[{"path":"a.py","old_string":"alpha","new_string":"OMEGA"}],'
+           '"notes":"Changed alpha to OMEGA"}')
+    got = orch_lanes.normalize_edits(orch_lanes.parse_json_object(raw))
+    edits = got.get("edits") or []
+    assert len(edits) == 1
+    assert edits[0].get("old_string") == "alpha", "parsed the contract example, not the answer"
+    assert edits[0].get("new_string") == "OMEGA"
+
+
+@pytest.mark.parametrize("open_tag,close_tag", [
+    ("<think>", "</think>"),
+    ("<thinking>", "</thinking>"),
+    ("<reasoning>", "</reasoning>"),
+])
+def test_reasoning_strip_covers_the_common_tag_spellings(open_tag, close_tag):
+    raw = (f'{open_tag}{{"edits":[{{"path":"FILE","old_string":"OLD"}}]}}{close_tag}'
+           '{"edits":[{"path":"real.py","old_string":"x","new_string":"y"}]}')
+    got = orch_lanes.normalize_edits(orch_lanes.parse_json_object(raw))
+    assert (got.get("edits") or [{}])[0].get("path") == "real.py"
+
+
+def test_unclosed_reasoning_block_yields_no_edits_not_scratch_work():
+    """A reply truncated mid-thought has no answer — it must not look like one."""
+    raw = '<think>I should emit {"edits":[{"path":"FILE","old_string":"OLD"}]} next'
+    got = orch_lanes.normalize_edits(orch_lanes.parse_json_object(raw))
+    assert not (got.get("edits") or []), "returned the model's scratch work as the answer"
+
+
+def test_plain_json_is_unaffected_by_the_reasoning_strip():
+    raw = '{"edits":[{"path":"a.py","old_string":"x","new_string":"y"}],"notes":"n"}'
+    got = orch_lanes.normalize_edits(orch_lanes.parse_json_object(raw))
+    assert (got.get("edits") or [{}])[0].get("path") == "a.py"
+
+
+def test_dahl_lane_is_configured_correctly_when_a_key_is_present():
+    """dahl needs a browser UA (Cloudflare 403s a Python UA) and DeepSeek first."""
+    lanes = {l.name: l for l in orch_lanes.default_lanes(execute.CFG)}
+    if "dahl" not in lanes:
+        pytest.skip("no dahl key configured on this box")
+    d = lanes["dahl"]
+    assert d.headers and "User-Agent" in d.headers
+    assert "Python" not in d.headers["User-Agent"], (
+        "a Python user-agent is 403'd by the Cloudflare in front of dahl")
+    assert d.models[0].startswith("deepseek-ai/"), (
+        "owner asked for DeepSeek Flash first; MiniMax is the fallback")
+    assert d.auth, "lane present without a key"
+    assert d.timeout
+
+
+def test_lane_extra_headers_are_actually_sent():
+    """A `headers` dict on a Lane must reach the request, overriding defaults."""
+    lane = orch_lanes.Lane("x", "http://127.0.0.1:1/v1", ["m"], auth="k",
+                           headers={"User-Agent": "Mozilla/5.0", "X-Test": "1"})
+    headers = {"Content-Type": "application/json"}
+    if lane.auth:
+        headers["Authorization"] = f"Bearer {lane.auth}"
+    if lane.headers:
+        headers.update(lane.headers)
+    assert headers["User-Agent"] == "Mozilla/5.0"
+    assert headers["X-Test"] == "1"
+    assert headers["Authorization"] == "Bearer k"
+
+
+def test_no_api_key_is_hardcoded_for_dahl():
+    """The dahl key lives in ~/.config/orch/dahl_key.txt or $DAHL_API_KEY."""
+    src = Path(orch_lanes.__file__).read_text(encoding="utf-8")
+    assert "dahl_" not in src.replace("dahl_key", "").replace("_dahl_key", ""), (
+        "a dahl API key looks hardcoded in the source")

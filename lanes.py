@@ -82,6 +82,11 @@ class Lane:
     # ALWAYS pass this as a keyword: `prompt_cap` and `auth` precede it, and a
     # positional arg silently bound the API key to prompt_cap once already.
     timeout: int | None = None
+    # 09-14 (worker): per-lane extra request headers. The dahl lane sits behind
+    # Cloudflare, which 403s on a Python user-agent — aiohttp's default
+    # ("Python/3.x aiohttp/3.y") is blocked outright. Measured live: the SAME
+    # request returned 403 with the default UA and 200 with a browser UA.
+    headers: dict | None = None
     # runtime health
     dead_until: float = 0.0
     model_dead: dict[str, float] = field(default_factory=dict)
@@ -95,6 +100,27 @@ class Lane:
 
     def is_available(self, now: float) -> bool:
         return now >= self.dead_until and bool(self.available_models(now))
+
+
+def _dahl_key() -> str:
+    """Dahl API key: $DAHL_API_KEY, else the 0600 file at ~/.config/orch/dahl_key.txt.
+
+    Kept OUT of the source: this repo is public and the engine already has a
+    file-based convention for the OpenRouter PAT (see _openrouter_key).
+    A fresh key with a 100,000,000-token allowance is mintable with an
+    unauthenticated `POST https://inference.dahl.global/tokens` (verified live
+    2026-09-14), so an exhausted key is replaceable without an account.
+    """
+    tok = os.environ.get("DAHL_API_KEY", "").strip()
+    if tok:
+        return tok
+    p = Path(os.path.expanduser("~/.config/orch/dahl_key.txt"))
+    if p.exists():
+        try:
+            return p.read_text(encoding="utf-8").strip()
+        except OSError:
+            return ""
+    return ""
 
 
 def default_lanes(cfg=None) -> list[Lane]:
@@ -245,6 +271,48 @@ def default_lanes(cfg=None) -> list[Lane]:
         Lane("chatgpt", "http://127.0.0.1:8087/v1/chat/completions",
              ["chatgpt webchat"], 120, 300,
              prompt_cap=12000, timeout=210),  # gw HARD_CAP_MS=180000 + 30s
+        # 09-14 (owner): Dahl Inference — OpenAI-compatible API lane on
+        # decentralised GPU infra, 100M free tokens per key, no account needed.
+        # Docs: https://docs.dahl.global/ | base https://inference.dahl.global/v1
+        #
+        # Three things this lane needs that no other lane does, all measured live:
+        #  1. A BROWSER USER-AGENT. Cloudflare fronts the endpoint and 403s a
+        #     Python UA; aiohttp's default is blocked. Same request, same key:
+        #     403 with the default UA, 200 with the browser UA below.
+        #  2. Reasoning-block stripping. MiniMax-M2.7 answers inside
+        #     <think>...</think> and restates the CONTRACT EXAMPLE there, so the
+        #     old first-balanced-object parse returned old_string="OLD" — a
+        #     placeholder that can never apply. Handled in _strip_reasoning().
+        #  3. Room for the thought. The visible answer is short but the model
+        #     spends most of its budget reasoning, so the completion budget must
+        #     not be clipped the way a webchat lane's is.
+        #
+        # MODEL ORDER IS DELIBERATE (owner: "use deepseek flash cuz its a better
+        # model"). DeepSeek-V4-Flash-0731 is listed FIRST so the pool takes it
+        # whenever it is servable; the pool hops to the next model in the lane on
+        # failure, so MiniMax is the fallback rather than the default.
+        # As of 2026-09-14 DeepSeek answers HTTP 429 `model_concurrency`:
+        #   "This model is at concurrency capacity. Signed-in and paid accounts
+        #    are admitted first."
+        # That is CAPACITY GATING for anonymous keys, not an exhausted quota, so
+        # it is transient and worth retrying — `http 429` is already a transport
+        # marker, so it never escalates a step. MiniMax answered every probe
+        # (1.4-9.1s). If DeepSeek stays gated, signing the key in to an account
+        # is what unlocks it.
+        #
+        # An exhausted key answers `402 insufficient_quota: available tokens
+        # exhausted` — mint a new one with `POST /tokens` (no auth, returns a key
+        # with available_tokens=100000000) and write it to
+        # ~/.config/orch/dahl_key.txt.
+        *([Lane("dahl", "https://inference.dahl.global/v1/chat/completions",
+                ["deepseek-ai/DeepSeek-V4-Flash-0731",
+                 "MiniMaxAI/MiniMax-M2.7"],
+                60, 180, prompt_cap=24000, timeout=180,
+                auth=_dahl_key(),
+                headers={"User-Agent": ("Mozilla/5.0 (X11; Linux x86_64) "
+                                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                        "Chrome/140.0.0.0 Safari/537.36")})]
+          if _dahl_key() else []),
         Lane("gemini", "http://127.0.0.1:8085/v1/chat/completions",
              ["gemini 3.7 flash webchat"], 300, 900,
              prompt_cap=12000, timeout=330),  # gw HARD_CAP_MS=300000 + 30s  # 09-14: 2500 -> 12000. Bob: "the messages aren't even
@@ -492,6 +560,40 @@ def _lenient_edits(text: str) -> dict:
     return {"edits": edits} if edits else {}
 
 
+_REASONING_SPANS = (
+    ("<think>", "</think>"),
+    ("<thinking>", "</thinking>"),
+    ("<reasoning>", "</reasoning>"),
+    ("<|begin_of_thought|>", "<|end_of_thought|>"),
+)
+
+
+def _strip_reasoning(text: str) -> str:
+    """Remove chain-of-thought spans so only the real answer is parsed.
+
+    An UNCLOSED opener (the reply was truncated mid-thought) drops everything
+    after it — there is no answer in a cut-off thought, and keeping it would
+    hand the caller the model's scratch work as if it were the result.
+    """
+    for open_tag, close_tag in _REASONING_SPANS:
+        if open_tag not in text:
+            continue
+        out = []
+        rest = text
+        while True:
+            i = rest.find(open_tag)
+            if i < 0:
+                out.append(rest)
+                break
+            out.append(rest[:i])
+            j = rest.find(close_tag, i + len(open_tag))
+            if j < 0:
+                break               # unclosed: discard the tail
+            rest = rest[j + len(close_tag):]
+        text = "".join(out)
+    return text
+
+
 def parse_json_object(text: str) -> dict:
     """Extract the first balanced JSON object from a model reply.
 
@@ -504,6 +606,21 @@ def parse_json_object(text: str) -> dict:
     docstrings with raw ``\"\"\"`` inside a string value.
     """
     if not isinstance(text, str) or "{" not in text:
+        return {}
+    # 09-14 (worker): STRIP REASONING BLOCKS BEFORE SCANNING.
+    # A reasoning model restates the contract inside its own chain of thought:
+    #   <think>... I need to output {"edits":[{"path":"FILE","old_string":"OLD",
+    #   "new_string":"NEW"}],"notes":"..."} ...</think>
+    #   {"edits":[{"path":"a.py","old_string":"alpha","new_string":"OMEGA"}]}
+    # The balanced scan takes the FIRST object, which is the EXAMPLE — so the
+    # engine applied `old_string: "OLD"`, got "old_string not found (context
+    # changed)", and burned the step's rounds on a placeholder while the real
+    # edit sat in the very next object. Measured live against
+    # MiniMaxAI/MiniMax-M2.7 on the dahl lane: the parser returned
+    # [{'path': 'FILE', 'old_string': 'OLD'}] for a reply whose actual answer was
+    # a correct alpha->OMEGA edit. Drop the reasoning span first.
+    text = _strip_reasoning(text)
+    if "{" not in text:
         return {}
     stripped = text.strip()
     if stripped.startswith("```"):
@@ -892,6 +1009,10 @@ class LanePool:
             headers = {"Content-Type": "application/json"}
             if lane.auth:
                 headers["Authorization"] = f"Bearer {lane.auth}"
+            # 09-14 (worker): per-lane extra headers, last so a lane can
+            # override the defaults (dahl needs a browser UA past Cloudflare).
+            if lane.headers:
+                headers.update(lane.headers)
 
             for attempt in range(1, retries + 1):
                 lane.calls += 1
