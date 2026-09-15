@@ -354,8 +354,15 @@ def default_lanes(cfg=None) -> list[Lane]:
         # `WEBCHAT_MODE=chatgpt` (drop-in 95-mode.conf) so the mode's
         # `skipEmptyMessageRows` quirk applies. Verified live: HTTP 200, PONG in 5s.
         Lane("chatgpt", "http://127.0.0.1:8087/v1/chat/completions",
-             ["chatgpt webchat"], 120, 300,
-             prompt_cap=32000, timeout=300),  # 09-14: 210s guillotined the thinking model mid-answer ("chatgpt failed (timeout after 210s)"); gateway HARD_CAP_MS now 310s so the gateway always outlives this budget.  # 09-14: 12000 truncated the file contents to ~9.6K so chatgpt couldn't see the code; raise so the full prompt gets through
+             ["chatgpt webchat"], 120, 420,
+             prompt_cap=32000, timeout=420),  # 09-15 (Bob: the lane "is not
+             # functioning correctly"): engine budget 300s against a gateway HARD_CAP
+             # of 310s left a 10s margin, so on any thinking-heavy reply the ENGINE
+             # timed out first ("chatgpt failed (timeout after 300s)") and the pool
+             # then cooled the lane ("all models of this lane are cooled" x7), which
+             # is what made it look dead. It is a thinking model - 300s was already
+             # raised once from 210s for exactly this reason. Gateway is now
+             # TIMEOUT=450000 / HARD_CAP_MS=430000, comfortably above this budget.  # 09-14: 210s guillotined the thinking model mid-answer ("chatgpt failed (timeout after 210s)"); gateway HARD_CAP_MS now 310s so the gateway always outlives this budget.  # 09-14: 12000 truncated the file contents to ~9.6K so chatgpt couldn't see the code; raise so the full prompt gets through
 
         # 09-15 (data-driven pull): the chatgpt account is SOFT-CAPPED again —
         # it accepts the prompt and generates NOTHING. Measured on the live tab
