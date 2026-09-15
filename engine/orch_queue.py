@@ -66,6 +66,28 @@ def validate_justification(text: str) -> str:
 def make_yellow(rec: dict, justification: str, *, lane: str | None = None) -> dict:
     """Terminal PASS with a mandatory written justification (owner 09-14)."""
     j = validate_justification(justification)
+    # 09-15: this is the ONLY function that can create a yellow, so it is the one
+    # place that can GUARANTEE a temporary condition never retires a step.
+    # Measured on the live state: 256 yellows whose justification was
+    # `timeout after 200s - the executor could not apply a working edit`, i.e. a
+    # step retired because a lane never answered. `is_transport_error` already
+    # matches that wording, but it is consulted at the CALL SITES and several of
+    # the seven callers do not consult it, so the guard belongs where a yellow is
+    # actually born rather than in each caller.
+    try:
+        from execute import is_transport_error as _ite      # lazy: execute imports us
+    except Exception:
+        def _ite(_e):
+            return any(k in str(_e) for k in (
+                "timeout after", "timed out", "ReadTimeout", "ConnectTimeout",
+                "Cannot connect to host", "Connection refused", "no lane available",
+                "http 429", "429:", "rate limit", "rate_limited"))
+    if _ite(j):
+        rec["status"] = "pending"
+        rec["no_verdict_reason"] = (
+            "a transport condition is not a verdict about the code; "
+            "left claimable (%s)" % j[:80])
+        return rec
     rec["status"] = "yellow"
     rec["yellow_justification"] = j
     rec["yellow_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
