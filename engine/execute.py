@@ -1346,7 +1346,7 @@ async def execute_step_pinned(session, lane: str, step: dict, st: dict) -> "oq.S
                           edits=(rec.get("last_apply") or {}).get("edits") or [])
 
 
-async def escalate_final(session, sid: str, st: dict) -> str:
+async def escalate_final(session, sid: str, st: dict, lane: str | None = None) -> str:
     """The escalation persona's ONE final shot: fix it (green) or code it yellow.
 
     The persona is handed the step, its files, and the path of the step's history
@@ -1363,7 +1363,13 @@ async def escalate_final(session, sid: str, st: dict) -> str:
               f"FILES: {', '.join(files)}\n\n"
               f"WHY EXECUTION GAVE UP: {rec.get('escalated_reason') or rec.get('last_lane_error') or 'n/a'}\n\n"
               f"{hist}\nFILE CONTENTS:\n{ctx}\n\nDECIDE NOW — one JSON object.")
-    res = await POOL.call(session, ESCALATION_SYSTEM, prompt, want_edits=False)
+    # Pinned to the lane the queue handed this task to, so the escalation runs
+    # on a real worker instead of hopping the whole pool under load.
+    POOL.pinned = lane
+    try:
+        res = await POOL.call(session, ESCALATION_SYSTEM, prompt, want_edits=False)
+    finally:
+        POOL.pinned = None
     if not res.ok:
         print(f"[esc] {sid}: escalation lane unavailable ({res.error[:90]}) — left escalated",
               flush=True)
@@ -1426,8 +1432,8 @@ async def run_queue_batches(session, batches: list, st: dict) -> None:
     async def _exec(lane, sid):
         return await execute_step_pinned(session, lane, steps_by_id[sid], st)
 
-    async def _esc(sid):
-        return await escalate_final(session, sid, st)
+    async def _esc(lane, sid):
+        return await escalate_final(session, sid, st, lane=lane)
 
     def _batch_done(bi, snap):
         try:
