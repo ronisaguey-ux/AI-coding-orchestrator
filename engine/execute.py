@@ -266,7 +266,18 @@ async def save_state_serialized(st: dict) -> None:
             # driver then raised YellowJustificationError and killed the run.
             # A yellow is terminal and must never be resurrected by a stale
             # snapshot.
-            TERMINAL = ("green", "escalated", "obsolete", "blocked", "yellow")
+            # 09-15: `escalated` is LEGACY when the escalation phase is off. The
+            # merge rule below is "a terminal status on disk beats a non-terminal
+            # one in memory", which is right for a concurrent executor but WRONG
+            # here: reopen_dead_escalations flips the old records to pending in
+            # memory, the disk still says escalated (terminal), and the merge
+            # restores it on the very next save. Measured: 486 reopened at startup,
+            # then 536 escalated back and every yellow (0) gone. With the switch
+            # OFF, escalated must NOT count as terminal, so a reopen always wins.
+            if ESCALATIONS_ENABLED:
+                TERMINAL = ("green", "escalated", "obsolete", "blocked", "yellow")
+            else:
+                TERMINAL = ("green", "obsolete", "blocked", "yellow")
             for sid, srec in ssteps.items():
                 drec = dsteps.get(sid)
                 if not isinstance(drec, dict):
