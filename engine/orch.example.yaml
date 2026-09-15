@@ -1,0 +1,49 @@
+base_dir: /home/roni/Roni_Workspace/audits_plans
+repo_dir: /home/roni/Roni_Workspace/oculus
+plan_json: /home/roni/Roni_Workspace/audits_plans/oculus_cross_eval_plan_9_4_fixed.json
+exec_state: /home/roni/Roni_Workspace/audits_plans/exec_state_9_4.json
+escalation_queue: /home/roni/Roni_Workspace/audits_plans/escalation_queue.json
+wake_log: /tmp/main_wake.log
+lanes_extra:
+- name: deepseek-b
+  url: http://127.0.0.1:8081/v1/chat/completions
+  models:
+  - anymodel
+  cool_base: 300
+  cool_esc: 600
+- name: deepseek-a
+  url: http://127.0.0.1:8082/v1/chat/completions
+  models:
+  - anymodel
+  cool_base: 300
+  cool_esc: 600
+- name: deepseek-c
+  url: http://127.0.0.1:8083/v1/chat/completions
+  models:
+  - anymodel
+  cool_base: 300
+  cool_esc: 600
+- name: deepseek-d
+  url: http://127.0.0.1:8084/v1/chat/completions
+  models:
+  - anymodel
+  cool_base: 300
+  cool_esc: 600
+exclude_lanes:
+- deepseek-a
+- deepseek-c
+- deepseek-d
+- deepseek-b
+# 09-14: DS webchats re-enabled (owner: "deepseek is now back up") — gateways
+# 8080/8081/8083 all logged "Response received"; they share the anti-ban send gate.
+group_cap: 15
+parallel: 10
+lane_timeout: 400
+min_avail_mb: 500
+lane_retries: 2
+lane_max_hops: 3
+
+# A lane that reports the work is ALREADY THERE is reporting the step done.
+# green (default) | escalate | pending
+already_satisfied_action: green
+swarm_cap: 12

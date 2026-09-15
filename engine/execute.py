@@ -1,0 +1,2178 @@
+#!/usr/bin/env python3
+"""execute.py — master-plan executor for the oculus fix pipeline.
+
+Executes the per-finding master plan JSON (oculus_cross_eval_plan_9_3*.json,
+17,345 per-finding steps) on the FREE webchat lanes ONLY (deepseek 8080 /
+gemini 8085 round-robin, model anymodel, no paid API — user 09-02 policy).
+The pattern is the proven 8_26 OXA engine: per step EXECUTE call -> apply
+edits (exact string replace + py syntax guard) -> VERIFY call over test
+output (<=3 rounds) -> green/escalated. Steps are density-packed into batches
+of WORKERS with DISJOINT file targets (never co-editing a file in one batch).
+
+State: audits_plans/exec_state_8_27.json (per step_id: pending -> applied ->
+green|escalated). Usage: python3 execute.py [--resume] [--batch N]
+[--only-step ID] [--limit N]
+"""
+import argparse, asyncio, json, os, re, subprocess, sys, time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import orch_config, orch_git, orch_lanes, orch_queue as oq, orch_verify
+
+# 09-05: the whole engine now resolves through orch_config (defaults < file <
+# env < CLI), so the gateway envs and the engine options read ONE source.
+CFG = orch_config.load()
+
+BASE = Path(CFG.base_dir)
+# The former default (oculus_cross_eval_plan_9_3.json, 263 steps) matched only
+# 7 of the 52 escalated ids in exec_state_9_4; the 14,356-step 9_4_fixed plan
+# covers 199/199. A wrong default here silently starved every step lookup.
+PLAN_FILE = CFG.plan_path
+STATE_FILE = CFG.state_path
+REPO = Path(CFG.repo_dir)
+
+WORKERS = int(os.environ.get("EXEC_WORKERS", "8"))
+MAX_ROUNDS = 3
+
+# 09-13: a TRANSPORT failure is not a verdict. Measured: 136 steps were escalated to
+# terminal because the gemini gateway (127.0.0.1:8085) was briefly unreachable — the
+# lane HAD produced an edit, the verify call just could not connect. Those steps are
+# now permanently dead for a reason that had nothing to do with the code. A connection
+# error must leave the step pending and must NOT count toward MAX_ROUNDS.
+_TRANSPORT_MARKERS = (
+    "ClientConnectorError", "Cannot connect to host", "Connect call failed",
+    "Connection refused", "ConnectionResetError", "ServerDisconnectedError",
+    "Server disconnected", "no lane available", "lanes unavailable",
+    "ReadTimeout", "ConnectTimeout", "aiohttp.client_exceptions",
+    # 09-14: a rate-limit / capacity error is a TEMPORARY transport condition,
+    # never a verdict. Measured: 19 steps escalated to terminal with
+    # `http 429 {"code":"free_rate_limited"}` as the last lane error, because
+    # none of these markers matched and the phantom-green gate spent its round.
+    "free_rate_limited", "rate_limited", "rate limit", "Too Many Requests",
+    "http 429", "429:", "temporarily rate", "Provider returned error",
+    "Webchat not connected", "browser.isConnected",
+    # 09-14: the engine's OWN timeout wording was never matched. "ReadTimeout" /
+    # "ConnectTimeout" are aiohttp class names, but the engine logs the failure as
+    # `timeout after 600s`. Measured: 268 steps sat in `escalated` at rounds=3 on
+    # exactly that string — a lane that never answered is not a verdict about the
+    # code, so those must retry, never terminate.
+    "timeout after", "timed out",
+)
+
+
+def is_transport_error(err) -> bool:
+    """True when a lane call failed to REACH a lane rather than answer it."""
+    if not err:
+        return False
+    e = str(err)
+    return any(m in e for m in _TRANSPORT_MARKERS)
+
+# 09-13 (owner): what to do when a lane reports the work is ALREADY THERE.
+#   green (default) | escalate | pending   — set via orch.yaml
+# `already_satisfied_action`. Phrases are configurable too; the built-in list
+# below is the default and `already_satisfied_phrases` is appended to it.
+try:
+    from orch_config import load as _orch_load  # noqa: E402
+    _ORCH_CFG = _orch_load()
+except Exception:
+    _ORCH_CFG = None
+
+
+def already_satisfied_action() -> str:
+    v = getattr(_ORCH_CFG, "already_satisfied_action", "green") if _ORCH_CFG else "green"
+    v = str(v or "green").strip().lower()
+    return v if v in ("green", "escalate", "pending") else "green"
+
+
+_BASE_ALREADY = (
+    "already satisfied", "already present", "is present with", "already exists",
+    "already implemented", "no change needed", "already on disk",
+    "already contains", "already carries", "already has", "already declares",
+    "already defines", "no fix needed",
+    # a bare "— satisfied" / "is satisfied" verdict (deepseek4 wrote
+    # "P1B6R0F3#8 — satisfied (verified by MANIFEST.json read)") was missed and
+    # fell through to PENDING.
+    " satisfied (", " is satisfied", "satisfied (verified",
+)
+
+
+def is_already_satisfied(text: str) -> bool:
+    low = (text or "").lower()
+    if not low:
+        return False
+    extra = getattr(_ORCH_CFG, "already_satisfied_phrases", None) if _ORCH_CFG else None
+    phrases = list(_BASE_ALREADY) + [str(x).lower() for x in (extra or [])]
+    return any(p in low for p in phrases)
+
+# OpenRouter free pool (user key 09-05) — API-speed FREE lane; model "openrouter/free"
+# auto-routes to whatever :free model is available; (url, model, cool_base, cool_esc, auth)
+OPENROUTER_KEY = ""
+try:
+    OPENROUTER_KEY = Path("/home/roni/.claude/openrouter.token").read_text().strip()
+except Exception:
+    pass
+
+LANES = [
+    ("http://127.0.0.1:8085/v1/chat/completions", "gemini 3.7 flash webchat", 300, 900),  # gemini 8085 — long settle window (user 09-04)
+    ("http://127.0.0.1:20128/v1/chat/completions",
+     ["cfp/nvidia/nemotron-3-120b-a12b", "auto/best-free", "auto/coding"],
+     120, 360),  # omniroute — free lane. 09-10 probe: cfp/nemotron-3-120b-a12b 200 (works);
+                 # auto/* combos 502 (opencode noauth 401 + 429), auto/best-coding 429.
+    # openrouter free lane COMMENTED 09-09 (roni: only gemini/omniroute rn).
+    # Free models probe 404 "unavailable for free" (quota/model churn) — wastes
+    # slots hopping. Re-enable when the free pool is back (favor 00:00 UTC reset):
+    # ("https://openrouter.ai/api/v1/chat/completions", "openrouter/free", 45, 120, OPENROUTER_KEY),
+    # kimi lane DISABLED 09-08: K3 webchat first-turns = 30min+ / die empty
+    # (verified with real probes) — far beyond the 600s lane timeout. Gateway
+    # 8086 + login stay warm; re-enable when kimi's agentic mode can be tamed.
+]
+_lane_idx = 0
+# dead-lane cooldown: consecutive failures (5xx/conn) mark lane dead for N sec
+_lane_dead_until = {}
+_lane_fail_streak = {}
+_model_dead_until = {}   # (lane, model) -> ts — per-model cooldown (user 09-05: model, not lane)
+_model_fail_streak = {}
+
+
+# 09-06 user ladder: 15m base + 5m per SEQUENTIAL issue (15→20→25→30…) —
+# a model is skipped entirely until its timer expires; success resets the streak.
+def _model_cool_s(streak: int) -> int:
+    base = int(os.environ.get("OMNI_COOLDOWN_BASE_S", "600"))  # 09-09 (roni): per-model ban ladder 10m base, +5m each sequential fail (10→15→20→…)
+    step = int(os.environ.get("OMNI_COOLDOWN_STEP_S", "300"))
+    return base + max(0, streak - 1) * step
+
+GROUP_CAP = int(CFG.group_cap)  # orch.yaml group_cap (user: >=15 per batch)
+# 09-14 (owner, S2): a batch larger than the lane count leaves slack, so a lane
+# always finds a claimable step after a sibling cools. The barrier tail grows
+# with the batch, so this is deliberately modest.
+BATCH_CAP = int(os.environ.get("ORCH_BATCH_CAP", "30"))
+PARALLEL = min(8, max(1, int(os.environ.get("EXEC_PARALLEL", "8"))))  # 09-09 (roni): raise cap so omniroute (API lane) parallelizes; gemini stays serial (1 tab). Memory-safe: omniroute calls are lightweight HTTP.
+SAVE_LOCK = asyncio.Semaphore(1)  # serialize state dumps (dict-change-during-iteration guard for concurrent groups)
+EXEC_SYSTEM = (
+    "You are a code FIX EXECUTOR for the oculus repo (Python/FastAPI/React). The plan below "
+    "contains 1-5 INDEPENDENT steps (disjoint files — no edits reference another step's file). "
+    "Fix EVERY step in ONE reply. "
+    "Answer ONE JSON object only: {\"edits\":[{\"step\":\"<step id, e.g. STEP 1 or P1B1R0F12>\","
+    "\"file\":\"<repo-relative path>\",\"old_string\":\"<exact existing text>\",\"new_string\":"
+    "\"<replacement text>\"}],\"notes\":\"<short>\"}. EVERY edit must carry the step id it "
+    "belongs to; leave the step id off only when only ONE step is present. "
+    "Each old_string must be UNIQUE and byte-exact from the CURRENT file contents (re-read the "
+    "live file, not the plan snippet). Use full function bodies when replacing functions. "
+    "FILE CONTENTS arrive as LINE-NUMBERED CHUNKS: every line is prefixed with its line number, "
+    "and a large file is shown as several windows (head + interior + tail) with the omitted ranges "
+    "marked. You may read ANY of those chunks and quote an old_string from any of them — you are "
+    "not limited to the first block. Never answer 'the file is truncated': the chunks ARE the file, "
+    "and the line numbers tell you where each piece sits. "
+    "09-09 (Bob): do NOT treat plan steps as verbatim. The plan is a STALE snapshot — line "
+    "numbers, offsets and code snippets may be off because the file has moved on. You have logical "
+    "authority to apply the CORRECT edit: read the actual file, locate the real target by intent "
+    "(function name / module / unique nearby text), and anchor old_string against what is truly "
+    "there. If the target FILE IS ABSENT and the fix requires creating "
+    "it, emit {\"file\":\"...\",\"old_string\":\"\",\"new_string\":\"<full file content>\"}. "
+    "Batch as much real work into this ONE turn as the steps allow — no prose about it, just do it. "
+    "No fences, no prose, no submit_answer. If a step's guidance conflicts with reality or you "
+    "cannot fix it, do NOT return empty edits — omit that step from edits and put its id + reason "
+    "in notes (cannot-fix:<id>:<reason>). An empty edits array means NOTHING was fixed. "
+    "NEVER emit empty edits and claim success.\n"
+    # The webchat models (gemini especially) drift into their conversational
+    # assistant persona and answer a code-fix request with "Task completed
+    # successfully." — 28 bytes of prose, no edits. The lane then (correctly)
+    # rejects it and hops, so every step burns the whole pool and escalates.
+    # A short, last-word restatement of the output contract, placed after the
+    # long body, is what actually holds the format: the model weights the tail
+    # of the system prompt most heavily, and a bare imperative beats a buried
+    # schema. Do not remove this — it is the difference between edits and prose.
+    "\nOUTPUT CONTRACT — your entire reply is parsed as JSON. "
+    "If you write a sentence, a status line, an apology or a confirmation, the reply is "
+    "REJECTED and the work is counted as not done. "
+    "There is no such thing as 'done' to report: you report WHAT YOU CHANGED, as edits. "
+    "Your first character is '{' and your last is '}'. "
+    "Reply now with the JSON object only."
+)
+VERIFY_SYSTEM = (
+    "You are the SELF-VERIFIER for the step you just fixed. You receive your edits + the test/check "
+    "output. Answer ONE JSON object only. {\"verdict\":\"green\"} is FORBIDDEN when the EDITS array is "
+    "EMPTY — an empty change means nothing was fixed, so return {\"verdict\":\"red\",\"reason\":"
+    "\"no real edit — step NOT fixed\",\"edits\":[...]} with the correct edit. green requires a "
+    "NON-EMPTY edits array whose new_string actually appears in the target file. Otherwise "
+    "{\"verdict\":\"red\",\"reason\":\"<terse>\",\"edits\":[{\"file\":\"...\",\"old_string\":\"...\","
+    "\"new_string\":\"...\"}]} with corrected edits. PREEXISTING/ignorable output lines are not your "
+    "fault. No fences."
+)
+
+
+def load_state() -> dict:
+    if STATE_FILE.exists():
+        try:
+            return json.loads(STATE_FILE.read_text())
+        except Exception:
+            pass
+    return {"steps": {}}
+
+
+def save_state(st: dict) -> None:
+    """Atomic write: temp file + fsync + replace, with a rolling backup.
+
+    A plain write_text truncated the state file if the process died mid-dump,
+    losing every step result recorded so far.
+    """
+    if getattr(CFG, "dry_run", False):
+        return
+    if CFG.state_backups and STATE_FILE.exists():
+        try:
+            STATE_FILE.with_suffix(STATE_FILE.suffix + ".bak").write_bytes(
+                STATE_FILE.read_bytes())
+        except OSError:
+            pass
+    tmp = STATE_FILE.with_suffix(STATE_FILE.suffix + f".tmp{os.getpid()}")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(st, fh)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, STATE_FILE)
+
+
+async def save_state_serialized(st: dict) -> None:
+    """09-05: save_state under the SAVE_LOCK — parallel groups share one state
+    dict; a plain dump during another task's mutation can raise
+    'dictionary changed size during iteration' and lose the last writer.
+
+    09-13: the lock only serializes the WRITE — it does not stop a group that
+    read the state earlier from writing its stale copy over a change another
+    group already committed. Measured: the already-satisfied path greened
+    P1B0R0F0#94 / P1B0R0F3#75 / P1B6R0F5#53 and all three were back at
+    `pending` seconds later, because a concurrent group's later save restored
+    its own older snapshot of those steps.
+
+    Fix: merge. Re-read what is on disk and keep whichever side of each step
+    moved LAST (this snapshot's version when it is the one being written, the
+    on-disk version when this snapshot is older). A terminal status
+    (green/escalated/obsolete) always wins over pending/executing — those are
+    the states a stale snapshot would wrongly resurrect.
+    """
+    async with SAVE_LOCK:
+        try:
+            with open(STATE_FILE, encoding="utf-8") as fh:
+                disk = json.load(fh)
+        except Exception:
+            disk = None
+        if isinstance(disk, dict) and isinstance(disk.get("steps"), dict):
+            dsteps = disk["steps"]
+            ssteps = st.get("steps") or {}
+            # 09-14: "yellow" (code yellow — a pass flagged for review) was
+            # MISSING from this set. The escalation persona wrote a valid yellow
+            # on P1B0R0F4#2, save_state_serialized merged the disk's older
+            # "escalated" back over it (disk terminal, memory not), and the queue
+            # driver then raised YellowJustificationError and killed the run.
+            # A yellow is terminal and must never be resurrected by a stale
+            # snapshot.
+            TERMINAL = ("green", "escalated", "obsolete", "blocked", "yellow")
+            for sid, srec in ssteps.items():
+                drec = dsteps.get(sid)
+                if not isinstance(drec, dict):
+                    continue
+                dstat = drec.get("status")
+                sstat = srec.get("status")
+                # 09-14 (worker): NEVER resurrect a step this run re-opened on
+                # purpose. Without this, one stale write of the old terminal
+                # record is enough for the merge to adopt it back into memory
+                # and make the re-open undo itself.
+                if sid in _REOPENED_THIS_RUN and dstat in TERMINAL:
+                    continue
+                # on disk already terminal, this snapshot is not -> keep disk
+                if dstat in TERMINAL and sstat not in TERMINAL:
+                    ssteps[sid] = drec
+                # both terminal, but disk ran MORE rounds -> keep disk (newer)
+                elif (dstat in TERMINAL and sstat in TERMINAL
+                      and int(drec.get("rounds") or 0) > int(srec.get("rounds") or 0)):
+                    ssteps[sid] = drec
+            st["steps"] = ssteps
+        save_state(st)
+
+
+def signal_escalation(sid: str, rec: dict) -> None:
+    """09-05 (user): an escalated step used to wake the MAIN operator, who
+    fixed it personally. Since 09-06 the autonomous escalation solver drains
+    these, so per-step wakes are pure noise. Log to the engine journal; write
+    the wake chain ONLY when explicitly enabled (ORCH_SIGNAL_WAKE=1).
+    """
+    if getattr(CFG, "dry_run", False):
+        return
+    try:
+        la = rec.get("last_apply") or {}
+        print(f"[esc] {sid} escalated (edits: {json.dumps(la.get('edits'))[:160]})", flush=True)
+        if os.environ.get("ORCH_SIGNAL_WAKE", "0") == "1":
+            with open("/tmp/main_wake.log", "a", encoding="utf-8") as f:
+                f.write(f"[escalation] EXEC step {sid} escalated — "
+                        f"edits: {json.dumps(la.get('edits'))[:240]} | "
+                        f"verify: {str(la.get('verify', ''))[:240]} | "
+                        f"checks: {str(la.get('checks', ''))[:200]} | "
+                         f"state: {STATE_FILE}\n")
+    except Exception:
+        pass
+
+
+# 09-14 (worker, brief Part B / B1): ESCALATION MUST CARRY A REASON.
+# Measured on the live state: 155 of 502 escalated steps had NEITHER
+# `last_lane_error` NOR `escalated_reason` — and 139 of those carried real
+# applied edits (last_apply.ok=true with a non-empty edits list). The engine
+# did the work, killed the step, and recorded nothing, so nobody could tell
+# why. The silent killer was the bare `rec["status"] = "escalated"` at the
+# fall-out of run_step's round loop plus six more unannotated sites.
+#
+# Every escalation now goes through this one function, which:
+#   (a) REFUSES to escalate without a non-empty reason (raises in dry_run /
+#       ORCH_STRICT_ESCALATION=1, otherwise records an explicit marker so the
+#       record is still diagnosable),
+#   (b) REFUSES to escalate at all when the last lane error was a TRANSPORT
+#       failure — that is not a verdict about the code (B6). The step goes
+#       back to `pending` with a clean slate instead of dying,
+#   (c) stamps `escalated_at` and `escalated_by` so the path is identifiable.
+# Returns the status actually applied ("escalated" or "pending").
+def escalate(sid: str, rec: dict, reason: str, *, site: str,
+             verify: str | None = None) -> str:
+    """Terminal-escalate a step, or refuse to. The ONLY way to set escalated."""
+    reason = (reason or "").strip()
+    if not reason:
+        # A reason is not optional. Fail loudly where a test can catch it.
+        if os.environ.get("ORCH_STRICT_ESCALATION", "0") == "1":
+            raise ValueError(f"escalate({sid}) called without a reason at {site}")
+        reason = f"UNSPECIFIED (escalation site {site} recorded no reason)"
+    # (b) transport failures are never a verdict — see is_transport_error.
+    last_err = rec.get("last_lane_error")
+    if is_transport_error(last_err):
+        rec["status"] = "pending"
+        rec["last_transport_block"] = {
+            "at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "site": site,
+            "would_have_been": reason[:200],
+            "error": str(last_err)[:200],
+        }
+        rec.pop("last_lane_error", None)  # clean slate for the next lane
+        print(f"[esc-guard] {sid} NOT escalated at {site} — last lane error was "
+              f"transport ({str(last_err)[:90]}); left pending", flush=True)
+        return "pending"
+    rec["status"] = "escalated"
+    rec["escalated_reason"] = reason[:300]
+    rec["escalated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+    rec["escalated_by"] = site
+    if verify is not None:
+        la = rec.setdefault("last_apply", {})
+        if isinstance(la, dict):
+            la["verify"] = verify
+    signal_escalation(sid, rec)
+    return "escalated"
+
+
+# 09-09 (Bob 6333/6337): reset lane context every N COMPLETED steps (not sends).
+# A step is completed when its status lands on a terminal value (green/escalated).
+# Counting here instead of in browser.js keeps the cadence at TASK granularity: a
+# step may take many lane sends (retries + verify) yet only counts as ONE, so the
+# gemini webchat tab is never swapped mid-task (which would throw away the prompt
+# context the step is mid-edit on). On the Nth completion we (a) drop the pool's
+# per-lane history and (b) ask the gemini gateway to open a fresh chat.
+_reset_target = int(os.environ.get("EXEC_RESET_EVERY_STEPS", "5"))
+_reset_step_count = 0
+
+
+def _note_step_completions(statuses: dict) -> None:
+    """Count terminal (green/escalated) steps in a batch; reset lane context on N."""
+    global _reset_step_count
+    done = sum(1 for s in statuses.values() if s in ("green", "escalated"))
+    if done <= 0:
+        return
+    _reset_step_count += done
+    if _reset_step_count >= _reset_target:
+        _reset_step_count = 0
+        print(f"[ctx] reset lane context after {_reset_target} completed steps", flush=True)
+        _trigger_lane_reset()
+
+
+def _trigger_lane_reset() -> None:
+    """Drop pool history + force a fresh gemini chat (webchat context reset)."""
+    try:
+        POOL.reset_context()
+    except Exception as e:
+        print(f"[ctx] pool reset_context failed: {e}", flush=True)
+    # gemini is the one webchat tab that genuinely accumulates context; open a
+    # fresh chat via the gateway's /v1/newchat so the lane forgets prior tasks.
+    gemini_gw = getattr(CFG, "gemini_gw_url", "http://127.0.0.1:8085")
+    try:
+        import asyncio
+        # fire-and-forget; gateway logs its own progress (we're inside the loop)
+        asyncio.ensure_future(_post(gemini_gw + "/v1/newchat"))
+    except Exception as e:
+        print(f"[ctx] lane reset (gemini /v1/newchat) failed: {e}", flush=True)
+
+
+async def _post(url: str) -> None:
+    import aiohttp
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.post(url, json={}, timeout=aiohttp.ClientTimeout(total=30)):
+                pass
+    except Exception as e:
+        print(f"[ctx] gemini /v1/newchat error: {str(e)[:120]}", flush=True)
+
+
+def file_text(rel: str, size_cap: int = 24000) -> str:
+    """File body for a lane prompt, as LINE-NUMBERED CHUNKS.
+
+    09-12 (owner): a lane must be able to read SEVERAL parts of a file at once,
+    not one truncated head. The old form cut the body at 24000 chars and appended
+    "...[TRUNCATED]", so the lane could only ever see the first chunk and said so
+    — `cannot-fix: file appears truncated at <symbol>` — for every file over the
+    cap (measured: a 17K-char prompt came back "file appears truncated at
+    _get_hmac_key()"). That is why no edit ever landed.
+
+    Now: a file that fits is returned whole; a bigger one is returned as numbered
+    windows (head + interior + tail) so the lane sees multiple chunks at once and
+    can target the lines it needs. Every line carries its number, so an
+    old_string can still be matched byte-exactly.
+    """
+    p = REPO / rel.lstrip("/")
+    try:
+        t = p.read_text(errors="ignore")
+    except Exception:
+        return ""
+    lines = t.splitlines()
+    total = len(lines)
+    if len(t) <= size_cap:
+        return "\n".join(f"{i:>5}\t{l}" for i, l in enumerate(lines, 1))
+    window = max(40, (size_cap // 3) // 60)
+    if total <= window:
+        starts = [1]
+    else:
+        step = max(1, (total - window) // 2)
+        starts = [1]
+        s = 1 + step
+        while s <= total and len(starts) < 3:
+            starts.append(s)
+            s += step
+    out = [f"FILE: {rel} — {total} lines, shown as {len(starts)} chunk(s) with line numbers"]
+    for s in starts:
+        e = min(total, s + window - 1)
+        if s > 1:
+            out.append(f"--- lines {s - 1} and earlier omitted ---")
+        out.extend(f"{i:>5}\t{lines[i - 1]}" for i in range(s, e + 1))
+    out.append(f"--- end of {rel} ({total} lines) ---")
+    return "\n".join(out)
+
+
+def in_repo(rel: str) -> bool:
+    """09-09 (Bob): True only if rel resolves INSIDE repo_dir.
+
+    Fixes the cross-repo leak where 485 plan steps targeted ../webchat-api/*
+    (a sibling repo). REPO / "../webchat-api/x" resolves outside the oculus repo
+    yet exists, so apply_edits wrote there and git_commit_step tried to git-add
+    a path outside the worktree. = False for anything with .. or that escapes.
+    """
+    try:
+        p = (REPO / rel.lstrip("/")).resolve()
+        root = REPO.resolve()
+        return p == root or root in p.parents
+    except Exception:
+        return False
+
+
+import difflib as _difflib
+
+
+def _fuzzy_replace(cur: str, old: str, new: str) -> str | None:
+    """09-09 (Bob): re-anchor a drifted old_string onto the current file.
+
+    Plan steps are a 9-04 snapshot; the engine's own edits have moved the file,
+    so a once-exact old_string now fails. Retain the edit's intent instead of
+    escalating: if the target is still findable by (a) whitespace-normalized
+    match, or (b) a confident line-window anchor, substitute the real text.
+    Returns the updated file only when it locates the edit UNAMBIGUOUSLY;
+    None lets the caller escalate rather than guess.
+    """
+    if not old:
+        return None
+    if old in cur:
+        return cur.replace(old, new, 1)
+    # (a) whitespace/indentation drift only (tabs, trailing spaces, line endings)
+    if " ".join(str(old).split()) in " ".join(cur.split()):
+        return _normalized_apply(cur, old, new)
+    # (b) line anchor: first non-empty line of `old` present & unique in cur
+    lines = str(old).splitlines()
+    anchor = next((l.strip() for l in lines if l.strip()), "")
+    if not anchor:
+        return None
+    return _line_anchor_apply(cur, old, new, anchor)
+
+
+def _normalized_apply(cur: str, old: str, new: str) -> str | None:
+    """Whitespace-only drift. Locate old's token run in cur and replace its
+    exact span. Requires the first 40 non-ws chars to appear exactly once."""
+    nonws = "".join(str(old).split())
+    probe = nonws[:40]
+    if cur.count(probe) != 1:
+        return None
+    start = cur.find(probe)
+    # grow the span to consume the whole non-ws token run, staying contiguous
+    end = start + len(nonws)
+    return cur[:start] + new + cur[end:]
+
+
+def _line_anchor_apply(cur: str, old: str, new: str, anchor: str) -> str | None:
+    """Replace the block whose first non-empty line equals `anchor`, allowing
+    interior drift in the lines that follow. Only when the anchor is unique and
+    distinctive (>=20 chars) — otherwise we cannot confidently locate the edit."""
+    if len(anchor) < 20:
+        return None
+    lcur = cur.splitlines(keepends=True)
+    hits = [i for i, l in enumerate(lcur) if anchor in l]
+    if len(hits) != 1:
+        return None  # 0 or multiple -> ambiguous
+    a0 = hits[0]
+    old_lines = str(old).splitlines()
+    # Count contiguous cur lines that whitespace-match the old lines from anchor.
+    matched = 0
+    for k, ol in enumerate(old_lines):
+        j = a0 + k
+        if j >= len(lcur):
+            break
+        if " ".join(lcur[j].split()).strip() == " ".join(str(ol).split()).strip():
+            matched += 1
+        else:
+            break
+    if matched < 1:
+        return None
+    # If the whole old block matched, splice exactly `matched` lines. If it
+    # diverged early (interior drift), we still replace the block we anchored —
+    # the intended edit replaces the whole old block, so splice at the matched
+    # run's end (diverging lines are the drifted remainder, still owned by old).
+    before = "".join(lcur[:a0])
+    after = "".join(lcur[a0 + matched:])
+    nl = "" if new.endswith("\n") else "\n"
+    return before + new + nl + after
+
+
+
+
+
+LANE_COOLDOWN = 90  # sec a failed lane stays out of rotation
+
+# 09-05: the pool replaces the hand-rolled rotation below. It parses SSE bodies
+# (OmniRoute was silently dark), bounds each request (a wedged Gemini call used
+# to stall a worker for the full 900s client timeout), hops to another lane on
+# failure, and — critically — reports transport failure as ok=False instead of
+# collapsing it to "" where the caller read it as "the model produced no edits".
+POOL = orch_lanes.LanePool(CFG)
+
+
+async def lane_call_result(session, system: str, user: str):
+    """Return a LaneResult. Check .ok before trusting .content."""
+    return await POOL.call(session, system, user)
+
+
+async def lane_call(session, system: str, user: str, retries: int = 4) -> str:
+    """Backwards-compatible string form. Prefer lane_call_result."""
+    res = await POOL.call(session, system, user)
+    return res.content if res.ok else ""
+
+
+async def repair_with_retry(session, system: str, user: str, max_retries: int = 1):
+    """Edits-producing lane call for a step/group.
+
+    09-08 (user): a weak lane (omniroute/nemotron-free) often answers HTTP 200
+    with EMPTY edits and a bogus "file doesn't exist" note. The pool returns on
+    that first 200, so the strong lane (gemini) is never tried and the step
+    churns forever with no_edits. This retries once so a different lane gets a
+    shot before we give up.
+
+    09-09 (Bob): POOL.call stops at the first non-empty 200, but free lanes
+    (openrouter/free) return valid-looking PROSE that is not an edits JSON. The
+    pool calls it a win and stops; repair_with_retry re-call then re-picks the
+    same lane forever. Fix: loop across lanes until we actually get an edits
+    block, or every lane has been exhausted. We consume max(2, lanes*2) calls
+    so a single weak lane can't starve the funnel.
+    """
+    history: list[dict] = []  # (role, content) turns for the SAME task (Bob 09-09: a
+    # lane must remember why the previous attempt failed instead of statelessly
+    # re-trying blind → openrouter 6335). Built up across this task's retries.
+    seen: set[str] = set()
+    budget = max(2, len(POOL.lanes) * 2)
+    for _ in range(budget):
+        # POOL.call round-robins (rotates _idx) and hops internally up to
+        # lane_max_hops. With want_edits the pool treats garbage-prose and
+        # empty-edits 200s as unusable, so it hops past openrouter/free and
+        # omniroute/nemotron to the strong gemini lane before giving up.
+        res = await POOL.call(session, system, user, want_edits=True, history=history)
+        if not res.ok:
+            return res
+        ex = parse_json(res.content)
+        if ex.get("edits"):
+            return res
+        # 09-13: THIRD hop site. The pool now returns a terminal verdict without
+        # hopping, but this retry loop hopped anyway — the log showed
+        #   "[lanes] openrouter terminal verdict — returning without hopping"
+        # followed immediately by
+        #   "[lane] empty-edits answer from openrouter — hopping to next lane"
+        # so the pool's saving was discarded here. A verdict that the work is
+        # already present / cannot be fixed is the same on every lane: return it
+        # and let the caller escalate the step.
+        _low = (res.content or "").lower()
+        if ("cannot-fix" in _low or "no edit emitted" in _low
+                or "no edits emitted" in _low):
+            return res
+        print(f"[lane] empty-edits answer from {res.lane} — hopping to next lane", flush=True)
+        # 09-12: a reply that OPENS an edits block but does not parse is not a
+        # refusal — it is a CUT-OFF answer. Measured on this dump: a 2626-char
+        # gemini reply carried "edits"/"step"/"file"/"old_string" and then just
+        # stopped, with no new_string at all, and the strict parse died at
+        # char 864 ("Expecting ':' delimiter"). The engine recorded a real edit
+        # as "empty/no-edits" and hopped. Tell the lane the truth instead: its
+        # last answer was truncated, and it must re-send the COMPLETE JSON,
+        # smaller if needed (one edit per reply).
+        if '"edits"' in (res.content or ""):
+            history.append({"role": "assistant", "content": (res.content or "")[:4000]})
+            history.append({"role": "user", "content":
+                "Your previous reply was CUT OFF mid-JSON and could not be parsed. "
+                "Re-send the COMPLETE JSON object now, starting with '{' and ending with '}'. "
+                "If it is too long, send ONE edit at a time and keep every old_string SHORT "
+                "(a few unique lines, never a whole file). Do not apologise, do not explain."})
+            seen.add(res.lane)
+            continue
+        # 09-12: a PROSE reply is not a refusal either. Measured on this dump: a
+        # deepseek2 answer (53394B prompt, 404B reply) read
+        #   "Fixed IK-01 (P1B1R0F14) in live/exchange_connector.py — verified: the
+        #    file on disk now imports `re`, defines _CLIENT_ORDER_ID_RE = ..."
+        # The lane did the work and reported it in English instead of the edits
+        # contract, so parse_json found nothing and the engine hopped — with two
+        # of the four lanes rate-limited, one hop exhausts the pool. Ask THAT lane
+        # for the JSON it owes, once, before moving on.
+        if res.lane not in seen and _looks_like_fix_report(res.content or ""):
+            history.append({"role": "assistant", "content": (res.content or "")[:4000]})
+            history.append({"role": "user", "content":
+                "You answered in PROSE. I cannot apply prose — I need the change as JSON. "
+                "Convert exactly what you just did into ONE JSON object:\n"
+                '{"edits":[{"file":"<path>","old_string":"<exact text from the file>",'
+                '"new_string":"<replacement>"}],"notes":"<terse>"}\n'
+                "Use the same file and the same change you just described. Reply with the "
+                "JSON only, starting with '{' and ending with '}'."})
+            seen.add(res.lane)
+            continue
+        # Diagnostic (2026-09-11): the lanes answer correctly in direct tests but
+        # return empty here, so dump the EXACT prompt and reply once per lane to
+        # a file. Diffing this against the direct test is the whole diagnosis.
+        try:
+            import hashlib
+            with open("/tmp/lane_empty_debug.jsonl", "a") as _dbg:
+                _dbg.write(json.dumps({
+                    "ts": time.time(),
+                    "lane": res.lane,
+                    "system_len": len(system or ""),
+                    "user_len": len(user or ""),
+                    "user_sha": hashlib.sha256((user or "").encode()).hexdigest()[:16],
+                    "user_head": (user or "")[:600],
+                    "user_tail": (user or "")[-800:],
+                    "reply_len": len(res.content or ""),
+                    "reply": (res.content or ""),
+                }) + "\n")
+        except Exception:
+            pass
+        seen.add(res.lane)
+        # 09-13: stop the hop here too when the lane returned a TERMINAL verdict.
+        # `repair_with_retry` is a SECOND hop site, separate from the pool, and
+        # measured live it kept cycling lanes after the pool had already
+        # recognised the verdict — the log showed
+        #   "[lanes] openrouter terminal verdict — returning without hopping"
+        # immediately followed by
+        #   "[lane] empty-edits answer from openrouter — hopping to next lane"
+        # so the saving was thrown away one layer up. A verdict that the work is
+        # already present / cannot be fixed will read the same on every lane.
+        _low = (res.content or "").lower()
+        if res.ok and ("cannot-fix" in _low or "no edit emitted" in _low
+                       or "no edits emitted" in _low):
+            return res
+        # Feed the failure back so the next attempt (any lane) sees the reason
+        # and does not blindly repeat it. Cap history so it never grows unbounded.
+        history.append({"role": "assistant", "content": res.content[:2000]})
+        history.append({"role": "user",
+                        "content": "Your previous reply did not contain a usable "
+                                   "edits block. Fix it and output ONE JSON with "
+                                   "a non-empty \"edits\" array."})
+        history = history[-6:]
+    # fallback: return the last result even if it had no edits
+    return res
+
+
+async def _legacy_lane_call(session, system: str, user: str, retries: int = 4) -> str:
+    import aiohttp
+    global _lane_idx
+    # pick next lane that is not in cooldown; if all cooldown, force the round-robin one
+    n = len(LANES)
+    picks = []
+    for i in range(n):
+        picks.append((_lane_idx + i) % n)
+    chosen = None
+    for i in picks:
+        if time.time() >= _lane_dead_until.get(i, 0):
+            chosen = i
+            break
+    if chosen is None:
+        chosen = picks[0]
+    _lane_idx = chosen + 1
+    url, model, cool_base, cool_esc, auth = (LANES[chosen] + (None,))[:5]
+    models = list(model) if isinstance(model, (list, tuple)) else [model]
+    # per-model fallback (user 09-05): a rate-limited MODEL is cooled + skipped,
+    # the lane keeps serving its next model. Lane dead only when ALL its models cooled.
+    for m in models:
+        if time.time() < _model_dead_until.get((chosen, m), 0):
+            continue
+        payload = {"model": m,
+                   "messages": [{"role": "system", "content": system[:60000]},
+                                {"role": "user", "content": user[:80000]}],
+                   "max_tokens": 16000, "temperature": 0.2}
+        headers = {"Content-Type": "application/json"}
+        if auth:
+            headers["Authorization"] = f"Bearer {auth}"
+        for attempt in range(1, retries + 1):
+            try:
+                async with session.post(url, json=payload, headers=headers) as r:
+                    body = await r.text()
+                    if r.status == 200:
+                        _lane_fail_streak[chosen] = 0
+                        _model_fail_streak[(chosen, m)] = 0
+                        _model_dead_until.pop((chosen, m), None)  # success resets ladder
+                        try:
+                            c = json.loads(body)["choices"][0]["message"]["content"]
+                            return c if isinstance(c, str) else ""
+                        except Exception:
+                            return ""
+                    # hard-fail: ladder-cooldown THIS model, fall through to the next
+                    # (09-06 user ladder: every issue cools, 15m + 5m per sequential)
+                    if r.status in (404, 422, 500, 502, 503):
+                        streak = _model_fail_streak.get((chosen, m), 0) + 1
+                        _model_fail_streak[(chosen, m)] = streak
+                        cool = _model_cool_s(streak)
+                        _model_dead_until[(chosen, m)] = time.time() + cool
+                        print(f"[lanes] lane {chosen} model {m} ladder-cooled "
+                              f"{cool}s (streak {streak}, status {r.status})", flush=True)
+                        break
+                    if r.status == 429:
+                        streak = _model_fail_streak.get((chosen, m), 0) + 1
+                        _model_fail_streak[(chosen, m)] = streak
+                        cool = _model_cool_s(streak)
+                        _model_dead_until[(chosen, m)] = time.time() + cool
+                        print(f"[lanes] lane {chosen} model {m} rate-limited "
+                              f"-> {cool}s (streak {streak}) — skipping (in-lane fallback)", flush=True)
+                        break
+                    await asyncio.sleep(4)
+            except Exception:
+                streak = _model_fail_streak.get((chosen, m), 0) + 1
+                _model_fail_streak[(chosen, m)] = streak
+                cool = _model_cool_s(streak)
+                _model_dead_until[(chosen, m)] = time.time() + cool
+                print(f"[lanes] lane {chosen} model {m} conn error "
+                      f"-> {cool}s (streak {streak}, in-lane fallback)", flush=True)
+                await asyncio.sleep(6 * attempt)
+    # every model of this lane is cooled — brief lane pause keeps rotation fair
+    if models and all(time.time() < _model_dead_until.get((chosen, mm), 0) for mm in models):
+        _lane_dead_until[chosen] = time.time() + cool_base
+        print(f"[lanes] lane {chosen} {model} all models cooled {cool_base}s", flush=True)
+    return ""
+
+
+def _looks_like_fix_report(text: str) -> bool:
+    """True when a lane answered in prose that reads like a completed fix.
+
+    09-12: a webchat lane sometimes does the work and then reports it in English
+    ("Fixed IK-01 ... verified: the file on disk now imports re ...") instead of
+    emitting the edits JSON. That is not a refusal — the change may well be real —
+    so the engine asks that lane once for the JSON it owes instead of hopping
+    (with two of four lanes rate-limited, one wasted hop can exhaust the pool).
+    Keep this narrow: a fix verb AND evidence language, or a fix verb AND a path.
+    """
+    if not text or len(text) < 60:
+        return False
+    low = text.lower()
+    fix_verbs = ("fixed", "updated", "changed", "patched", "replaced", "added", "removed")
+    evidence = ("verified", "the file on disk", "now imports", "now defines", "confirmed")
+    has_verb = any(v in low for v in fix_verbs)
+    has_evidence = any(e in low for e in evidence)
+    has_path = bool(re.search(r"[\w./-]+\.(py|sh|json|dart|rs|yml|yaml|md|js|ts)\b", text))
+    return (has_verb and has_evidence) or (has_verb and has_path)
+
+
+def parse_json(text) -> dict:
+    """Balanced-object scan. The old greedy r'\\{.*\\}' spanned from the first
+    brace to the last, so any prose after the object, a second object, or a
+    brace inside an old_string value broke the parse and looked like a refusal.
+
+    09-10: normalized so a free lane's tool-call JSON (write_file/edit_file
+    shapes) is accepted as a real edits block instead of being discarded.
+    """
+    return orch_lanes.normalize_edits(orch_lanes.parse_json_object(text))
+
+
+def apply_edits(edits: list) -> tuple:
+    """Exact string replace with py syntax guard (proven 8_26 logic).
+
+    09-05: an EMPTY edit list is now an explicit failure. ``all([])`` is
+    vacuously True, so "the lane returned nothing" was recorded as a successful
+    apply — 43 of 52 escalated steps carried ok=true over zero edits.
+    """
+    import ast
+    if not edits:
+        return False, "no edits proposed (lane returned nothing usable)"
+    results = []
+    for e in edits or []:
+        f = str(e.get("file") or "")
+        old = str(e.get("old_string") or "")
+        new = str(e.get("new_string") or "")
+        # 09-09 (Bob): never touch a file that escapes repo_dir (../webchat-api etc).
+        if not in_repo(f):
+            results.append({"file": f, "ok": False,
+                            "msg": "refused: target outside repo_dir"})
+            continue
+        path = REPO / f.lstrip("/")
+        # CREATE: absent file + empty old_string -> write new_string as full content
+        if not path.exists() and old == "" and new:
+            if f.endswith(".py") and not f.endswith(".py.in"):
+                try:
+                    ast.parse(new)
+                except SyntaxError as se:
+                    results.append({"file": f, "ok": False,
+                                    "msg": f"new file failed syntax check: {se}"})
+                    continue
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(new, errors="ignore")
+            results.append({"file": f, "ok": True, "msg": "created"})
+            continue
+        if old == "" and new:
+            # 09-12: empty old_string + an existing file is NOT always "context
+            # changed" — it is how a lane asks to REWRITE the whole file. Measured:
+            # P1B1R0F1#4 returned file=backend/app/security/cookie_policy.py with
+            # old_string="" and a 2583-char new_string, and the engine refused it
+            # ("empty old_string but file exists"), so the edit never landed, the
+            # verify said green anyway, and the phantom-green gate reopened the
+            # step. Treat it as a full-file write, with the same syntax guard the
+            # create path uses, and keep a backup so a bad rewrite is recoverable.
+            if f.endswith(".py") and not f.endswith(".py.in"):
+                try:
+                    ast.parse(new)
+                except SyntaxError as se:
+                    results.append({"file": f, "ok": False,
+                                    "msg": f"rewrite failed syntax check: {se}"})
+                    continue
+            try:
+                path.with_suffix(path.suffix + ".bak-orch").write_text(
+                    path.read_text(errors="ignore"), errors="ignore")
+                path.write_text(new, errors="ignore")
+            except Exception as ex:
+                results.append({"file": f, "ok": False, "msg": f"rewrite fail: {ex}"})
+                continue
+            results.append({"file": f, "ok": True, "msg": "rewrote whole file"})
+            continue
+        try:
+            cur = path.read_text(errors="ignore")
+        except Exception as ex:
+            results.append({"file": f, "ok": False, "msg": f"read fail: {ex}"})
+            continue
+        if old and old in cur:
+            if f.endswith(".py"):
+                try:
+                    ast.parse(cur.replace(old, new, 1))
+                except SyntaxError as se:
+                    results.append({"file": f, "ok": False,
+                                    "msg": f"syntax break (edit rejected): {se}"})
+                    continue
+            path.write_text(cur.replace(old, new, 1), errors="ignore")
+            results.append({"file": f, "ok": True, "msg": "applied"})
+        else:
+            # 09-09 (Bob): plan-drift re-anchor. Try a SAFE fuzzy match before
+            # escalating. _fuzzy_replace returns None when it cannot locate the
+            # edit unambiguously (renamed/removed target, ambiguous anchor).
+            fz = _fuzzy_replace(cur, old, new)
+            if fz is not None:
+                if f.endswith(".py"):
+                    try:
+                        ast.parse(fz)
+                    except SyntaxError as se:
+                        results.append({"file": f, "ok": False,
+                                        "msg": f"syntax break (fuzzy edit rejected): {se}"})
+                        continue
+                path.write_text(fz, errors="ignore")
+                results.append({"file": f, "ok": True, "msg": "applied (fuzzy re-anchor)"})
+            else:
+                results.append({"file": f, "ok": False,
+                                "msg": "old_string not found (context changed)"})
+    return all(r["ok"] for r in results), "; ".join(
+        f"{r['file']}:{r['msg']}" for r in results[:4])
+
+
+def edits_present(edits: list) -> bool:
+    """09-07 phantom-green gate: is every edit ALREADY IN the files?
+
+    True = the fix is genuinely applied on disk (dedupe of an earlier wave) —
+    legitimate green even though THIS run failed to apply it (old_string gone
+    because the change is already there). False = old_string still absent AND
+    new_string missing => the fix never landed; verdict-green is a phantom.
+    """
+    if not edits:
+        return False
+    for e in edits:
+        f = str(e.get("file") or "")
+        old = str(e.get("old_string") or "")
+        new = str(e.get("new_string") or "")
+        if not f:
+            return False
+        p = REPO / f.lstrip("/")
+        if not p.exists():
+            return False
+        content = p.read_text(errors="ignore") if p.stat().st_size < 5_000_000 else ""
+        if new == old:
+            continue
+        if new and new not in content:
+            return False
+    return True
+
+
+def run_checks(files: list) -> str:
+    """Local verification per step: syntax check each touched file + git state.
+
+    09-05: the previous implementation ran ``py_compile`` and then DISCARDED the
+    return code, appending "py_compile <f>: ok" unconditionally — a file with a
+    syntax error reported success, so the verifier model was judging fixes
+    against output that could never say "broken". Checking is now ast.parse
+    in-process (no bytecode written, no module code executed, no subprocess).
+    """
+    result = orch_verify.verify_files(REPO, files or [])
+    outs = [result.report]
+    r = subprocess.run(["git", "status", "--short"], capture_output=True, text=True,
+                       timeout=60, check=False, cwd=str(REPO))
+    outs.append(f"git status:\n{r.stdout[:800]}")
+    outs.append(f"VERDICT: {'checks passed' if result.ok else 'CHECKS FAILED'}")
+    return "\n".join(outs)
+
+
+async def run_step(session, step: dict, st: dict) -> dict:
+    sid = step["finding_id"]
+    rec = st["steps"].get(sid)
+    if rec is None:
+        rec = {"rounds": 0, "status": "pending"}
+        st["steps"][sid] = rec
+    # 09-09 (Bob): drop cross-repo files (../webchat-api/*) so we never edit or
+    # git-add outside repo_dir. A step left with no in-repo files is a no-op.
+    files = [x for x in (step.get("files") or []) if x and in_repo(x)]
+    ctx = "\n\n".join(file_text(f) for f in files[:2])
+    plan_user = (
+        f"STEP {sid}: {step.get('title')}\nSTATE: {step.get('finding')}\n"
+        f"FIX GUIDANCE: {step.get('fix')}\nMECHANISM: {step.get('mechanism')}\n"
+        f"FILES: {', '.join(files)}\n\nFILE CONTENTS:\n{ctx}\n"
+    )
+    # 09-12 BUG: a step already at MAX_ROUNDS is still SELECTED (the picker takes
+    # status in (None, "pending", "executing")) but `range(3, 3)` is empty, so the
+    # loop body never ran — the step sat in "executing" forever, never escalated,
+    # never retried. 63 steps were stuck this way and the green counter went flat
+    # while the engine churned batches. Escalate them instead of silently skipping.
+    if rec.get("rounds", 0) >= MAX_ROUNDS:
+        escalate(sid, rec,
+                 f"round budget already spent before this pass "
+                 f"(rounds={rec.get('rounds')}/{MAX_ROUNDS}); no lane call made",
+                 site="run_step:pre_loop_max_rounds")
+        if rec["status"] != "escalated":
+            await save_state_serialized(st)
+            return rec
+        try:
+            await orch_git.git_commit_step(sid, rec)
+        except Exception as ge:
+            print(f"[step {sid}] git commit failed: {str(ge)[:180]}", flush=True)
+        print(f"[group] step {sid} already at MAX_ROUNDS — escalated", flush=True)
+        return
+
+    for rnd in range(rec["rounds"], MAX_ROUNDS):
+        rec["rounds"] = rnd + 1
+        rec["status"] = "executing"
+        await save_state_serialized(st)
+        res = await repair_with_retry(session, EXEC_SYSTEM,
+                                      plan_user + "\nOUTPUT THE EDITS NOW.")
+        # A transport failure is NOT a failed fix. Leaving the step pending
+        # keeps it eligible for the next pass instead of burning an escalation
+        # on a dead gateway — the defect behind 37 of 52 escalations on 09-05.
+        if not res.ok:
+            rec["status"] = "pending"
+            rec["last_lane_error"] = res.error[:300]
+            await save_state_serialized(st)
+            print(f"[step {sid}] lanes unavailable ({res.error[:90]}) — "
+                  f"left pending", flush=True)
+            return rec
+        ex = parse_json(res.content)
+        edits = ex.get("edits") or []
+        # 09-08 (user): repair returning EMPTY edits is a phantom feed. Don't even
+        # burn a second lane call on verify — record red/no_edits and leave pending
+        # so the step is retried/escalated honestly instead of churning green.
+        if not edits:
+            # 09-14 (owner): ALREADY-SATISFIED MUST BE TESTED BEFORE `cannot-fix`.
+            # Lanes write BOTH verdicts in one sentence —
+            #   "Steps P1B3R0F5#7, P1B4R0F4#11 — cannot-fix (already satisfied / stale);
+            #    no edits emitted."
+            # — and the `cannot-fix` substring matched first, so the step was
+            # escalated to TERMINAL and never reached the already-satisfied path
+            # below. Measured live: green flat at 3152 for 25 min while every lane
+            # answered "already satisfied" and every such step landed in
+            # `escalated`. When the lane says the work is present, that IS the
+            # step done: honour `already_satisfied_action` (default green) here.
+            if is_already_satisfied(res.content):
+                action = already_satisfied_action()
+                rec["resolved_by"] = "lane verdict: already satisfied"
+                rec["last_apply"] = {
+                    "rnd": rnd + 1,
+                    "ok": action == "green",
+                    "edits": [],
+                    "apply_msg": "lane verdict: already satisfied",
+                    "lane": res.lane,
+                    "verify": (
+                        "green: lane verified the work is already present"
+                        if action == "green"
+                        else ("escalated: lane says the work is already present"
+                              if action == "escalate"
+                              else "red:no_edits — already-satisfied verdict left pending")
+                    ),
+                }
+                if action == "green":
+                    rec["status"] = "green"
+                elif action == "escalate":
+                    escalate(sid, rec,
+                             "lane verdict: work already present "
+                             "(already_satisfied_action=escalate)",
+                             site="run_step:already_satisfied")
+                else:
+                    rec["status"] = "pending"
+                    rec["rounds"] = rnd + 1
+                try:
+                    await orch_git.git_commit_step(sid, rec)
+                except Exception as ge:
+                    print(f"[step {sid}] git commit failed: {str(ge)[:180]}", flush=True)
+                await save_state_serialized(st)
+                print(f"[step {sid}] lane verdict already-satisfied -> {rec['status']}", flush=True)
+                return rec
+            # 09-13: a `cannot-fix:<id>:<reason>` reply is the CONTRACT's own
+            # terminal verdict — the lane inspected the file and reports the fix
+            # is already present or impossible. Measured live: the pool burned 9
+            # empty-edits hops per round across openrouter / omniroute /
+            # deepseek2 / deepseek4 / bitdeer / gemini with ZERO commits for 20
+            # minutes, because every lane answered
+            # "cannot-fix:P1B0R0F0#29: the required line is ALREADY present" and
+            # the engine hopped each one in turn. Honour the verdict: escalate
+            # instead of spending the whole pool on a step no lane will edit.
+            if "cannot-fix" in (res.content or "").lower():
+                # 09-14 (worker, B2): ONE lane's cannot-fix is NOT terminal.
+                # The group path already required MAX_ROUNDS before honouring
+                # this verdict (see run_group), but THIS path escalated on the
+                # first round — measured: 53 steps escalated at rounds==1, 15 of
+                # them with apply_msg "lane returned cannot-fix". A lane that
+                # gives up is not proof the work is impossible, so retry across
+                # the remaining lanes and only let the verdict kill the step
+                # once it has survived the full round budget.
+                rec["rounds"] = rnd + 1
+                rec["last_apply"] = {"rnd": rnd + 1, "ok": False, "edits": [],
+                                     "apply_msg": "lane returned cannot-fix",
+                                     "lane": res.lane}
+                if rec["rounds"] < MAX_ROUNDS:
+                    rec["status"] = "pending"
+                    rec["last_apply"]["verify"] = (
+                        "red:no_edits — cannot-fix verdict not yet corroborated, left pending")
+                    await save_state_serialized(st)
+                    print(f"[step {sid}] lane said cannot-fix — left pending "
+                          f"(round {rec['rounds']}/{MAX_ROUNDS}, not yet terminal)", flush=True)
+                    return rec
+                escalate(sid, rec,
+                         f"lane verdict cannot-fix, corroborated across "
+                         f"{rec['rounds']}/{MAX_ROUNDS} rounds (last lane: {res.lane})",
+                         site="run_step:cannot_fix",
+                         verify="escalated: lane verdict cannot-fix")
+                if rec["status"] != "escalated":
+                    await save_state_serialized(st)
+                    return rec
+                try:
+                    await orch_git.git_commit_step(sid, rec)
+                except Exception as ge:
+                    print(f"[step {sid}] git commit failed: {str(ge)[:180]}", flush=True)
+                await save_state_serialized(st)
+                print(f"[step {sid}] lane verdict cannot-fix — escalated", flush=True)
+                return rec
+            # 09-13: the same stall also arrives as a plain prose verdict — the
+            # lane inspects the file and reports the step's PREMISE is wrong or
+            # the work is already on disk, without the `cannot-fix:` prefix.
+            # Measured on this dump, two replies that each hopped every lane:
+            #   "P1B0R0F1#10: _with_idempotency_key lives in
+            #    oculus/execution/execute_trade.py ... not live/execute_trade.py"
+            #   "STEP P1B5R0F4#121 — tests/test_live_trading_auth.py is present
+            #    with the batch-provided content (19 tests ...)"
+            # Neither contains a fix verb, so `_looks_like_fix_report` misses
+            # both and the pool burns 9 hops per round on a step no lane will
+            # ever edit. A verdict that the work is ALREADY THERE is terminal:
+            # escalate it and let the escalation solver decide.
+            _c = (res.content or "").lower()
+            if sid.split("#")[0].lower() in _c and is_already_satisfied(res.content):
+                # 09-13 (owner): the work being already there IS the step done.
+                # This used to escalate, which put the step in the terminal
+                # "escalated" bucket and left the caller reading it as unfixed
+                # work. Count it green and move on.
+                rec["status"] = "green"
+                rec["resolved_by"] = "lane verdict: already satisfied"
+                rec["last_apply"] = {"rnd": rnd + 1, "ok": True, "edits": [],
+                                     "apply_msg": "lane verdict: already satisfied",
+                                     "lane": res.lane,
+                                     "verify": "green: lane verified the work is already present"}
+                try:
+                    await orch_git.git_commit_step(sid, rec)
+                except Exception as ge:
+                    print(f"[step {sid}] git commit failed: {str(ge)[:180]}", flush=True)
+                await save_state_serialized(st)
+                print(f"[step {sid}] lane verdict already-satisfied — GREEN, moving on", flush=True)
+                return rec
+            rec["status"] = "pending"
+            rec["rounds"] = rnd + 1
+            rec["last_apply"] = {"rnd": rnd + 1, "ok": False, "edits": [],
+                                 "apply_msg": "no edits proposed", "lane": res.lane}
+            rec["last_apply"]["verify"] = "red:no_edits — repair returned empty edits; not fixed, verify skipped"
+            rec["last_apply"]["lane_error"] = ""
+            # 09-13: the GROUP path already escalates a terminal verdict on sight
+            # (cannot-fix / no edits emitted). This SINGLE path did not, so a lane
+            # that had plainly said "already satisfied / cannot-fix" still fell
+            # through to `pending` and burned its remaining rounds re-asking lanes
+            # that had all said no. Measured: 419 pending steps parked at rounds
+            # 1-2 on exactly these verdicts. Escalate here too.
+            _low = (res.content or "").lower()
+            if is_already_satisfied(res.content):
+                action = already_satisfied_action()
+                rec["last_apply"]["verify"] = (
+                    "green: lane verified the work is already present" if action == "green"
+                    else ("escalated: lane says the work is already present" if action == "escalate"
+                          else "red:no_edits — already-satisfied verdict left pending"))
+                rec["resolved_by"] = "lane verdict: already satisfied"
+                if action == "green":
+                    rec["status"] = "green"
+                elif action == "escalate":
+                    escalate(sid, rec,
+                             "lane verdict: work already present "
+                             "(already_satisfied_action=escalate)",
+                             site="run_step:already_satisfied_prose")
+                else:
+                    rec["status"] = "pending"
+                if rec["status"] != "pending":
+                    try:
+                        await orch_git.git_commit_step(sid, rec)
+                    except Exception as ge:
+                        print(f"[step {sid}] git commit failed: {str(ge)[:180]}", flush=True)
+                await save_state_serialized(st)
+                print(f"[step {sid}] already-satisfied verdict — {rec['status'].upper()} "
+                      f"(already_satisfied_action={action})", flush=True)
+                return rec
+            if ("cannot-fix" in _low or "no edit emitted" in _low
+                    or "no edits emitted" in _low):
+                # 09-14 (worker, B2): same rule as the group path — a terminal-
+                # LOOKING verdict only becomes terminal once it has survived the
+                # round budget. Escalating "without burning rounds" is exactly
+                # how 53 steps died at rounds==1.
+                if rec["rounds"] < MAX_ROUNDS:
+                    rec["status"] = "pending"
+                    rec["last_apply"]["verify"] = (
+                        "red:no_edits — terminal-looking verdict not yet corroborated, left pending")
+                    await save_state_serialized(st)
+                    print(f"[step {sid}] terminal-looking verdict — left pending "
+                          f"(round {rec['rounds']}/{MAX_ROUNDS}, not yet terminal)", flush=True)
+                    return rec
+                escalate(sid, rec,
+                         f"terminal verdict from lane {res.lane} "
+                         f"(cannot-fix / no edits emitted) after "
+                         f"{rec['rounds']}/{MAX_ROUNDS} rounds",
+                         site="run_step:terminal_verdict",
+                         verify="escalated:terminal_verdict")
+                if rec["status"] != "escalated":
+                    await save_state_serialized(st)
+                    return rec
+                try:
+                    await orch_git.git_commit_step(sid, rec)
+                except Exception as ge:
+                    print(f"[step {sid}] git commit failed: {str(ge)[:180]}", flush=True)
+                await save_state_serialized(st)
+                print(f"[step {sid}] terminal verdict — escalated "
+                      f"(rounds={rec['rounds']}/{MAX_ROUNDS})", flush=True)
+                return rec
+            await save_state_serialized(st)
+            print(f"[step {sid}] repair returned NO edits — left pending (red/no_edits, verify skipped)",
+                  flush=True)
+            return rec
+        ok, msg = apply_edits(edits)
+        rec["last_apply"] = {"rnd": rnd + 1, "ok": ok, "edits": edits,
+                             "apply_msg": msg, "lane": res.lane}
+        checks = run_checks(files)
+        vres = await lane_call_result(
+            session, VERIFY_SYSTEM,
+            f"STEP {sid}: your edits {json.dumps(edits)[:3000]}\n"
+            f"CHECK OUTPUT:\n{checks}\n\nRUN VERIFICATION NOW.")
+        if not vres.ok:
+            rec["status"] = "pending"
+            rec["last_lane_error"] = f"verify lane: {vres.error[:280]}"
+            await save_state_serialized(st)
+            print(f"[step {sid}] verify lane unavailable — left pending", flush=True)
+            return rec
+        v = parse_json(vres.content)
+        if v.get("verdict") == "green":
+            # 09-07 phantom-green gate (user): verdict-green alone is not proof.
+            # Real green = the edits were actually applied this run, OR they are
+            # already present on disk (legit dedupe). Otherwise the fix never
+            # landed and the step stays pending for a real execution.
+            if edits_present(rec["last_apply"]["edits"]):
+                rec["status"] = "green"
+                rec["last_apply"]["checks"] = checks[-600:]
+                await save_state_serialized(st)
+                # 09-06 (user): every green step = individual commit+push to origin/main.
+                # Never allowed to break the marathon — git trouble logs and moves on.
+                try:
+                    await orch_git.git_commit_step(sid, rec)
+                except Exception as ge:
+                    print(f"[step {sid}] git commit failed: {str(ge)[:180]}", flush=True)
+                return rec
+            print(f"[step {sid}] verify green but NO real edit on disk — kept pending "
+                  f"(phantom-green gate)", flush=True)
+            rec["last_apply"]["verify"] = ("phantom-green: verdict green but edits not "
+                                           f"present/appl:{(str(rec['last_apply'].get('ok')))}")
+            rec["status"] = "pending"
+        rec["last_apply"]["verify"] = v.get("reason", "")
+        new_edits = v.get("edits") or edits
+        okay2, msg2 = apply_edits(new_edits)
+        plan_user = (f"STEP {sid}: corrected attempt\nFILES: {', '.join(files)}\n"
+                     f"VERIFY SAID: {v.get('reason','')}\n\nFILE CONTENTS:\n"
+                     f"{ctx}\n")
+        rec["last_apply"] = {"rnd": rnd + 1, "ok": okay2, "edits": new_edits,
+                             "apply_msg": msg2, "lane": res.lane}
+    # 09-14 (worker, B1): THIS was the silent killer. The round loop fell out
+    # here and set `escalated` with no reason at all — 108 of the 155 no-reason
+    # escalations sat at rounds==3 with last_apply.ok=true and real edits. Record
+    # WHY: the rounds were spent and the verify lane never returned green.
+    _la = rec.get("last_apply") or {}
+    escalate(sid, rec,
+             f"round budget exhausted ({rec.get('rounds')}/{MAX_ROUNDS}) without a "
+             f"green verify; last apply ok={_la.get('ok')} "
+             f"msg={str(_la.get('apply_msg'))[:80]!r} "
+             f"verify={str(_la.get('verify'))[:80]!r}",
+             site="run_step:rounds_exhausted")
+    if rec["status"] != "escalated":
+        await save_state_serialized(st)
+        return rec
+    # 09-08 (user: each step commits+pushes): escalate = terminal — save the
+    # step's applied edits to the repo too, not just greens. Individual commit.
+    try:
+        await orch_git.git_commit_step(sid, rec)
+    except Exception as ge:
+        print(f"[step {sid}] git commit failed: {str(ge)[:180]}", flush=True)
+    await save_state_serialized(st)
+    return rec
+
+
+
+
+# ---------------------------------------------------------------------------
+# Per-step batch queue engine (owner spec 2026-09-14).
+#
+#   batch of GROUP_CAP steps -> EVERY lane works that batch, one step per lane
+#   call -> each lane claims the next step whose files no other lane holds ->
+#   NO lane touches the next batch until this one is terminal (green or yellow)
+#   -> a lane cooldown is NOT an escalation: the lane parks and its step is
+#   handed to a sibling together with the step's history log.
+#
+# Set ORCH_QUEUE_ENGINE=0 to fall back to the old batch-group loop.
+# ---------------------------------------------------------------------------
+_QUEUE_ENGINE = os.environ.get("ORCH_QUEUE_ENGINE", "1") == "1"
+HANDOFF = oq.StepHandoff()
+
+ESCALATION_SYSTEM = (
+    "You are the ESCALATION PERSONA — the last line of defence for one oculus fix "
+    "step. Execution lanes have already tried and failed. You get ONE final shot. "
+    "You are given the step, its files, and the FULL HISTORY of every previous "
+    "attempt (read the history log file named in the prompt). "
+    "Decide honestly between exactly two outcomes: "
+    "(1) you can still fix it — answer {\"verdict\":\"green\",\"edits\":[{\"file\":\"...\","
+    "\"old_string\":\"...\",\"new_string\":\"...\"}],\"notes\":\"...\"}; or "
+    "(2) it genuinely cannot be fixed here — answer {\"verdict\":\"yellow\","
+    "\"justification\":\"<a specific, verifiable reason a reviewer can act on: what "
+    "you tried, what is missing, why no lane can close it>\"}. "
+    "A yellow REQUIRES a real justification of at least 40 characters; a one-word or "
+    "copy-paste reason is rejected. Never answer yellow because you are unsure — "
+    "yellow means 'this is a pass that a human must review'. "
+    "Answer ONE JSON object only, no fences, no prose."
+)
+
+
+def _lane_cool_seconds(err: str) -> int:
+    """How long to park the lane whose call failed, by failure kind.
+
+    A cooldown is NOT an escalation: the step keeps its place in the batch
+    queue and a sibling lane takes it, handed the history log.
+    """
+    e = (err or "").lower()
+    if "429" in e or "rate limit" in e or "rate_limit" in e or "too frequent" in e:
+        return int(os.environ.get("ORCH_LANE_COOL_RATE_S", "900"))
+    if "timeout" in e or "timed out" in e:
+        return int(os.environ.get("ORCH_LANE_COOL_TIMEOUT_S", "120"))
+    return int(os.environ.get("ORCH_LANE_COOL_ERROR_S", "60"))
+
+
+async def execute_step_pinned(session, lane: str, step: dict, st: dict) -> "oq.StepOutcome":
+    """ONE step, ONE lane, ONE call — the queue's unit of work.
+
+    Reuses run_step's whole verdict machine (cannot-fix / already-satisfied /
+    phantom-green / rounds / per-step commit) by pinning the lane pool to the
+    lane the scheduler handed us.
+    """
+    sid = step["finding_id"]
+    POOL.pinned = lane
+    try:
+        rec = await run_step(session, step, st)
+    except Exception as e:
+        return oq.StepOutcome("retry", lane=lane,
+                              error=f"{type(e).__name__}: {e}")
+    finally:
+        POOL.pinned = None
+    rec = rec if isinstance(rec, dict) else (st.get("steps", {}).get(sid) or {})
+    status = rec.get("status")
+    err = str(rec.get("last_lane_error") or "")
+    if status in ("green", "yellow"):
+        return oq.StepOutcome(status, lane=lane, edits=(rec.get("last_apply") or {}).get("edits") or [])
+    if status == "escalated":
+        return oq.StepOutcome("escalate", lane=lane,
+                              note=str(rec.get("escalated_reason") or ""),
+                              edits=(rec.get("last_apply") or {}).get("edits") or [])
+    cooled = _lane_cool_seconds(err) if err else 0
+    return oq.StepOutcome("retry", lane=lane, error=err or None, cooled_s=cooled,
+                          edits=(rec.get("last_apply") or {}).get("edits") or [])
+
+
+async def escalate_final(session, sid: str, st: dict) -> str:
+    """The escalation persona's ONE final shot: fix it (green) or code it yellow.
+
+    The persona is handed the step, its files, and the path of the step's history
+    log so it can see everything the execution lanes already tried.
+    """
+    rec = st["steps"].setdefault(sid, {"rounds": 0, "status": "pending"})
+    step = _STEP_BY_ID.get(sid) or {}
+    files = [x for x in (step.get("files") or []) if x and in_repo(x)]
+    ctx = "\n\n".join(file_text(f) for f in files[:2])
+    hist = HANDOFF.render(sid)
+    prompt = (f"STEP {sid}: {step.get('title')}\n"
+              f"STATE: {step.get('finding')}\nFIX GUIDANCE: {step.get('fix')}\n"
+              f"MECHANISM: {step.get('mechanism')}\n"
+              f"FILES: {', '.join(files)}\n\n"
+              f"WHY EXECUTION GAVE UP: {rec.get('escalated_reason') or rec.get('last_lane_error') or 'n/a'}\n\n"
+              f"{hist}\nFILE CONTENTS:\n{ctx}\n\nDECIDE NOW — one JSON object.")
+    res = await POOL.call(session, ESCALATION_SYSTEM, prompt, want_edits=False)
+    if not res.ok:
+        print(f"[esc] {sid}: escalation lane unavailable ({res.error[:90]}) — left escalated",
+              flush=True)
+        return "escalated"
+    verdict = parse_json(res.content)
+    v = str(verdict.get("verdict") or "").strip().lower()
+    if v in ("green", "fixed") or verdict.get("edits"):
+        edits = verdict.get("edits") or []
+        if edits:
+            ok, msg = apply_edits(edits)
+            rec["last_apply"] = {"rnd": rec.get("rounds", 0) + 1, "ok": ok,
+                                 "edits": edits, "apply_msg": msg, "lane": res.lane,
+                                 "verify": "green: escalation persona applied the fix"}
+            if not ok:
+                print(f"[esc] {sid}: persona edits failed to apply ({msg[:90]})", flush=True)
+                return "escalated"
+        rec["status"] = "green"
+        rec["resolved_by"] = "escalation persona: fixed on the final shot"
+        try:
+            await orch_git.git_commit_step(sid, rec)
+        except Exception as ge:
+            print(f"[step {sid}] git commit failed: {str(ge)[:180]}", flush=True)
+        print(f"[esc] {sid}: GREEN (escalation persona fixed it)", flush=True)
+        return "green"
+    justification = str(verdict.get("justification") or verdict.get("reason") or "").strip()
+    try:
+        oq.make_yellow(rec, justification, lane="escalation")
+    except oq.YellowJustificationError as e:
+        print(f"[esc] {sid}: persona yellow REJECTED — {e}", flush=True)
+        return "escalated"
+    rec["yellow_history_log"] = str(HANDOFF.path(sid))
+    print(f"[esc] {sid}: YELLOW (flagged for review) — {justification[:120]}", flush=True)
+    await save_state_serialized(st)
+    return "yellow"
+
+
+async def run_queue_batches(session, batches: list, st: dict) -> None:
+    """S3 (owner 09-14): ONE global work queue, lanes never idle.
+
+    A batch is an ACCOUNTING boundary, not a work boundary: the moment every
+    step of a batch is terminal, `on_batch_done` commits and reports it, while
+    the lanes have already moved on to whichever claimable step is next in the
+    plan. File safety is unchanged — `drive_plan` uses ONE reservations table
+    across every batch, so no two lanes anywhere hold the same file.
+    """
+    lane_names = [ln.name for ln in POOL.lanes]
+    steps_by_id = {s["finding_id"]: s for batch in batches for s in batch}
+    if not steps_by_id:
+        print("[qeng] nothing pending — plan drained", flush=True)
+        return
+    _STEP_BY_ID.update(steps_by_id)
+    ids = [[s["finding_id"] for s in batch] for batch in batches]
+    roster = oq.LaneRoster(lane_names)
+    locked = [s["finding_id"] for s in _STEP_BY_ID.values()
+              if "locked" in str(s.get("tags") or [])]
+    print(f"[qeng] S3 work-stealing engine: {len(ids)} batches, "
+          f"{len(steps_by_id)} steps, {len(lane_names)} lanes, "
+          f"batch_cap={BATCH_CAP}", flush=True)
+
+    async def _exec(lane, sid):
+        return await execute_step_pinned(session, lane, steps_by_id[sid], st)
+
+    async def _esc(sid):
+        return await escalate_final(session, sid, st)
+
+    def _batch_done(bi, snap):
+        try:
+            _note_step_completions(snap)
+        except Exception as e:
+            print(f"[qeng] completion hook failed: {e}", flush=True)
+
+    try:
+        snap = await oq.drive_plan(ids, st["steps"], roster, HANDOFF,
+                                   _exec, _esc, steps_by_id=steps_by_id,
+                                   poll_s=5.0,
+                                   log=lambda m: print(m, flush=True),
+                                   on_batch_done=_batch_done)
+    except oq.BatchStalled as e:
+        print(f"[qeng] PLAN STALLED — {e}", flush=True)
+        snap = {}
+    await save_state_serialized(st)
+    if snap:
+        n_t = sum(1 for v in snap.values() if v in ("green", "yellow"))
+        print(f"[qeng] plan pass done: {n_t}/{len(snap)} terminal "
+              f"(parked lanes: {roster.parked()})", flush=True)
+
+
+_STEP_BY_ID: dict = {}
+
+
+async def run_group(session, steps: list, st: dict) -> dict:
+    """09-05 (user): up to GROUP_CAP INDEPENDENT steps in ONE exec lane call.
+
+    The group arrives from pack_steps with disjoint file targets. The EXEC_SYSTEM
+    contract now allows up to 5 steps per reply: build one user prompt with STEP 1..N
+    blocks, take ONE lane_call, split the tagged edits per step, then verify every
+    step (per-step verify keeps the red/corrected-attempt semantics of run_step).
+    """
+    if len(steps) == 1:
+        return await run_step(session, steps[0], st)
+    plan, step_ids = [], []
+    step_by_sid = {}
+    for i, s in enumerate(steps, 1):
+        sid = s["finding_id"]
+        step_by_sid[sid] = s
+        rec = st["steps"].get(sid)
+        if rec is None:
+            rec = {"rounds": 0, "status": "pending"}
+            st["steps"][sid] = rec
+        # 09-09 (Bob): cap the round counter AT increment time, NEVER beyond.
+        # Previously rec["rounds"] grew unbounded (564+ steps >3, max 27) because
+        # it incremented every pass but only escalated in the verify-fail branch.
+        rec["rounds"] = min(rec.get("rounds", 0) + 1, MAX_ROUNDS)
+        rec["status"] = "executing"
+        # 09-09 (Bob): drop cross-repo files (see in_repo) in group path too.
+        files = [x for x in (s.get("files") or []) if x and in_repo(x)]
+        ctx = "\n\n".join(file_text(f) for f in files[:2])
+        plan.append(
+            f"STEP {i} ({sid}): {s.get('title')}\nSTATE: {s.get('finding')}\n"
+            f"FIX GUIDANCE: {s.get('fix')}\nMECHANISM: {s.get('mechanism')}\n"
+            f"FILES: {', '.join(files)}\n\nFILE CONTENTS:\n{ctx}\n"
+        )
+        step_ids.append((str(i), sid, files))
+    plan_user = "\n\n".join(plan) + "\nOUTPUT THE EDITS NOW — tag every edit with STEP N."
+    gres = await repair_with_retry(session, EXEC_SYSTEM, plan_user)
+    if not gres.ok:
+        # Whole-group transport failure: return every step to pending rather
+        # than escalating a batch of untouched steps.
+        for _idx, sid, _files in step_ids:
+            rec = st["steps"][sid]
+            rec["status"] = "pending"
+            rec["rounds"] = max(0, rec.get("rounds", 1) - 1)
+            rec["last_lane_error"] = gres.error[:300]
+        await save_state_serialized(st)
+        print(f"[group] lanes unavailable ({gres.error[:90]}) — "
+              f"{len(step_ids)} steps left pending | {POOL.health_report()}", flush=True)
+        return {sid: "pending" for _i, sid, _f in step_ids}
+    ex = parse_json(gres.content)
+    edits = [e for e in (ex.get("edits") or []) if isinstance(e, dict)]
+    by_step = {sid: [] for _, sid, _ in step_ids}
+    for e in edits:
+        tag = str(e.get("step") or "").replace("STEP", "").strip().strip("()").strip()
+        matched = None
+        for idx, sid, _ in step_ids:
+            if tag in (idx, sid, sid.split("#")[0]):
+                matched = sid
+                break
+        if matched is None:
+            matched = step_ids[0][1] if len(step_ids) == 1 else None
+        if matched:
+            by_step[matched].append(e)
+    for idx, sid, files in step_ids:
+        rec = st["steps"][sid]
+        mine = by_step[sid]
+        # 09-08 (user): a weak lane may skip this step in the group (empty edits).
+        # Retry it SINGLE so gemini gets a shot before we give up (repair_with_retry
+        # hops once on empty edits). Only if it still returns nothing -> red/no_edits.
+        # 09-13: the GROUP reply itself can say the work is already there. The
+        # check below only looked at the single-retry content, so a group verdict
+        # of "already satisfied" fell through to the single retry and then to
+        # escalate. Honour the group verdict first.
+        if not mine and is_already_satisfied(gres.content):
+            _action = already_satisfied_action()
+            rec["last_apply"] = {
+                "rnd": rec["rounds"],
+                "ok": _action == "green",
+                "edits": [],
+                "apply_msg": "lane verdict: already satisfied (group reply)",
+                "verify": ("green: lane verified the work is already present" if _action == "green"
+                           else ("escalated: lane says the work is already present" if _action == "escalate"
+                                 else "red:no_edits — already-satisfied verdict left pending")),
+            }
+            rec["resolved_by"] = "lane verdict: already satisfied"
+            if _action == "green":
+                rec["status"] = "green"
+            elif _action == "escalate":
+                escalate(sid, rec,
+                         "lane verdict (group reply): work already present "
+                         "(already_satisfied_action=escalate)",
+                         site="run_group:already_satisfied_group_reply")
+            else:
+                rec["status"] = "pending"
+            if rec["status"] != "pending":
+                try:
+                    await orch_git.git_commit_step(sid, rec)
+                except Exception as ge:
+                    print(f"[step {sid}] git commit failed: {str(ge)[:180]}", flush=True)
+            print(f"[group] step {sid} already-satisfied verdict (group reply) — "
+                  f"{rec['status'].upper()} (already_satisfied_action={_action})", flush=True)
+            continue
+        if not mine:
+            ss = step_by_sid.get(sid) or {}
+            sfiles = [x for x in (ss.get("files") or []) if x and in_repo(x)]
+            sctx = "\n\n".join(file_text(f) for f in sfiles[:2])
+            sp = (f"STEP 1 ({sid}): {ss.get('title')}\nSTATE: {ss.get('finding')}\n"
+                  f"FIX GUIDANCE: {ss.get('fix')}\nMECHANISM: {ss.get('mechanism')}\n"
+                  f"FILES: {', '.join(sfiles)}\n\nFILE CONTENTS:\n{sctx}\n"
+                  f"OUTPUT THE EDITS NOW.")
+            sres = await repair_with_retry(session, EXEC_SYSTEM, sp)
+            if sres.ok:
+                sex = parse_json(sres.content)
+                mine = sex.get("edits") or []
+                # 09-13: the SINGLE retry can come back with a terminal verdict
+                # ("cannot-fix" / "no edits emitted") — repair_with_retry returns
+                # those deliberately instead of hopping, because the answer is the
+                # same on every lane. Treat it as terminal HERE too: without this
+                # the step fell through to `pending` and burned its remaining
+                # rounds re-asking lanes that had already said no. Measured: 421
+                # pending steps stuck at rounds 1-2 on exactly these verdicts.
+                _low = (sres.content or "").lower()
+                if not mine and is_already_satisfied(sres.content):
+                    action = already_satisfied_action()
+                    rec["last_apply"] = {
+                        "rnd": rec["rounds"],
+                        "ok": action == "green",
+                        "edits": [],
+                        "apply_msg": "lane verdict: already satisfied",
+                        "verify": ("green: lane verified the work is already present" if action == "green"
+                                   else ("escalated: lane says the work is already present" if action == "escalate"
+                                         else "red:no_edits — already-satisfied verdict left pending")),
+                    }
+                    rec["resolved_by"] = "lane verdict: already satisfied"
+                    if action == "green":
+                        rec["status"] = "green"
+                    elif action == "escalate":
+                        escalate(sid, rec,
+                                 "lane verdict: work already present "
+                                 "(already_satisfied_action=escalate)",
+                                 site="run_group:already_satisfied")
+                    else:
+                        rec["status"] = "pending"
+                    if rec["status"] != "pending":
+                        try:
+                            await orch_git.git_commit_step(sid, rec)
+                        except Exception as ge:
+                            print(f"[step {sid}] git commit failed: {str(ge)[:180]}", flush=True)
+                    print(f"[group] step {sid} already-satisfied verdict — {rec['status'].upper()} "
+                          f"(already_satisfied_action={action})", flush=True)
+                    continue
+                if not mine and ("cannot-fix" in _low or "no edit emitted" in _low
+                                 or "no edits emitted" in _low):
+                    # 09-13: the group path escalated 105 steps as "cannot-fix
+                    # (target not found)" while `last_lane_error` held a
+                    # ClientConnectorError — the verdict was reached while a lane
+                    # was unreachable. A transport failure is not a verdict: leave
+                    # the step pending and let a healthy lane answer it.
+                    if is_transport_error(rec.get("last_lane_error")):
+                        rec["status"] = "pending"
+                        # 09-14: clear the stale transport error. Leaving it in place
+                        # made the step match `is_transport_error` again on every
+                        # later pass, so it was reset to pending forever and never
+                        # escalated or committed (measured: 8,533 pending steps
+                        # stuck on a stale 429 / "no lane available"). A fresh
+                        # attempt needs a clean slate.
+                        # 09-14 (worker, B7): this message named neither the
+                        # lane, the error, nor the step's file, so a step cycling
+                        # through this state forever was indistinguishable from
+                        # healthy churn. Record it on the step AND in the log so
+                        # a live-lock is countable.
+                        _terr = str(rec.get("last_lane_error"))[:200]
+                        rec["transport_blocks"] = int(rec.get("transport_blocks", 0)) + 1
+                        rec["last_transport_block"] = {
+                            "at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                            "site": "run_group:cannot_fix_transport",
+                            "error": _terr,
+                            "lane": str(gres.lane),
+                            "files": files[:3],
+                        }
+                        rec.pop("last_lane_error", None)
+                        print(f"[group] step {sid} terminal-looking verdict but lane "
+                              f"{gres.lane} was unreachable ({_terr[:90]}) — left pending "
+                              f"(block #{rec['transport_blocks']}, files={files[:2]})", flush=True)
+                        continue
+                    # 09-14: a "target not found" verdict is NOT trustworthy as a
+                    # terminal verdict. Sampled the 23 steps escalated this way and
+                    # **21 of them named files that DO exist on disk** (only 2 were
+                    # genuinely missing) — the lane gave up on the file, it did not
+                    # find the file absent. Escalating on that claim kills real
+                    # work. Leave it pending and let another lane try; only a
+                    # verdict that survives repeated lanes is terminal.
+                    if rec.get("rounds", 0) < MAX_ROUNDS:
+                        # 09-14: ONE lane's `cannot-fix` must not be terminal.
+                        # Sampled the 23 steps escalated this way and **21 of them
+                        # named files that DO exist on disk** (only 2 were genuinely
+                        # missing) — the lane gave up, it did not prove the work
+                        # impossible. Escalating on the first verdict killed real
+                        # work and drove `escalated` up while `green` stayed flat.
+                        # Retry across the remaining lanes; only a verdict that
+                        # survives MAX_ROUNDS is terminal.
+                        rec["status"] = "pending"
+                        # 09-14 (worker, B3): cap AT increment. This site and the
+                        # phantom-green site below incremented without a cap, so a
+                        # step could leave the group path at MAX_ROUNDS+1.
+                        rec["rounds"] = min(rec.get("rounds", 0) + 1, MAX_ROUNDS)
+                        rec["last_apply"] = {
+                            "rnd": rec["rounds"], "ok": False, "edits": [],
+                            "apply_msg": "lane verdict cannot-fix — unverified, retrying other lanes",
+                            "verify": "red:no_edits — cannot-fix verdict not yet corroborated, left pending",
+                        }
+                        print(f"[group] step {sid} lane said cannot-fix — left pending "
+                              f"(round {rec['rounds']}/{MAX_ROUNDS}, not yet terminal)", flush=True)
+                        continue
+                    rec["last_apply"] = {
+                        "rnd": rec["rounds"], "ok": False, "edits": [],
+                        "apply_msg": "terminal verdict — cannot-fix (target not found)",
+                        "verify": "escalated:terminal_verdict",
+                    }
+                    if escalate(sid, rec,
+                                f"terminal verdict cannot-fix / target not found from lane "
+                                f"{gres.lane} after {rec['rounds']}/{MAX_ROUNDS} rounds "
+                                f"(files={files[:2]})",
+                                site="run_group:terminal_verdict") != "escalated":
+                        continue
+                    try:
+                        await orch_git.git_commit_step(sid, rec)
+                    except Exception as ge:
+                        print(f"[step {sid}] git commit failed: {str(ge)[:180]}", flush=True)
+                    print(f"[group] step {sid} terminal verdict — escalated "
+                          f"(rounds={rec['rounds']}/{MAX_ROUNDS})", flush=True)
+                    continue
+        if not mine:
+            rec["last_apply"] = {"rnd": rec["rounds"], "ok": False, "edits": [],
+                                 "apply_msg": "no edits proposed"}
+            rec["last_apply"]["verify"] = "red:no_edits — repair returned empty edits; not fixed, verify skipped"
+            # 09-09 (Bob): no_edits is terminal once the round budget is spent.
+            # Previously this branch `continue`d forever, leaving the step pending
+            # and re-hammering the lane pool every main-loop pass (rounds to 27).
+            if rec["rounds"] >= MAX_ROUNDS:
+                if escalate(sid, rec,
+                            f"round budget exhausted ({rec['rounds']}/{MAX_ROUNDS}) — "
+                            f"lane {gres.lane} returned no edits for this step on every round",
+                            site="run_group:no_edits_exhausted") == "escalated":
+                    try:
+                        await orch_git.git_commit_step(sid, rec)
+                    except Exception as ge:
+                        print(f"[step {sid}] git commit failed: {str(ge)[:180]}", flush=True)
+                    print(f"[group] step {sid} exhausted rounds on no_edits — escalated", flush=True)
+            else:
+                rec["status"] = "pending"
+                print(f"[group] step {sid} repair returned NO edits — pending (red/no_edits)", flush=True)
+            continue
+        ok, msg = apply_edits(mine)
+        rec["last_apply"] = {"rnd": rec["rounds"], "ok": ok, "edits": mine, "apply_msg": msg}
+        checks = run_checks(files)
+        rec["last_apply"]["checks"] = checks[-600:]
+        vres = await lane_call_result(
+            session, VERIFY_SYSTEM,
+            f"STEP {sid}: your edits {json.dumps(mine)[:3000]}\n"
+            f"CHECK OUTPUT:\n{checks}\n\nRUN VERIFICATION NOW.")
+        if not vres.ok:
+            rec["status"] = "pending"
+            rec["last_lane_error"] = f"verify lane: {vres.error[:280]}"
+            continue
+        v = parse_json(vres.content)
+        if v.get("verdict") == "green":
+            if edits_present(rec["last_apply"]["edits"]):
+                rec["status"] = "green"
+                # 09-06 (user): per-step individual commit+push (same rule as run_step).
+                try:
+                    await orch_git.git_commit_step(sid, rec)
+                except Exception as ge:
+                    print(f"[step {sid}] git commit failed: {str(ge)[:180]}", flush=True)
+            else:
+                # 09-13: this branch did NOT advance rounds, so a step whose lane
+                # keeps saying "green" without an edit on disk stayed pending
+                # forever and was re-asked on every pass (measured: steps parked
+                # at rounds 16). Count the round, and escalate once the budget is
+                # spent — a lane that cannot produce the edit is a terminal
+                # verdict, not something to retry indefinitely.
+                if is_transport_error(rec.get("last_lane_error")):
+                    # the last verify could not reach a lane — retry, never escalate
+                    rec["status"] = "pending"
+                    rec.pop("last_lane_error", None)  # clean slate (see group path)
+                    continue
+                rec["rounds"] = min(rec.get("rounds", 0) + 1, MAX_ROUNDS)  # B3: cap
+                rec["last_apply"]["verify"] = ("phantom-green: verdict green but edits not "
+                                               f"present/appl:{str(rec['last_apply'].get('ok'))}")
+                if rec["rounds"] >= MAX_ROUNDS:
+                    if escalate(sid, rec,
+                                f"phantom-green: verify returned green but no edit is present "
+                                f"on disk after {rec['rounds']}/{MAX_ROUNDS} rounds "
+                                f"(apply ok={rec['last_apply'].get('ok')}, files={files[:2]})",
+                                site="run_group:phantom_green") == "escalated":
+                        try:
+                            await orch_git.git_commit_step(sid, rec)
+                        except Exception as ge:
+                            print(f"[step {sid}] git commit failed: {str(ge)[:180]}", flush=True)
+                        print(f"[group] step {sid} phantom-green verdict — escalated "
+                              f"(rounds={rec['rounds']})", flush=True)
+                else:
+                    print(f"[group] step {sid} verdict green but no real edit on disk — "
+                          f"kept pending (phantom-green gate, round {rec['rounds']}/{MAX_ROUNDS})",
+                          flush=True)
+                    rec["status"] = "pending"
+        else:
+            new_edits = v.get("edits") or mine
+            _, msg2 = apply_edits(new_edits)
+            rec["last_apply"] = {"rnd": rec["rounds"], "ok": ok,
+                                 "edits": new_edits, "apply_msg": msg2}
+            # Only escalate once the step has actually spent its rounds. The
+            # group path used to escalate after a SINGLE attempt while
+            # run_step allowed MAX_ROUNDS, so a step's retry budget depended
+            # on whether packing happened to place it alone in a batch.
+            if rec["rounds"] >= MAX_ROUNDS:
+                if escalate(sid, rec,
+                            f"verify verdict not green after {rec['rounds']}/{MAX_ROUNDS} "
+                            f"rounds; verify said {str(v.get('reason'))[:120]!r} "
+                            f"(apply ok={ok}, files={files[:2]})",
+                            site="run_group:verify_red_exhausted") == "escalated":
+                    # 09-08 (user: each step commits+pushes): escalate = terminal.
+                    try:
+                        await orch_git.git_commit_step(sid, rec)
+                    except Exception as ge:
+                        print(f"[step {sid}] git commit failed: {str(ge)[:180]}", flush=True)
+            else:
+                rec["status"] = "pending"
+    await save_state_serialized(st)
+    return {s["finding_id"]: st["steps"].get(s["finding_id"], {}).get("status") for s in steps}
+
+
+def pack_diverse(steps: list, cap: int) -> list:
+    """Pack steps into batches of at most `cap` with DISJOINT file sets.
+
+    09-14 (owner): the linear plan slice produced batches whose LIVE members
+    all targeted the same file — measured BATCH 1 carried 3 live steps on
+    `weight_store_integrity_...json`, so the file reservations let ONE lane
+    work and nine lanes sat idle for the whole barrier. The pending pool holds
+    9,984 steps across 1,352 distinct files, so a 15-step disjoint batch is
+    always available; the batch just has to be CHOSEN for diversity instead of
+    taken in plan order. Leftovers carry to the next batch, so no step is lost.
+    """
+    remaining = list(steps)
+    out = []
+    while remaining:
+        used, batch, rest, i = set(), [], [], 0
+        while i < len(remaining) and len(batch) < cap:
+            s = remaining[i]
+            i += 1
+            fs = {f for f in (s.get("files") or []) if f}
+            if fs and (fs & used):
+                rest.append(s)
+                continue
+            used |= fs
+            batch.append(s)
+        rest.extend(remaining[i:])
+        if not batch:                       # every remaining step collides
+            batch, rest = [remaining[0]], remaining[1:]
+        out.append(batch)
+        remaining = rest
+    return out
+
+
+def pack_steps(steps: list) -> list:
+    """Density pack up to GROUP_CAP regardless of file overlap.
+    09-05 (user): "make each batch have at least 15 steps" — the disjoint-file
+    rule capped most batches at 1-2 and starved throughput. Same-file steps in
+    ONE call are contract-legal (each edit anchors on its own unique old_string)
+    and per-step VERIFY catches any mis-application; packing is by count only."""
+    packed, group = [], []
+    for s in steps:
+        if group and len(group) >= GROUP_CAP:
+            packed.append(group)
+            group = []
+        group.append(s)
+    if group:
+        packed.append(group)
+    return packed
+
+
+def recover_orphaned_executing(st: dict) -> int:
+    """09-13: a step is marked `executing` and saved BEFORE the lane call runs, so a
+    process killed mid-step (the green-truth restarts, the escalation solver's
+    SIGTERM) leaves it in `executing` FOREVER — the engine only ever picks up
+    `pending`, so the step is lost. Measured: 233 steps parked in `executing`,
+    every one carrying `no lane available` / `verify lane: no lane available`.
+
+    At startup NO step can genuinely be executing: the only process that could be
+    running one is the one we are starting. Return them to `pending` so they are
+    eligible again."""
+    n = 0
+    refunded = 0
+    for rec in (st.get("steps") or {}).values():
+        if rec.get("status") == "executing":
+            rec["status"] = "pending"
+            rec["orphan_recovered"] = time.strftime("%Y-%m-%d %H:%M startup recovery")
+            rec["orphan_recoveries"] = int(rec.get("orphan_recoveries", 0)) + 1
+            # 09-14 (worker, B9): REFUND THE ROUND. `rec["rounds"]` is incremented
+            # and saved BEFORE the lane call, so a process killed mid-step burns a
+            # round on which NO lane ever answered. This box restarts the engine
+            # often (green-truth every 5 min, the gemini health check every 30,
+            # the escalation solver's SIGTERM), so the budget drains without a
+            # single verdict. Measured on the live state: 412 steps carry
+            # `orphan_recovered`, and 243 of them hold rounds>=1 with NO
+            # `last_apply` at all — a spent round and nothing to show for it. 25
+            # were already at rounds==3, which means the very next pass would hit
+            # the `rounds >= MAX_ROUNDS` gate and escalate them WITHOUT ever
+            # calling a lane. That is precisely the shape of the 108 no-reason
+            # escalations at rounds==3 (see B1). A round that produced no lane
+            # result is not a round the step spent.
+            if not rec.get("last_apply"):
+                before = int(rec.get("rounds") or 0)
+                rec["rounds"] = max(0, before - 1)
+                if rec["rounds"] != before:
+                    refunded += 1
+            n += 1
+    if refunded:
+        print(f"[eng] refunded {refunded} round(s) burned by mid-step kills "
+              f"(no lane verdict was ever recorded for them)", flush=True)
+    return n
+
+
+# 09-14 (worker, brief Part B): RE-OPEN DEAD WORK AT STARTUP.
+#
+# Measured on the live state: 502 of 502 escalated steps carried a reason that
+# was NOT a verdict about the code —
+#   300  transport / timeout (`timeout after Ns`, ClientConnectorError,
+#        ServerDisconnectedError, 429 / rate-limited, "no lane available")
+#   155  no reason at all (the silent escalate fixed in this same commit series)
+#    38  `[502] Prompt too long (max 6000 characters)` from the omniroute lane,
+#        which has since been pulled from the pool entirely
+#     9  gateway/auth infrastructure errors (expired key, overloaded upstream,
+#        `page.viewportSize is not a function`)
+# ZERO were a lane actually saying the fix could not be made. Every one of them
+# is work the engine gave up on because of its own defects, and `escalated` is
+# terminal — nothing would ever retry them.
+#
+# Doing this by hand on the state file does NOT hold: save_state_serialized
+# merges on save and a TERMINAL status in a running engine's in-memory snapshot
+# beats a `pending` on disk, so an out-of-band re-open is silently reverted
+# (observed directly: 502 steps re-opened on disk were back to `escalated`
+# minutes later with every field the re-open added stripped). Doing it HERE, on
+# the engine's own state at startup before any batch runs, is authoritative.
+#
+# Idempotent: a step is re-opened at most once per REOPEN_VERSION, so this is
+# not a loop — once the fixed engine escalates a step for a REAL reason, that
+# reason is not in the list below and the step stays terminal.
+REOPEN_VERSION = "2026-09-14.worker.1"
+
+# 09-14 (worker): steps THIS process deliberately re-opened. The merge in
+# save_state_serialized keeps a TERMINAL status on disk over a non-terminal one
+# in memory — which is right for a stale snapshot, but WRONG for a step this run
+# re-opened on purpose: a single stale write of the old `escalated` record puts
+# it back on disk, the merge then adopts it into memory, and the engine
+# propagates it forever. Observed live: `escalated` flip-flopped 0 <-> 502 and
+# the 155 no-reason records kept returning minutes after a clean re-open.
+# A step in this set is never resurrected from disk by the merge.
+_REOPENED_THIS_RUN: set[str] = set()
+
+_REOPEN_NOT_A_VERDICT = (
+    "timeout after", "timed out",
+    "ClientConnectorError", "Cannot connect to host", "Connect call failed",
+    "Connection refused", "ConnectionResetError", "ClientOSError",
+    "ServerDisconnectedError", "Server disconnected",
+    "no lane available", "lanes unavailable",
+    "free_rate_limited", "rate_limited", "rate limit", "Rate limit exceeded",
+    "http 429", "Too Many Requests",
+    "Prompt too long",
+    "API key expired", "invalid_token",
+    # 09-14: model-auth / capability failures on the provider side. Measured as
+    # the last 5 escalations on the live state: `[401] Model north-mini-code-free
+    # is not supported`, `[401] Model hy3-free is not supported`, and
+    # `[402] This model requires an opencode API key`. A model the account may
+    # not call is an infrastructure fact, not a statement about the step.
+    "authentication_error", "invalid_api_key", "http 401", "http 402",
+    "[401]", "[402]", "is not supported", "requires an opencode API key",
+    "temporarily overloaded", "upstream error",
+    "page.viewportSize is not a function", "Messages too frequent",
+)
+
+
+def reopen_dead_escalations(st: dict) -> int:
+    """Return escalated steps that died on infrastructure, not on a verdict."""
+    if os.environ.get("ORCH_REOPEN_DEAD", "1") != "1":
+        return 0
+    n = 0
+    for sid, rec in (st.get("steps") or {}).items():
+        if rec.get("status") != "escalated":
+            continue
+        if rec.get("reopened_by_startup") == REOPEN_VERSION:
+            continue                      # already given a second life
+        reason = (f"{rec.get('escalated_reason') or ''} "
+                  f"{rec.get('last_lane_error') or ''}").strip()
+        # No reason at all = the silent escalate. Not a verdict either.
+        if reason and not any(m in reason for m in _REOPEN_NOT_A_VERDICT):
+            continue                      # a real verdict — leave it terminal
+        rec["status"] = "pending"
+        rec["rounds"] = 0                 # the old rounds were spent on a bug
+        rec["reopened_by_startup"] = REOPEN_VERSION
+        _REOPENED_THIS_RUN.add(sid)
+        rec["reopened_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+        rec["reopened_from_reason"] = (reason or "NONE (silent escalation)")[:200]
+        rec.pop("last_lane_error", None)  # stale errors re-trigger the guards
+        rec.pop("escalated_reason", None)
+        n += 1
+    return n
+
+
+async def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--resume", action="store_true")
+    ap.add_argument("--batch", type=int, default=None, help="1-based pack batch")
+    ap.add_argument("--only-step", default=None)
+    ap.add_argument("--limit", type=int, default=None)
+    ap.add_argument("--dry-run", action="store_true", help="Resolve config and plan without side effects")
+    ap.add_argument("--print-config", action="store_true", help="Print resolved config and exit")
+    args = ap.parse_args()
+
+    global CFG, BASE, PLAN_FILE, STATE_FILE, REPO
+    if args.dry_run:
+        CFG = orch_config.load(overrides={"dry_run": True})
+        BASE = Path(CFG.base_dir)
+        PLAN_FILE = CFG.plan_path
+        STATE_FILE = CFG.state_path
+        REPO = Path(CFG.repo_dir)
+
+    if args.print_config or args.dry_run:
+        print("[eng] === DRY RUN (Zero side effects, zero state writes) ===")
+        print(f"[eng] Config file: {orch_config._config_file()}")
+        print(f"[eng] Repo dir:    {CFG.repo_dir}")
+        print(f"[eng] Base dir:    {CFG.base_dir}")
+        print(f"[eng] Plan file:   {PLAN_FILE}")
+        print(f"[eng] State file:  {STATE_FILE}")
+        print(f"[eng] Queue file:  {CFG.queue_path}")
+        print(f"[eng] Wake log:    {CFG.wake_log}")
+        if not PLAN_FILE.exists():
+            print(f"[eng] WARNING: Plan file does not exist: {PLAN_FILE}")
+            return
+        plan = json.loads(PLAN_FILE.read_text(encoding="utf-8"))
+        steps = plan.get("steps") or []
+        st = load_state()
+        print(f"[eng] Total plan steps: {len(steps)} | Recorded state steps: {len(st.get('steps', {}))}")
+        todo = steps
+        if args.only_step:
+            todo = [s for s in todo if s.get("finding_id") == args.only_step]
+        if args.limit is not None:
+            todo = todo[: args.limit]
+        batches = pack_steps(todo)
+        print(f"[eng] Target steps: {len(todo)} | Disjoint batches: {len(batches)}")
+        print(CFG.render())
+        print("[eng] === END DRY RUN ===")
+        return
+
+    plan = json.loads(PLAN_FILE.read_text())
+    steps = plan.get("steps") or []
+    print(f"[eng] plan {PLAN_FILE.name}: {len(steps)} steps | lanes={len(POOL.lanes)} | workers={WORKERS}")
+    # 09-07: green-truth invariant BEFORE state load — any phantom that the
+    # 5-min watch (or a previous run) reopened must never be re-saved as green
+    # by this process's in-memory copy of a pre-repair state file.
+    # 09-14: this was a BLOCKING 120s subprocess call on the startup path, and the
+    # watch itself waits on the state lock the escalation solver holds — measured
+    # the engine sitting at cpu=00:00:00 with ZERO log output because the child
+    # never returned. The watch is housekeeping, never a gate: bound it hard and
+    # let the engine start regardless.
+    try:
+        _gt = subprocess.run([sys.executable, str(Path(__file__).parent / "green_truth_watch.py")],
+                             capture_output=True, timeout=20, check=False)
+        if _gt.returncode != 0:
+            print(f"[eng] green-truth pass exited {_gt.returncode} (non-fatal)", flush=True)
+    except subprocess.TimeoutExpired:
+        print("[eng] green-truth pass exceeded 20s — skipped (non-fatal)", flush=True)
+    except Exception as _e:
+        print(f"[eng] green-truth pass unavailable ({_e}) — continuing", flush=True)
+    st = load_state()
+    _orphans = recover_orphaned_executing(st)
+    # 09-14 (worker): re-open work the engine killed for reasons that were never
+    # a verdict about the code. Runs BEFORE any batch, on the engine's own state,
+    # so it cannot be clobbered by a stale snapshot the way a hand-edit is.
+    _reopened = reopen_dead_escalations(st)
+    if _orphans or _reopened:
+        save_state(st)
+        if _orphans:
+            print(f"[eng] recovered {_orphans} orphaned 'executing' step(s) -> pending "
+                  f"(a previous process died mid-step)", flush=True)
+        if _reopened:
+            print(f"[eng] re-opened {_reopened} escalated step(s) that died on "
+                  f"transport/timeout/prompt-cap/no-reason — none was a lane verdict "
+                  f"(version {REOPEN_VERSION})", flush=True)
+    todo = steps
+    if args.only_step:
+        todo = [s for s in todo if s["finding_id"] == args.only_step]
+    if args.limit is not None:
+        todo = todo[: args.limit]
+    batches = pack_steps(todo)
+    print(f"[eng] packed {len(batches)} batches (disjoint-file groups)")
+    # 09-13: the loop iterated EVERY batch and printed "[BATCH n] 3 steps, 0
+    # pending" for each already-terminal one. Measured live: 579 of those lines
+    # in 3 minutes against only 5 batches that did real work — the scan itself
+    # was the bulk of the log and the loop spent its time re-visiting finished
+    # batches on every pass. Drop the batches with nothing left to do before the
+    # loop, so a pass only walks work that can actually complete.
+    def _has_pending(batch):
+        return any((st["steps"].get(s["finding_id"]) or {}).get("status")
+                   in (None, "pending", "executing") for s in batch)
+    _before = len(batches)
+    batches = [b for b in batches if _has_pending(b)]
+    print(f"[eng] {len(batches)}/{_before} batches still have pending steps", flush=True)
+    # 09-13: FRESH WORK FIRST. 7,487 pending steps had rounds=0 (never attempted)
+    # while the engine looped on the first few batches, whose steps were already
+    # at rounds 1-3 and kept returning terminal verdicts — so a pass spent its
+    # lane calls escalating the same handful of hard steps and never reached the
+    # untouched majority. Sort by the least-attempted step in the batch: a batch
+    # containing a never-tried step goes ahead of one whose steps have all been
+    # round-tripped, and the backlog drains instead of spinning.
+    def _min_rounds(batch):
+        return min((st["steps"].get(s["finding_id"]) or {}).get("rounds", 0) or 0
+                   for s in batch)
+    batches.sort(key=_min_rounds)
+    sel = batches
+    if args.batch is not None:
+        sel = [batches[args.batch - 1]]
+    # 09-14: repack the PENDING pool by file diversity so a batch's live steps
+    # never contend for the same reservation (see pack_diverse).
+    if _QUEUE_ENGINE:
+        _pend = [s for s in todo
+                 if (st["steps"].get(s["finding_id"]) or {}).get("status")
+                 in (None, "pending", "executing")]
+        # 09-14: ORDER MATTERS FOR PRIORITY, AND ONLY FOR PRIORITY. Measured on
+        # the plan: it is priority-sorted in 6 repeated waves (24 runs, 5
+        # inversions / 14,356 steps), and 58% of consecutive steps share a file.
+        # The dependency language in the step text is prose about code coupling,
+        # not step->step sequencing (89 hits, none a "run X before Y"). So the
+        # repack must NOT shuffle priority: sort the pool by (priority rank,
+        # plan index) FIRST, then fill each batch with the highest-priority
+        # candidates whose files are still free. Priority order is preserved
+        # exactly; file diversity is won by skipping a colliding candidate and
+        # taking the next one down the same ordered list.
+        _prank = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
+        _order = {s["finding_id"]: i for i, s in enumerate(todo)}
+        _before_d = len(batches)
+        _pend.sort(key=lambda s: (_prank.get(str(s.get("priority") or "").upper(), 4),
+                                  _order.get(s["finding_id"], 1 << 30)))
+        batches = pack_diverse(_pend, BATCH_CAP)
+        print(f"[eng] repacked {len(_pend)} pending steps into {len(batches)} "
+              f"file-disjoint batches (cap {GROUP_CAP}, was {_before_d})", flush=True)
+        sel = batches
+        if args.batch is not None:
+            sel = [batches[args.batch - 1]]
+    tok = None
+    import aiohttp
+    # 09-14: this was a flat 900s while the configured lane_timeout is 400s, so a
+    # single wedged webchat call held a worker slot for 15 minutes and the engine
+    # looked frozen (measured: cpu=0, three connections parked on one gateway,
+    # zero log output for 10+ min). Honour lane_timeout with a small margin so the
+    # request fails, the lane cools, and the batch hops to a sibling.
+    _lane_budget = int(getattr(CFG, "lane_timeout", 400)) + 30
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=_lane_budget)) as session:
+        num = args.batch if args.batch is not None else 0
+        # 09-05 (user): PARALLELITY — up to EXEC_PARALLEL batch groups in
+        # flight at once. Lanes round-robin per lane_call, so groups spread
+        # across DS / gemini / openrouter naturally; state saves are
+        # SAVE_LOCK-serialized (see save_state_serialized). Memory-safe cap:
+        # each webchat lane drives ONE tab anyway, so extra groups only add
+        # small HTTP payloads, not browsers.
+        gpb = asyncio.Semaphore(PARALLEL)
+        skip_index = args.batch if args.batch is not None else 0
+
+        async def run_one(idx_batch: tuple) -> None:
+            idx, batch = idx_batch
+            async with gpb:
+                bnum = idx if skip_index == 0 else skip_index
+                pending = [s for s in batch
+                           if (st["steps"].get(s["finding_id"]) or {}).get("status")
+                           in (None, "pending", "executing")]
+                print(f"[BATCH {bnum}] {len(batch)} steps, {len(pending)} pending", flush=True)
+                if not pending:
+                    return
+                await run_group(session, pending, st)
+                statuses = {s["finding_id"]: st["steps"].get(s["finding_id"], {}).get("status")
+                            for s in batch}
+                print(f"[BATCH {bnum}] done: {statuses}", flush=True)
+                # 09-09 (Bob 6337): clear lane context every 5 COMPLETED steps,
+                # not every 5 sends/turns. A step is "completed" when its status
+                # is terminal (green or escalated). Count terminal transitions in
+                # this batch and, on the 5th, ask the pool to reset each lane's
+                # conversation so stale context can't compound across tasks.
+                _note_step_completions(statuses)
+
+        # 09-06: never exit while steps remain pending AND the whole lane pool
+        # is cooling. Exiting reset in-memory cooldowns via the Restart=always
+        # loop and re-hammered the pool; instead wait out the ladder and
+        # re-scan until progress resumes or the plan truly drains.
+        # 09-12: count only the steps THIS run selected. Counting the whole state
+        # made every scoped run (--limit / --only-step / --batch) spin forever:
+        # the selected batches drained, but 10k untouched steps stayed "pending",
+        # so `still` never hit 0 and the loop re-ran the same empty batches at
+        # full speed (observed: `[BATCH 1] 1 steps, 0 pending` hundreds of times
+        # with --limit 1).
+        sel_ids = {s["finding_id"] for batch in sel for s in batch}
+        _STEP_BY_ID.update({s["finding_id"]: s for batch in sel for s in batch})
+        if _QUEUE_ENGINE:
+            # 09-14 (owner): one batch at a time, every lane on it, barrier at
+            # the end. The old loop ran PARALLEL batch-groups at once.
+            await run_queue_batches(session, sel, st)
+        else:
+            while True:
+                await asyncio.gather(*(run_one(ib) for ib in enumerate(sel, 1)))
+                still = sum(1 for fid in sel_ids
+                            if (st["steps"].get(fid) or {}).get("status") in (None, "pending", "executing"))
+                if still == 0:
+                    break
+                if any(ln.is_available(time.time()) for ln in POOL.lanes):
+                    continue  # lanes live again — re-scan for pickups
+                print(f"[wait] {still} steps pending, pool blocked — sleeping 240s", flush=True)
+                await asyncio.sleep(240)
+        await save_state_serialized(st)
+        aggr = dict((k, v.get("status")) for k, v in st["steps"].items())
+        print(f"EXEC_DONE: total={len(aggr)} green={sum(1 for x in aggr.values() if x == 'green')} "
+              f"escalated={sum(1 for x in aggr.values() if x == 'escalated')}", flush=True)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
