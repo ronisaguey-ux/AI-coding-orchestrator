@@ -289,11 +289,19 @@ def default_lanes(cfg=None) -> list[Lane]:
         # tencent/hy3-free, z-ai/glm-5.3-flash-free all returned 200. This is an
         # API lane: no browser tab, no per-account mutex, no anti-ban gap — it can
         # take many concurrent calls, so it is the real throughput lever.
-        Lane("orcarouter", "https://api.orcarouter.ai/v1/chat/completions",
-             ["deepseek/deepseek-v4-flash-free", "orcarouter/free",
-              "tencent/hy3-free", "z-ai/glm-5.3-flash-free"],
-             45, 120, prompt_cap=24000, timeout=120,
-             auth="sk-orca-KNVShgXMQpSKanLRM8BFK6ZKyVCFoN3IhIdnZxubslG"),
+#         Lane("orcarouter", "https://api.orcarouter.ai/v1/chat/completions",
+#              ["deepseek/deepseek-v4-flash-free", "orcarouter/free",
+#               "tencent/hy3-free", "z-ai/glm-5.3-flash-free"],
+#              45, 120, prompt_cap=24000, timeout=120,
+#              auth="sk-orca-KNVShgXMQpSKanLRM8BFK6ZKyVCFoN3IhIdnZxubslG"),
+
+        # 09-15 (data-driven pull): orcarouter is DEAD WEIGHT. Over 3 hours it
+        # made 86 claims, failed 33 times, was ladder-cooled 44 times and
+        # produced TWO greens, while every other lane produced 3-18. All four
+        # of its free models now answer 429 'free pool capacity is limited' and
+        # get parked 1800s at a time, so it spends its life cooled. Re-enable
+        # only after /v1/chat/completions returns 200 with real content for
+        # deepseek/deepseek-v4-flash-free on a fresh day.
         # 09-13 (owner): Bitdeer AI Cloud Model Studio — OpenAI-compatible API
         # lane, key named "oculus" in their console. Base URL taken from the
         # model page's "API Interfaces" tab (api-inference.bitdeer.ai).
