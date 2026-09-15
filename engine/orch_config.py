@@ -101,6 +101,15 @@ DEFAULTS: dict[str, tuple[Any, type, str]] = {
     # backstop well below the OOM band.
     "ram_pct_cap":       (90, int, "Hard ceiling: pause above this system RAM percentage"),
     "min_avail_mb":      (600, int, "Pause when available memory falls below this many MB"),
+    # 09-14 (owner): escalation is a WORKFLOW CHOICE, not a baked-in stage.
+    # OFF (default): the step executor decides — it either lands a working
+    # edit (green) or reports it cannot (yellow, with its reason). No third
+    # class, nothing to wait on.
+    # ON: a step the executor cannot solve goes to `escalated` and a separate
+    # escalation persona gets one final shot at it (green, or code yellow).
+    "escalations_enabled": (False, bool,
+                            "Route unsolvable steps to an escalation persona "
+                            "for one final shot. Off = executor decides green/yellow."),
     "swarm_cap":         (12, int, "Hard concurrency ceiling (lane count). Raised 4->12 on owner order 09-14: one batch in flight, every lane a worker."),
     "dry_run":           (False, bool, "Resolve and print actions without side effects"),
     "verbose":           (False, bool, "Verbose lane/step logging"),

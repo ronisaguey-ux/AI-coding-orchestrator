@@ -563,11 +563,15 @@ class TestNoEscalations(unittest.IsolatedAsyncioTestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def test_drive_plan_has_no_escalation_hook(self):
+    def test_escalation_hook_is_optional_and_off_by_default(self):
+        # The hook still exists (escalations_enabled: true for users who want
+        # them) but must default to None, so the shipped behaviour is the
+        # executor deciding green/yellow with no third class.
         import inspect
         params = inspect.signature(oq.drive_plan).parameters
-        self.assertNotIn("on_escalate", params,
-                         "drive_plan must not take an escalation hook any more")
+        self.assertIn("on_escalate", params)
+        self.assertIsNone(params["on_escalate"].default,
+                          "escalations must be OFF unless a hook is supplied")
 
     def test_escalate_outcome_becomes_yellow_with_a_justification(self):
         recs = {"S1": {"rounds": 3, "status": "escalated"}}
@@ -625,3 +629,70 @@ class TestNoEscalations(unittest.IsolatedAsyncioTestCase):
                           exec_step, steps_by_id=steps, poll_s=0.005), timeout=5)
         self.assertNotEqual(recs["S1"]["status"], "escalated")
         self.assertTrue(oq.is_terminal(recs["S1"]))
+
+
+class TestEscalationConfigSwitch(unittest.IsolatedAsyncioTestCase):
+    """Escalation is a workflow choice: off = executor decides, on = persona."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.h = oq.StepHandoff(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_off_maps_escalate_to_yellow(self):
+        recs = {"S1": {"rounds": 3, "status": "pending"}}
+        oq.apply_outcome(recs, "S1", oq.StepOutcome("escalate", lane="L1",
+                                                    note="cannot apply a working edit"),
+                         escalations=False)
+        self.assertEqual(recs["S1"]["status"], "yellow")
+        self.assertTrue(recs["S1"].get("yellow_justification"))
+
+    def test_on_keeps_escalated_for_the_persona(self):
+        recs = {"S1": {"rounds": 3, "status": "pending"}}
+        oq.apply_outcome(recs, "S1", oq.StepOutcome("escalate", lane="L1"),
+                         escalations=True)
+        self.assertEqual(recs["S1"]["status"], "escalated")
+        self.assertFalse(oq.is_terminal(recs["S1"]))
+
+    async def test_switch_on_runs_the_persona_from_the_queue(self):
+        recs = {"S1": {"rounds": 0, "status": "pending"}}
+        steps = {"S1": {"finding_id": "S1", "files": ["a.py"]}}
+        seen = []
+
+        async def exec_step(lane, sid):
+            return oq.StepOutcome("escalate", lane=lane, note="cannot fix")
+
+        async def on_escalate(lane, sid):
+            seen.append((lane, sid))
+            oq.make_yellow(recs[sid],
+                           "Escalation persona took its final shot and could not close "
+                           "the step: the target module is absent from this repo.",
+                           lane=lane)
+            return "yellow"
+
+        await asyncio.wait_for(
+            oq.drive_plan([["S1"]], recs, oq.LaneRoster(["L1"]), self.h,
+                          exec_step, on_escalate=on_escalate, steps_by_id=steps,
+                          poll_s=0.005), timeout=5)
+        self.assertEqual(seen, [("L1", "S1")])
+        self.assertEqual(recs["S1"]["status"], "yellow")
+
+    async def test_switch_off_never_calls_the_persona(self):
+        recs = {"S1": {"rounds": 0, "status": "pending"}}
+        steps = {"S1": {"finding_id": "S1", "files": ["a.py"]}}
+        seen = []
+
+        async def exec_step(lane, sid):
+            return oq.StepOutcome("escalate", lane=lane, note="cannot fix this one")
+
+        async def on_escalate(lane, sid):
+            seen.append(sid)
+            return "green"
+
+        await asyncio.wait_for(
+            oq.drive_plan([["S1"]], recs, oq.LaneRoster(["L1"]), self.h,
+                          exec_step, steps_by_id=steps, poll_s=0.005), timeout=5)
+        self.assertEqual(seen, [])
+        self.assertEqual(recs["S1"]["status"], "yellow")

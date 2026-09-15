@@ -427,8 +427,15 @@ class StepOutcome:
     reply: str = ""
 
 
-def apply_outcome(records: dict, sid, res) -> str:
-    """Translate a lane's StepOutcome into the step record's status."""
+def apply_outcome(records: dict, sid, res, escalations: bool = False) -> str:
+    """Translate a lane's StepOutcome into the step record's status.
+
+    `escalations` is the workflow switch (config `escalations_enabled`):
+      False (default) — a lane that cannot fix the step yields a CODE YELLOW
+        carrying its reason. The executor decides; there is no third class.
+      True — the step goes to `escalated` and an escalation persona gets one
+        final shot at it.
+    """
     rec = records.setdefault(sid, {"rounds": 0, "status": "pending"})
     o = str(res.outcome or "").strip().lower()
     if o == "green":
@@ -439,6 +446,8 @@ def apply_outcome(records: dict, sid, res) -> str:
                 f"lane {res.lane} returned yellow for {sid} with no recorded "
                 f"justification")
         rec["status"] = "yellow"
+    elif o == "escalate" and escalations:
+        rec["status"] = "escalated"
     elif o == "escalate":
         # 09-14 (owner): "get rid of escalations entirely ... they either solve
         # it or they cant". There is no escalation phase and no red. A lane that
@@ -457,7 +466,7 @@ def apply_outcome(records: dict, sid, res) -> str:
     return rec["status"]
 
 
-def _apply_outcome(queue, sid, res) -> str:
+def _apply_outcome(queue, sid, res, escalations: bool = False) -> str:
     """Translate a lane's StepOutcome into the step's own status field.
 
     The queue reads status from the engine records, so the driver — not the
@@ -623,8 +632,9 @@ def pack_batches(step_ids, group_cap=DEFAULT_GROUP_CAP):
 
 
 async def drive_plan(batches, records, roster, handoff, execute_step, *,
-                     steps_by_id=None, poll_s=None, log=None, max_stall_rounds=600,
-                     on_batch_done=None):
+                     on_escalate=None, steps_by_id=None, poll_s=None, log=None,
+                     max_stall_rounds=600, on_batch_done=None,
+                     max_escalation_attempts=3):
     """ONE global work queue, lanes never idle, and NO escalation phase.
 
     Owner 09-14: "get rid of escalations entirely, have the initial step executor
@@ -665,15 +675,24 @@ async def drive_plan(batches, records, roster, handoff, execute_step, *,
         return (records.get(sid) or {}).get("status") or "pending"
 
     inflight: dict = {}
+    esc_attempts: dict = {}
 
     def claim(holder):
-        for sid in order:
-            if sid in inflight or status(sid) != "pending":
-                continue
-            if res.can_reserve(step_files(steps_by_id.get(sid)), holder):
-                res.reserve(step_files(steps_by_id.get(sid)), holder)
-                inflight[sid] = holder
-                return sid
+        kinds = ("escalate", "execute") if on_escalate else ("execute",)
+        for kind in kinds:
+            for sid in order:
+                if sid in inflight:
+                    continue
+                st = status(sid)
+                if kind == "execute" and st != "pending":
+                    continue
+                if kind == "escalate" and st != "escalated":
+                    continue
+                fs = step_files(steps_by_id.get(sid))
+                if res.can_reserve(fs, holder):
+                    res.reserve(fs, holder)
+                    inflight[sid] = holder
+                    return sid, kind
         return None
 
     def release(sid):
@@ -682,7 +701,8 @@ async def drive_plan(batches, records, roster, handoff, execute_step, *,
             res.release(h)
 
     def all_done():
-        return all(is_terminal(records.get(s)) for s in order)
+        return all(is_terminal(records.get(s))
+                   or (records.get(s) or {}).get("escalation_gave_up") for s in order)
 
     reported: set = set()
 
@@ -705,9 +725,37 @@ async def drive_plan(batches, records, roster, handoff, execute_step, *,
             if wait > 0:
                 await asyncio.sleep(min(wait, poll_s))
                 continue
-            sid = claim(lane)
-            if sid is None:
+            task = claim(lane)
+            if task is None:
                 await asyncio.sleep(poll_s)
+                continue
+            sid, kind = task
+            if kind == "escalate":
+                n = esc_attempts.get(sid, 0) + 1
+                esc_attempts[sid] = n
+                log(f"[plan] {lane} -> ESCALATION final shot on {sid} "
+                    f"(attempt {n}/{max_escalation_attempts})")
+                try:
+                    verdict = await on_escalate(lane, sid)
+                except Exception as e:
+                    verdict = "escalated"
+                    log(f"[plan] escalation of {sid} on {lane} errored: {e}")
+                rec = records.setdefault(sid, {"rounds": 0, "status": "escalated"})
+                if verdict == "green":
+                    rec["status"] = "green"
+                    rec["resolved_by"] = "escalation persona: fixed on the final shot"
+                elif verdict == "yellow":
+                    if rec.get("status") != "yellow":
+                        raise YellowJustificationError(
+                            f"escalation persona declared {sid} yellow with no "
+                            f"recorded justification")
+                elif n >= max_escalation_attempts:
+                    rec["escalation_gave_up"] = (
+                        f"no verdict from {n} lane attempt(s); last lane {lane}")
+                    log(f"[plan] {sid} escalation gave up after {n} attempt(s)")
+                release(sid)
+                report_batches()
+                log(f"[plan] {sid} -> {status(sid)} (escalation, {lane})")
                 continue
             log(f"[plan] {lane} claimed {sid} (batch {batch_of[sid]})")
             try:
@@ -725,7 +773,9 @@ async def drive_plan(batches, records, roster, handoff, execute_step, *,
                 log(f"[plan] {lane} cooled {out.cooled_s}s — {sid} handed off "
                     f"with history {handoff.path(sid).name}")
                 continue
-            apply_outcome(records, sid, out)
+            apply_outcome(records, sid, out, escalations=bool(on_escalate))
+            if status(sid) == "escalated":
+                esc_attempts.pop(sid, None)
             release(sid)
             report_batches()
             log(f"[plan] {sid} -> {status(sid)} by {out.lane}")
@@ -745,7 +795,9 @@ async def drive_plan(batches, records, roster, handoff, execute_step, *,
                 continue
             stall["rounds"] += 1
             if stall["rounds"] >= max_stall_rounds:
-                stuck = [s for s in order if not is_terminal(records.get(s))]
+                stuck = [s for s in order
+                         if not is_terminal(records.get(s))
+                         and not (records.get(s) or {}).get("escalation_gave_up")]
                 raise BatchStalled(
                     f"plan made no progress for {max_stall_rounds} polls; "
                     f"stuck={stuck[:8]} parked={roster.parked()} "

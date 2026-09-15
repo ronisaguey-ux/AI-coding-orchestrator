@@ -46,4 +46,5 @@ lane_max_hops: 3
 # A lane that reports the work is ALREADY THERE is reporting the step done.
 # green (default) | escalate | pending
 already_satisfied_action: green
+escalations_enabled: false
 swarm_cap: 12
