@@ -102,8 +102,16 @@ class RollbackAuditor:
         """Return HMAC-SHA256 of file contents for integrity verification."""
         if not path.exists():
             return ""
+        # P1B0R0F4#251 / P1B3R0F4#158: this used to read the whole file into
+        # memory (`f.read()`). A rollback target can be a multi-GB artefact, and
+        # the digest is computed for every file on every transaction, so peak
+        # memory tracked file size. Stream it in chunks instead — same HMAC,
+        # constant memory.
+        h = hmac.new(_HMAC_SECRET, digestmod=hashlib.sha256)
         with open(path, "rb") as f:
-            return hmac.new(_HMAC_SECRET, f.read(), hashlib.sha256).hexdigest()
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()
 
     def _backup(self) -> None:
         """Create a backup of the target file."""
