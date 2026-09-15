@@ -422,6 +422,12 @@ def default_lanes(cfg=None) -> list[Lane]:
         Lane("gemini", "http://127.0.0.1:8085/v1/chat/completions",
              ["gemini 3.7 flash webchat"], 300, 900,
              prompt_cap=12000, timeout=720),
+        # 09-15: re-enabled after I parked it on a WRONG attribution. gw1 and gw2 share
+        # one chrome, but the CDP churn is gw1's OWN behaviour - measured 50 reconnect
+        # events / 4 min with gw2 stopped vs 52 with it running. Sharing is not the
+        # cause, so the lane goes back in. Watch its green count: it earned 0 greens in
+        # 40 min (2 claims / 4 fails) - if that repeats it is a lane-quality problem,
+        # not an interference problem.
         # 09-15 (Bob): "Try to open concurrent gemini threads, add a 2nd chat".
         # A SECOND gemini gateway on its own port, attached to its own tab in the
         # same chrome, with its OWN WEBCHAT_ACCOUNT so the two do not share the
@@ -961,9 +967,18 @@ class LanePool:
         # queue driver around a single step call.
         name = getattr(self, "pinned", None)
         if name and name not in exclude:
+            now_pin = time.time()
             for lane in self.lanes:
                 if lane.name == name:
-                    return lane
+                    # 09-15: the pinned path used to return the lane without ANY
+                    # availability check, so a lane whose models were all cooled
+                    # was still picked and burned the hop with "all models of this
+                    # lane are cooled". Measured: openrouter 6 of its 9 failures in
+                    # 30 min were exactly that. A pinned lane that cannot serve is
+                    # not a lane - fall through to the rotation.
+                    if lane.is_available(now_pin):
+                        return lane
+                    break
 
         now = time.time()
         n = len(self.lanes)
