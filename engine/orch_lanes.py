@@ -353,9 +353,9 @@ def default_lanes(cfg=None) -> list[Lane]:
         # real answer sat in an earlier row. That is now handled: the gateway runs
         # `WEBCHAT_MODE=chatgpt` (drop-in 95-mode.conf) so the mode's
         # `skipEmptyMessageRows` quirk applies. Verified live: HTTP 200, PONG in 5s.
-#         Lane("chatgpt", "http://127.0.0.1:8087/v1/chat/completions",
-#              ["chatgpt webchat"], 120, 300,
-#              prompt_cap=32000, timeout=300),  # 09-14: 210s guillotined the thinking model mid-answer ("chatgpt failed (timeout after 210s)"); gateway HARD_CAP_MS now 310s so the gateway always outlives this budget.  # 09-14: 12000 truncated the file contents to ~9.6K so chatgpt couldn't see the code; raise so the full prompt gets through
+        Lane("chatgpt", "http://127.0.0.1:8087/v1/chat/completions",
+             ["chatgpt webchat"], 120, 300,
+             prompt_cap=32000, timeout=300),  # 09-14: 210s guillotined the thinking model mid-answer ("chatgpt failed (timeout after 210s)"); gateway HARD_CAP_MS now 310s so the gateway always outlives this budget.  # 09-14: 12000 truncated the file contents to ~9.6K so chatgpt couldn't see the code; raise so the full prompt gets through
 
         # 09-15 (data-driven pull): the chatgpt account is SOFT-CAPPED again —
         # it accepts the prompt and generates NOTHING. Measured on the live tab
