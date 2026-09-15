@@ -443,16 +443,26 @@ def apply_outcome(records: dict, sid, res, escalations: bool = False) -> str:
     elif o == "yellow":
         # 09-15: this used to RAISE, and that single raise took the whole engine
         # down (measured: "lane gemini returned yellow for P1B0R0F2#6 with no
-        # recorded justification" -> exit code 1, 13 minutes of work lost, systemd
-        # restart). A lane reporting "I cannot fix this" is a normal outcome, not a
-        # contract violation, so DERIVE the justification from the lane's own note
-        # instead of killing the run. Same padding rule as the escalate path.
+        # recorded justification" -> exit code 1, 13 minutes of work lost).
+        # But the first correction was too eager: it FABRICATED a justification
+        # when the lane gave none, which turned "no verdict was recorded" into a
+        # legitimate-looking yellow. Measured consequence: 155 of 548 yellows
+        # carried the padding text and nothing else, i.e. 155 steps were retired
+        # with no statement of what was tried.
+        #
+        # The rule that is both safe and honest: a yellow needs EVIDENCE. If the
+        # lane supplied a note or an error, use it. If it supplied NOTHING, do not
+        # invent one — leave the step claimable so a lane actually attempts it.
         if not rec.get("yellow_justification"):
             j = (getattr(res, "note", "") or getattr(res, "error", "") or "").strip()
-            if len(j) < MIN_YELLOW_JUSTIFICATION:
-                j = (j + " The lane reported it could not fix this step; flagged "
-                         "for human review.").strip()
-            make_yellow(rec, j, lane=getattr(res, "lane", None))
+            if len(j) >= MIN_YELLOW_JUSTIFICATION:
+                make_yellow(rec, j, lane=getattr(res, "lane", None))
+            else:
+                rec["status"] = "pending"
+                rec["no_verdict_reason"] = (
+                    "lane reported yellow with no justification and no error; "
+                    "left claimable rather than retired on an invented reason")
+                return rec["status"]
         rec["status"] = "yellow"
     elif o == "escalate" and escalations:
         rec["status"] = "escalated"
