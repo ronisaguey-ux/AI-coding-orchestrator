@@ -420,6 +420,19 @@ class BatchQueue:
                 st = self.status(sid)
                 if kind == "execute" and st != "pending":
                     continue
+                # 09-15: do not hand a lane a step whose round budget is already
+                # spent. `run_step` retires those to yellow the moment it sees them
+                # ("round budget already spent before this pass"), so the claim is
+                # taken and thrown away without the lane ever being called - measured
+                # with gemini2 claiming three such steps back to back and producing
+                # nothing. MAX_ROUNDS is imported lazily to avoid a cycle.
+                if kind == "execute":
+                    try:
+                        from execute import MAX_ROUNDS as _MAXR
+                    except Exception:
+                        _MAXR = 3
+                    if int((self.records.get(sid) or {}).get("rounds") or 0) >= _MAXR:
+                        continue
                 if kind == "escalate" and st != "escalated":
                     continue
                 if self.res.can_reserve(self.files(sid), holder):
