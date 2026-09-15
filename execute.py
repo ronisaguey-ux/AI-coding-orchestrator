@@ -1180,9 +1180,14 @@ async def run_step(session, step: dict, st: dict) -> dict:
             print(f"[step {sid}] rounds were spent without a verdict — reset to 0 "
                   f"and re-queued instead of retiring as yellow", flush=True)
             return rec
+        # 09-15: the reason used to read "no lane call made", which is FALSE here -
+        # `_tried` above proves a lane ran and left a non-transport apply record.
+        # It also printed rounds=11/3 and 12/3 (legacy counts from before the cap
+        # landed), which makes the string nonsense. Say what actually happened.
+        _r = rec.get("rounds", 0)
         escalate(sid, rec,
-                 f"round budget already spent before this pass "
-                 f"(rounds={rec.get('rounds')}/{MAX_ROUNDS}); no lane call made",
+                 f"round budget already spent (rounds={_r}, cap {MAX_ROUNDS}); "
+                 f"a lane ran and its answer did not land an edit this pass",
                  site="run_step:pre_loop_max_rounds")
         if rec["status"] not in ("escalated", "yellow"):
             await save_state_serialized(st)
