@@ -159,11 +159,39 @@ def main() -> int:
     legacy = [sid for sid, r in steps.items()
               if r.get("status") == "escalated"
               and not r.get("escalated_by") and not r.get("escalated_at")]
+    # 09-15: legacy escalated residue is NOT a phantom, and must NEVER be pushed
+    # through the `bad` path - `bad` ends in `systemctl restart oculus-fix-executor`,
+    # and the engine then re-saves the pre-repair state it holds in memory. Measured:
+    # 502 legacy records went through `bad`, the engine restarted at the SAME SECOND
+    # green-truth finished, and the escalation residue came straight back. Retire
+    # them in their own write with no restart; residue needs no engine reload.
     if legacy:
-        bad.extend(legacy)
-        print(f"[green-truth] {len(legacy)} legacy escalated step(s) (no escalated_by/"
-              f"escalated_at - residue of the removed escalation phase) -> pending",
-              flush=True)
+        try:
+            state = json.load(open(STATE))
+        except Exception:
+            state = st
+        lsteps = state.setdefault("steps", {})
+        _n = 0
+        for sid in legacy:
+            r = lsteps.get(sid)
+            if isinstance(r, dict) and r.get("status") == "escalated":
+                r["status"] = "pending"
+                r.pop("escalated_at", None)
+                r.pop("escalated_by", None)
+                r["escalation_retired_reason"] = (
+                    "legacy escalated residue retired by green-truth; the "
+                    "escalation phase is disabled in the config")
+                _n += 1
+        if _n:
+            _t = STATE.with_suffix(STATE.suffix + f".gtwleg{os.getpid()}")
+            with open(_t, "w", encoding="utf-8") as fh:
+                json.dump(state, fh)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(_t, STATE)
+        print(f"[green-truth] {_n} legacy escalated step(s) (no escalated_by/"
+              f"escalated_at - residue of the removed escalation phase) -> pending "
+              f"[no engine restart needed]", flush=True)
     if bad:
         # 09-08 (user: make progress actually persist): NEVER dump our stale
         # `st` snapshot — it can clobber NEW greens the engine saved concurrently
