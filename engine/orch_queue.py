@@ -84,6 +84,7 @@ def make_yellow(rec: dict, justification: str, *, lane: str | None = None) -> di
                 "http 429", "429:", "rate limit", "rate_limited"))
     if _ite(j):
         rec["status"] = "pending"
+        rec.pop("resolved_by", None)
         rec["no_verdict_reason"] = (
             "a transport condition is not a verdict about the code; "
             "left claimable (%s)" % j[:80])
@@ -481,6 +482,7 @@ def apply_outcome(records: dict, sid, res, escalations: bool = False) -> str:
                 make_yellow(rec, j, lane=getattr(res, "lane", None))
             else:
                 rec["status"] = "pending"
+                rec.pop("resolved_by", None)
                 rec["no_verdict_reason"] = (
                     "lane reported yellow with no justification and no error; "
                     "left claimable rather than retired on an invented reason")
