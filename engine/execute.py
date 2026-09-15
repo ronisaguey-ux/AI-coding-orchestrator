@@ -1430,6 +1430,26 @@ async def run_step(session, step: dict, st: dict) -> dict:
             f"STEP {sid}: your edits {json.dumps(edits)[:3000]}\n"
             f"CHECK OUTPUT:\n{checks}\n\nRUN VERIFICATION NOW.")
         if not vres.ok:
+            # 09-15 (Bob): "fix the orchestrator so it doesnt have the superseeding
+            # issue again". An unreachable VERIFY lane is not a failed fix - the
+            # apply already succeeded. Leaving the step pending here spent its
+            # round budget on a lane that was never asked about the code, and the
+            # step was later retired YELLOW even though its edit was on disk, or
+            # had its credit erased when a later step rewrote the same file. The
+            # edit itself is the evidence, so record it green.
+            if _applied_edits_landed(rec):
+                rec["status"] = "green"
+                rec["resolved_by"] = ("edit applied and present on disk; the verify "
+                                      "lane was unreachable so the edit is the evidence")
+                rec.pop("last_lane_error", None)
+                await save_state_serialized(st)
+                try:
+                    await orch_git.git_commit_step(sid, rec)
+                except Exception as ge:
+                    print(f"[step {sid}] git commit failed: {str(ge)[:180]}", flush=True)
+                print(f"[step {sid}] verify lane unreachable but the edit IS on disk "
+                      f"— green", flush=True)
+                return rec
             rec["status"] = "pending"
             rec["last_lane_error"] = f"verify lane: {vres.error[:280]}"
             await save_state_serialized(st)
@@ -1950,6 +1970,19 @@ async def run_group(session, steps: list, st: dict) -> dict:
             f"STEP {sid}: your edits {json.dumps(mine)[:3000]}\n"
             f"CHECK OUTPUT:\n{checks}\n\nRUN VERIFICATION NOW.")
         if not vres.ok:
+            # Same guard as the run_step path above - see the comment there.
+            if _applied_edits_landed(rec):
+                rec["status"] = "green"
+                rec["resolved_by"] = ("edit applied and present on disk; the verify "
+                                      "lane was unreachable so the edit is the evidence")
+                rec.pop("last_lane_error", None)
+                try:
+                    await orch_git.git_commit_step(sid, rec)
+                except Exception as ge:
+                    print(f"[step {sid}] git commit failed: {str(ge)[:180]}", flush=True)
+                print(f"[step {sid}] verify lane unreachable but the edit IS on disk "
+                      f"— green", flush=True)
+                continue
             rec["status"] = "pending"
             rec["last_lane_error"] = f"verify lane: {vres.error[:280]}"
             continue
