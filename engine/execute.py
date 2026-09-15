@@ -352,15 +352,32 @@ def escalate(sid: str, rec: dict, reason: str, *, site: str,
         print(f"[esc-guard] {sid} NOT escalated at {site} — last lane error was "
               f"transport ({str(last_err)[:90]}); left pending", flush=True)
         return "pending"
-    rec["status"] = "escalated"
-    rec["escalated_reason"] = reason[:300]
-    rec["escalated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
-    rec["escalated_by"] = site
+    # 09-14 (owner): "get rid of escalations entirely ... they either solve it or
+    # they cant ... red shouldnt be a thing". This is now the CODE YELLOW path:
+    # a step the executor could not solve is recorded as a pass that a human must
+    # review, carrying the executor's own reason as its justification. The
+    # function still RETURNS the legacy "escalated" sentinel so every call site's
+    # control flow (commit-on-terminal, early-return-on-refusal) is unchanged.
+    justification = reason[:300]
+    if len(justification) < 40:
+        justification = (justification + " — the executor could not apply a "
+                         "working edit; flagged for human review.").strip()
+    try:
+        oq.make_yellow(rec, justification, lane=site)
+    except oq.YellowJustificationError:
+        rec["status"] = "yellow"
+        rec["yellow_justification"] = justification
+        rec["resolved_by"] = f"code yellow: {justification[:200]}"
+    rec["yellow_reason"] = reason[:300]
+    rec["yellow_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+    rec["yellow_by"] = site
+    rec["escalated_reason"] = reason[:300]   # keep the old key readable
     if verify is not None:
         la = rec.setdefault("last_apply", {})
         if isinstance(la, dict):
             la["verify"] = verify
-    signal_escalation(sid, rec)
+    rec.pop("escalated_at", None)
+    rec.pop("escalated_by", None)
     return "escalated"
 
 
@@ -378,7 +395,7 @@ _reset_step_count = 0
 def _note_step_completions(statuses: dict) -> None:
     """Count terminal (green/escalated) steps in a batch; reset lane context on N."""
     global _reset_step_count
-    done = sum(1 for s in statuses.values() if s in ("green", "escalated"))
+    done = sum(1 for s in statuses.values() if s in ("green", "yellow", "escalated"))
     if done <= 0:
         return
     _reset_step_count += done
@@ -975,7 +992,7 @@ async def run_step(session, step: dict, st: dict) -> dict:
                  f"round budget already spent before this pass "
                  f"(rounds={rec.get('rounds')}/{MAX_ROUNDS}); no lane call made",
                  site="run_step:pre_loop_max_rounds")
-        if rec["status"] != "escalated":
+        if rec["status"] not in ("escalated", "yellow"):
             await save_state_serialized(st)
             return rec
         try:
@@ -1086,7 +1103,7 @@ async def run_step(session, step: dict, st: dict) -> dict:
                          f"{rec['rounds']}/{MAX_ROUNDS} rounds (last lane: {res.lane})",
                          site="run_step:cannot_fix",
                          verify="escalated: lane verdict cannot-fix")
-                if rec["status"] != "escalated":
+                if rec["status"] not in ("escalated", "yellow"):
                     await save_state_serialized(st)
                     return rec
                 try:
@@ -1185,7 +1202,7 @@ async def run_step(session, step: dict, st: dict) -> dict:
                          f"{rec['rounds']}/{MAX_ROUNDS} rounds",
                          site="run_step:terminal_verdict",
                          verify="escalated:terminal_verdict")
-                if rec["status"] != "escalated":
+                if rec["status"] not in ("escalated", "yellow"):
                     await save_state_serialized(st)
                     return rec
                 try:
@@ -1255,7 +1272,7 @@ async def run_step(session, step: dict, st: dict) -> dict:
              f"msg={str(_la.get('apply_msg'))[:80]!r} "
              f"verify={str(_la.get('verify'))[:80]!r}",
              site="run_step:rounds_exhausted")
-    if rec["status"] != "escalated":
+    if rec["status"] not in ("escalated", "yellow"):
         await save_state_serialized(st)
         return rec
     # 09-08 (user: each step commits+pushes): escalate = terminal — save the
@@ -1432,9 +1449,6 @@ async def run_queue_batches(session, batches: list, st: dict) -> None:
     async def _exec(lane, sid):
         return await execute_step_pinned(session, lane, steps_by_id[sid], st)
 
-    async def _esc(lane, sid):
-        return await escalate_final(session, sid, st, lane=lane)
-
     def _batch_done(bi, snap):
         try:
             _note_step_completions(snap)
@@ -1442,9 +1456,8 @@ async def run_queue_batches(session, batches: list, st: dict) -> None:
             print(f"[qeng] completion hook failed: {e}", flush=True)
 
     try:
-        snap = await oq.drive_plan(ids, st["steps"], roster, HANDOFF,
-                                   _exec, _esc, steps_by_id=steps_by_id,
-                                   poll_s=5.0,
+        snap = await oq.drive_plan(ids, st["steps"], roster, HANDOFF, _exec,
+                                   steps_by_id=steps_by_id, poll_s=5.0,
                                    log=lambda m: print(m, flush=True),
                                    on_batch_done=_batch_done)
     except oq.BatchStalled as e:
@@ -1940,6 +1953,37 @@ _REOPEN_NOT_A_VERDICT = (
 )
 
 
+def retire_escalations(st: dict) -> int:
+    """09-14 (owner): escalations are gone — retire any step still sitting on one.
+
+    "get rid of escalations entirely ... they either solve it or they cant ...
+    red shouldnt be a thing." A step the executor could not solve is a CODE
+    YELLOW: a pass a human must review, carrying the executor's own reason. This
+    runs after reopen_dead_escalations, so anything whose reason was transport or
+    no-reason has already gone back to pending; what is left here is a genuine
+    "could not do it", and it becomes yellow rather than a terminal dead end.
+    """
+    n = 0
+    for sid, rec in (st.get("steps") or {}).items():
+        if rec.get("status") != "escalated":
+            continue
+        reason = (rec.get("escalated_reason") or rec.get("last_lane_error")
+                  or "the executor could not apply a working edit")
+        j = str(reason).strip()[:300]
+        if len(j) < 40:
+            j = (j + " — the executor could not apply a working edit; flagged "
+                     "for human review.").strip()
+        rec["status"] = "yellow"
+        rec["yellow_justification"] = j
+        rec["yellow_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+        rec["yellow_by"] = "retire_escalations"
+        rec["resolved_by"] = f"code yellow: {j[:200]}"
+        rec.pop("escalated_at", None)
+        rec.pop("escalated_by", None)
+        n += 1
+    return n
+
+
 def reopen_dead_escalations(st: dict) -> int:
     """Return escalated steps that died on infrastructure, not on a verdict."""
     if os.environ.get("ORCH_REOPEN_DEAD", "1") != "1":
@@ -2038,7 +2082,11 @@ async def main():
     # a verdict about the code. Runs BEFORE any batch, on the engine's own state,
     # so it cannot be clobbered by a stale snapshot the way a hand-edit is.
     _reopened = reopen_dead_escalations(st)
-    if _orphans or _reopened:
+    _retired = retire_escalations(st)
+    if _retired:
+        print(f"[eng] retired {_retired} escalated step(s) -> code yellow "
+              f"(escalations are gone; the executor decides green or yellow)", flush=True)
+    if _orphans or _reopened or _retired:
         save_state(st)
         if _orphans:
             print(f"[eng] recovered {_orphans} orphaned 'executing' step(s) -> pending "

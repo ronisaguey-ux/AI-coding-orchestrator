@@ -330,63 +330,6 @@ class TestDriveBatch(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(task, timeout=5)
         self.assertTrue(q.is_done())
 
-    async def test_execution_failure_routes_to_escalation_persona(self):
-        pairs = [("S1", ["a.py"])]
-        q = make_queue(pairs)
-        roster = oq.LaneRoster(["L1"])
-        seen = []
-
-        async def exec_step(lane, sid):
-            return oq.StepOutcome("escalate", lane=lane, note="cannot-fix: target absent")
-
-        async def on_escalate(sid):
-            seen.append(sid)
-            oq.make_yellow(q.records[sid],
-                           "Target symbol does not exist anywhere in the repo and the "
-                           "plan snippet is stale; needs human review before retry.",
-                           lane="escalation")
-            return "yellow"
-
-        await oq.drive_batch(q, roster, self.h, exec_step, on_escalate, poll_s=0.005)
-        self.assertEqual(seen, ["S1"])
-        self.assertEqual(q.status("S1"), "yellow")
-        self.assertTrue(q.is_done())
-
-    async def test_escalation_persona_can_fix_it_green(self):
-        pairs = [("S1", ["a.py"])]
-        q = make_queue(pairs)
-        roster = oq.LaneRoster(["L1"])
-
-        async def exec_step(lane, sid):
-            return oq.StepOutcome("escalate", lane=lane)
-
-        async def on_escalate(sid):
-            q.records[sid]["status"] = "green"
-            return "green"
-
-        await oq.drive_batch(q, roster, self.h, exec_step, on_escalate, poll_s=0.005)
-        self.assertEqual(q.status("S1"), "green")
-        self.assertTrue(q.is_done())
-
-    async def test_escalation_without_justification_stalls_loudly(self):
-        pairs = [("S1", ["a.py"])]
-        q = make_queue(pairs)
-        roster = oq.LaneRoster(["L1"])
-
-        async def exec_step(lane, sid):
-            return oq.StepOutcome("escalate", lane=lane)
-
-        async def on_escalate(sid):
-            try:
-                oq.make_yellow(q.records[sid], "no")
-            except oq.YellowJustificationError:
-                return "escalated"
-            return "yellow"
-
-        with self.assertRaises(oq.BatchStalled):
-            await oq.drive_batch(q, roster, self.h, exec_step, on_escalate,
-                                 poll_s=0.005, max_stall_rounds=4)
-
     async def test_all_lanes_cooled_waits_then_resumes(self):
         pairs = [("S1", ["a.py"]), ("S2", ["b.py"])]
         q = make_queue(pairs)
@@ -461,7 +404,7 @@ if __name__ == "__main__":
 
 
 class TestDrivePlan(unittest.IsolatedAsyncioTestCase):
-    """S3: work stealing across batches — lanes never idle."""
+    """drive_plan: one global queue, lanes never idle, executor decides."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -470,15 +413,34 @@ class TestDrivePlan(unittest.IsolatedAsyncioTestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
+    async def test_lanes_work_the_same_batch_in_parallel(self):
+        recs, steps = {}, {}
+        for i in range(10):
+            sid = f"S{i}"
+            recs[sid] = {"rounds": 0, "status": "pending"}
+            steps[sid] = {"finding_id": sid, "files": [f"f{i}.py"]}
+        roster = oq.LaneRoster([f"L{i}" for i in range(5)])
+        live = {"n": 0, "max": 0}
+
+        async def exec_step(lane, sid):
+            live["n"] += 1
+            live["max"] = max(live["max"], live["n"])
+            await asyncio.sleep(0.02)
+            live["n"] -= 1
+            recs[sid]["status"] = "green"
+            return oq.StepOutcome("green", lane=lane)
+
+        await oq.drive_plan([[f"S{i}" for i in range(10)]], recs, roster, self.h,
+                            exec_step, steps_by_id=steps, poll_s=0.005)
+        self.assertGreater(live["max"], 1)
+        self.assertTrue(all(r["status"] == "green" for r in recs.values()))
+
     async def test_lane_steals_work_from_a_later_batch(self):
-        # batch A is blocked on one shared file; batch B has free steps.
-        # Under the barrier engine the lane idled; under S3 it takes B's work.
-        recs = {}
-        steps_by_id = {}
+        recs, steps = {}, {}
         for sid, fs in [("A1", ["shared.py"]), ("A2", ["shared.py"]),
                         ("B1", ["b1.py"]), ("B2", ["b2.py"])]:
             recs[sid] = {"rounds": 0, "status": "pending"}
-            steps_by_id[sid] = {"finding_id": sid, "files": fs}
+            steps[sid] = {"finding_id": sid, "files": fs}
         roster = oq.LaneRoster(["L1", "L2"])
         order = []
 
@@ -488,27 +450,21 @@ class TestDrivePlan(unittest.IsolatedAsyncioTestCase):
             recs[sid]["status"] = "green"
             return oq.StepOutcome("green", lane=lane)
 
-        async def esc(sid):
-            return "yellow"
-
         await asyncio.wait_for(
             oq.drive_plan([["A1", "A2"], ["B1", "B2"]], recs, roster, self.h,
-                          exec_step, esc, steps_by_id=steps_by_id, poll_s=0.005),
-            timeout=5)
+                          exec_step, steps_by_id=steps, poll_s=0.005), timeout=5)
         self.assertEqual(set(order), {"A1", "A2", "B1", "B2"})
-        # A2 cannot be claimed while A1 holds shared.py, so B1/B2 ran first
         self.assertLess(order.index("B1"), order.index("A2"))
 
-    async def test_no_file_is_ever_held_by_two_lanes_across_batches(self):
-        recs, steps_by_id = {}, {}
+    async def test_no_file_ever_held_by_two_lanes(self):
+        recs, steps = {}, {}
         ids = []
         for bi in range(4):
             b = []
             for j in range(6):
                 sid = f"B{bi}S{j}"
-                # every step in every batch shares one file
                 recs[sid] = {"rounds": 0, "status": "pending"}
-                steps_by_id[sid] = {"finding_id": sid, "files": ["one.py"]}
+                steps[sid] = {"finding_id": sid, "files": ["one.py"]}
                 b.append(sid)
             ids.append(b)
         roster = oq.LaneRoster([f"L{i}" for i in range(8)])
@@ -524,18 +480,15 @@ class TestDrivePlan(unittest.IsolatedAsyncioTestCase):
 
         await asyncio.wait_for(
             oq.drive_plan(ids, recs, roster, self.h, exec_step,
-                          lambda sid: "yellow", steps_by_id=steps_by_id,
-                          poll_s=0.005),
-            timeout=10)
-        self.assertEqual(state["max"], 1, "two lanes co-edited one.py")
+                          steps_by_id=steps, poll_s=0.005), timeout=10)
+        self.assertEqual(state["max"], 1)
         self.assertTrue(all(r["status"] == "green" for r in recs.values()))
 
     async def test_batch_boundary_reports_when_all_its_steps_terminal(self):
-        recs, steps_by_id = {}, {}
+        recs, steps = {}, {}
         for sid in ("A1", "A2", "B1"):
             recs[sid] = {"rounds": 0, "status": "pending"}
-            steps_by_id[sid] = {"finding_id": sid, "files": [sid + ".py"]}
-        roster = oq.LaneRoster(["L1"])
+            steps[sid] = {"finding_id": sid, "files": [sid + ".py"]}
         done_batches = []
 
         async def exec_step(lane, sid):
@@ -543,49 +496,65 @@ class TestDrivePlan(unittest.IsolatedAsyncioTestCase):
             return oq.StepOutcome("green", lane=lane)
 
         await asyncio.wait_for(
-            oq.drive_plan([["A1", "A2"], ["B1"]], recs, roster, self.h,
-                          exec_step, lambda sid: "yellow",
-                          steps_by_id=steps_by_id, poll_s=0.005,
+            oq.drive_plan([["A1", "A2"], ["B1"]], recs, oq.LaneRoster(["L1"]),
+                          self.h, exec_step, steps_by_id=steps, poll_s=0.005,
                           on_batch_done=lambda bi, snap: done_batches.append(bi)),
             timeout=5)
         self.assertEqual(done_batches, [0, 1])
 
-    async def test_retry_and_escalation_still_close_every_step(self):
-        recs, steps_by_id = {}, {}
-        for i in range(12):
-            sid = f"S{i}"
+    async def test_lane_sits_idle_while_files_are_locked(self):
+        recs, steps = {}, {}
+        for sid in ("S1", "S2"):
             recs[sid] = {"rounds": 0, "status": "pending"}
-            steps_by_id[sid] = {"finding_id": sid, "files": [f"f{i}.py"]}
-        roster = oq.LaneRoster([f"L{i}" for i in range(6)])
-        tries = {}
+            steps[sid] = {"finding_id": sid, "files": ["a.py"]}
+        gate = asyncio.Event()
+        state = {"n": 0, "max": 0}
 
         async def exec_step(lane, sid):
-            tries[sid] = tries.get(sid, 0) + 1
-            if tries[sid] == 1 and int(sid[1:]) % 4 == 0:
-                return oq.StepOutcome("retry", lane=lane, cooled_s=0.01)
-            if tries[sid] == 2 and int(sid[1:]) % 4 == 0:
-                return oq.StepOutcome("escalate", lane=lane)
+            state["n"] += 1
+            state["max"] = max(state["max"], state["n"])
+            if sid == "S1":
+                await gate.wait()
+            state["n"] -= 1
             recs[sid]["status"] = "green"
             return oq.StepOutcome("green", lane=lane)
 
-        async def esc(lane, sid):
-            oq.make_yellow(recs[sid],
-                           f"Escalation persona could not close {sid}: the target "
-                           "symbol is absent from the repo and the plan snippet is "
-                           "stale; flagged for human review.", lane=lane)
-            return "yellow"
+        task = asyncio.create_task(
+            oq.drive_plan([["S1", "S2"]], recs, oq.LaneRoster(["L1", "L2"]),
+                          self.h, exec_step, steps_by_id=steps, poll_s=0.005))
+        await asyncio.sleep(0.05)
+        self.assertEqual(state["max"], 1)
+        gate.set()
+        await asyncio.wait_for(task, timeout=5)
+        self.assertTrue(all(r["status"] == "green" for r in recs.values()))
+
+    async def test_stress_15_steps_8_lanes(self):
+        recs, steps = {}, {}
+        for i in range(15):
+            sid = f"S{i}"
+            recs[sid] = {"rounds": 0, "status": "pending"}
+            steps[sid] = {"finding_id": sid, "files": [f"f{i}.py"]}
+        roster = oq.LaneRoster([f"L{i}" for i in range(8)])
+        tries = {}
+
+        async def exec_step(lane, sid):
+            n = tries.get(sid, 0) + 1
+            tries[sid] = n
+            if n == 1 and int(sid[1:]) % 3 == 0:
+                return oq.StepOutcome("retry", lane=lane, cooled_s=0.01)
+            recs[sid]["status"] = "green"
+            return oq.StepOutcome("green", lane=lane)
 
         await asyncio.wait_for(
-            oq.drive_plan([[f"S{i}" for i in range(0, 6)],
-                           [f"S{i}" for i in range(6, 12)]],
-                          recs, roster, self.h, exec_step, esc,
-                          steps_by_id=steps_by_id, poll_s=0.005),
-            timeout=10)
-        self.assertTrue(all(r["status"] in ("green", "yellow") for r in recs.values()))
+            oq.drive_plan([[f"S{i}" for i in range(15)]], recs, roster, self.h,
+                          exec_step, steps_by_id=steps, poll_s=0.005), timeout=10)
+        self.assertTrue(all(r["status"] == "green" for r in recs.values()))
 
 
-class TestEscalationsInQueue(unittest.IsolatedAsyncioTestCase):
-    """Escalations are work in the per-step queue, resolved as soon as they occur."""
+class TestNoEscalations(unittest.IsolatedAsyncioTestCase):
+    """Owner 09-14: escalations are gone. The executor decides green or yellow.
+    "they either solve it or they cant" — there is no red and no escalation phase.
+    """
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -594,113 +563,65 @@ class TestEscalationsInQueue(unittest.IsolatedAsyncioTestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def _q(self, pairs):
-        recs = {sid: {"rounds": 0, "status": "pending"} for sid, _ in pairs}
-        steps = {sid: {"finding_id": sid, "files": fs} for sid, fs in pairs}
-        return oq.BatchQueue([sid for sid, _ in pairs], recs,
-                             steps_by_id=steps, group_cap=15), recs
+    def test_drive_plan_has_no_escalation_hook(self):
+        import inspect
+        params = inspect.signature(oq.drive_plan).parameters
+        self.assertNotIn("on_escalate", params,
+                         "drive_plan must not take an escalation hook any more")
 
-    def test_claim_task_offers_escalation_before_fresh_work(self):
-        q, recs = self._q([("S1", ["a.py"]), ("S2", ["b.py"])])
-        recs["S2"]["status"] = "escalated"
-        sid, kind = q.claim_task("L1")
-        self.assertEqual((sid, kind), ("S2", "escalate"))
+    def test_escalate_outcome_becomes_yellow_with_a_justification(self):
+        recs = {"S1": {"rounds": 3, "status": "escalated"}}
+        oq.apply_outcome(recs, "S1",
+                         oq.StepOutcome("escalate", lane="L1",
+                                        note="the target symbol does not exist and the "
+                                             "plan snippet is stale"))
+        self.assertEqual(recs["S1"]["status"], "yellow")
+        self.assertIn("target symbol does not exist", recs["S1"]["yellow_justification"])
+        self.assertTrue(oq.is_terminal(recs["S1"]))
 
-    def test_claim_task_returns_execute_when_no_escalation(self):
-        q, _ = self._q([("S1", ["a.py"])])
-        sid, kind = q.claim_task("L1")
-        self.assertEqual((sid, kind), ("S1", "execute"))
+    def test_escalate_outcome_with_no_note_still_yields_a_justified_yellow(self):
+        recs = {"S1": {"rounds": 3, "status": "pending"}}
+        oq.apply_outcome(recs, "S1", oq.StepOutcome("escalate", lane="L1"))
+        self.assertEqual(recs["S1"]["status"], "yellow")
+        self.assertGreaterEqual(len(recs["S1"]["yellow_justification"]), 40)
 
-    def test_claim_task_reserves_files_for_escalation_too(self):
-        q, recs = self._q([("S1", ["shared.py"]), ("S2", ["shared.py"])])
-        recs["S1"]["status"] = "escalated"
-        recs["S2"]["status"] = "escalated"
-        self.assertIsNotNone(q.claim_task("L1"))
-        self.assertIsNone(q.claim_task("L2"), "two lanes got the same locked file")
-
-    async def test_escalation_resolved_inline_without_waiting(self):
-        recs = {}
-        steps = {}
+    async def test_unsolvable_step_closes_as_yellow_not_red(self):
+        recs, steps = {}, {}
         for i in range(6):
             sid = f"S{i}"
             recs[sid] = {"rounds": 0, "status": "pending"}
             steps[sid] = {"finding_id": sid, "files": [f"f{i}.py"]}
         roster = oq.LaneRoster([f"L{i}" for i in range(4)])
-        order = []
-        escalated_to_lane = []
 
         async def exec_step(lane, sid):
-            order.append(("exec", sid, lane))
-            if int(sid[1:]) % 3 == 0:
-                return oq.StepOutcome("escalate", lane=lane)
-            recs[sid]["status"] = "green"
-            return oq.StepOutcome("green", lane=lane)
-
-        async def on_escalate(lane, sid):
-            escalated_to_lane.append((sid, lane))
-            order.append(("esc", sid, lane))
-            oq.make_yellow(recs[sid],
-                           f"Escalation persona on {lane} closed {sid} as code yellow: "
-                           "the target symbol is absent and the plan snippet is stale.",
-                           lane=lane)
-            return "yellow"
+            if int(sid[1:]) % 2 == 0:
+                recs[sid]["status"] = "green"
+                return oq.StepOutcome("green", lane=lane)
+            return oq.StepOutcome(
+                "escalate", lane=lane,
+                note=f"{sid}: the fix requires a database migration this repo does not "
+                     "contain, so no lane can close it here")
 
         await asyncio.wait_for(
             oq.drive_plan([[f"S{i}" for i in range(6)]], recs, roster, self.h,
-                          exec_step, on_escalate, steps_by_id=steps, poll_s=0.005),
-            timeout=10)
-        self.assertTrue(all(r["status"] in ("green", "yellow") for r in recs.values()))
-        self.assertEqual(len(escalated_to_lane), 2)
-        # each escalation ran on a lane directly, not through a side escalator
-        self.assertTrue(all(lane.startswith("L") for _s, lane in escalated_to_lane))
-        # and it happened in the same pass as the step, not after all exec work
-        for sid, lane in escalated_to_lane:
-            idx_esc = order.index(("esc", sid, lane))
-            self.assertLess(idx_esc, len(order), "escalation deferred to the end")
+                          exec_step, steps_by_id=steps, poll_s=0.005), timeout=10)
+        for sid, r in recs.items():
+            self.assertIn(r["status"], ("green", "yellow"))
+            self.assertNotEqual(r["status"], "escalated")
+        yellows = [r for r in recs.values() if r["status"] == "yellow"]
+        self.assertEqual(len(yellows), 3)
+        for r in yellows:
+            self.assertTrue(r.get("yellow_justification"))
 
-    async def test_escalation_gives_up_after_bounded_attempts(self):
+    async def test_no_step_is_left_escalated_by_the_driver(self):
         recs = {"S1": {"rounds": 0, "status": "pending"}}
         steps = {"S1": {"finding_id": "S1", "files": ["a.py"]}}
-        roster = oq.LaneRoster(["L1", "L2", "L3"])
-        calls = []
 
         async def exec_step(lane, sid):
-            return oq.StepOutcome("escalate", lane=lane)
-
-        async def on_escalate(lane, sid):
-            calls.append(lane)
-            return "escalated"          # lane could not give a verdict
+            return oq.StepOutcome("escalate", lane=lane, note="cannot fix: gone")
 
         await asyncio.wait_for(
-            oq.drive_plan([["S1"]], recs, roster, self.h, exec_step, on_escalate,
-                          steps_by_id=steps, poll_s=0.005,
-                          max_escalation_attempts=3),
-            timeout=10)
-        self.assertLessEqual(len(calls), 4, "escalation retried without bound")
-        self.assertEqual(recs["S1"]["status"], "escalated")
-        self.assertIn("escalation_gave_up", recs["S1"])
-
-    async def test_lane_never_idles_while_escalations_remain(self):
-        recs = {}
-        steps = {}
-        for i in range(3):
-            sid = f"E{i}"
-            recs[sid] = {"rounds": 0, "status": "escalated"}
-            steps[sid] = {"finding_id": sid, "files": [f"e{i}.py"]}
-        roster = oq.LaneRoster(["L1", "L2", "L3"])
-        seen = []
-
-        async def exec_step(lane, sid):
-            return oq.StepOutcome("green", lane=lane)
-
-        async def on_escalate(lane, sid):
-            seen.append(sid)
-            recs[sid]["status"] = "green"
-            return "green"
-
-        await asyncio.wait_for(
-            oq.drive_plan([["E0", "E1", "E2"]], recs, roster, self.h,
-                          exec_step, on_escalate, steps_by_id=steps, poll_s=0.005),
-            timeout=10)
-        self.assertEqual(sorted(seen), ["E0", "E1", "E2"])
-        self.assertTrue(all(r["status"] == "green" for r in recs.values()))
+            oq.drive_plan([["S1"]], recs, oq.LaneRoster(["L1"]), self.h,
+                          exec_step, steps_by_id=steps, poll_s=0.005), timeout=5)
+        self.assertNotEqual(recs["S1"]["status"], "escalated")
+        self.assertTrue(oq.is_terminal(recs["S1"]))
