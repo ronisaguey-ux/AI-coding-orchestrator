@@ -908,6 +908,48 @@ def _all_noop(edits: list) -> bool:
     return True
 
 
+def _applied_edits_landed(rec: dict) -> bool:
+    """True when the step's last apply is real AND its result is on disk.
+
+    09-15: the pre_loop_max_rounds site retired steps as yellow with the reason
+    "round budget already spent ... no lane call made" while their ``last_apply``
+    read ``{ok: True, edits: [...]}`` and the new content WAS in the file -
+    measured 3 such steps (P1B1R0F11#60, P1B1R0F0#118, P1B3R0F9#84), every one
+    of them already carrying its edit on disk. Yellow means "a lane looked at
+    this and could not"; a step whose edit landed is finished work. Retiring it
+    yellow throws the credit away and the plan re-does the work later.
+
+    The check reads the file, so it cannot be satisfied by a claim in the reply.
+    """
+    la = rec.get("last_apply") or {}
+    if not la.get("ok"):
+        return False
+    edits = la.get("edits") or []
+    if not edits:
+        return False
+    landed = 0
+    for e in edits:
+        f = str(e.get("file") or "")
+        if not f or not in_repo(f):
+            return False
+        path = REPO / f.lstrip("/")
+        if not path.exists():
+            return False
+        try:
+            body = path.read_text(errors="ignore")
+        except Exception:
+            return False
+        new = str(e.get("new_string") or "")
+        old = str(e.get("old_string") or "")
+        if new:
+            if new in body:
+                landed += 1
+        elif old:
+            if old not in body:
+                landed += 1
+    return landed == len(edits)
+
+
 def apply_edits(edits: list) -> tuple:
     """Exact string replace with py syntax guard (proven 8_26 logic).
 
@@ -1109,6 +1151,26 @@ async def run_step(session, step: dict, st: dict) -> dict:
         _has_lane = bool(str(_la.get("lane") or "").strip())
         _has_edits = bool(_la.get("edits")) or bool(str(_la.get("apply_msg") or "").strip())
         _tried = bool(_la) and (_has_lane or _has_edits) and not is_transport_error(_le)
+        if _tried and _applied_edits_landed(rec):
+            # The edit is on disk, so this is finished work, not a step a lane
+            # gave up on. Green it with real evidence instead of retiring it
+            # yellow at MAX_ROUNDS. Safe from the phantom-green gate by
+            # construction: the file itself was read to reach this branch.
+            rec["status"] = "green"
+            rec["resolved_by"] = (
+                "edit already applied and present on disk — recorded green "
+                "instead of yellow (round budget exhausted)")
+            _la2 = dict(_la)
+            _la2["verified_by"] = "pre_loop_max_rounds:content-on-disk"
+            rec["last_apply"] = _la2
+            await save_state_serialized(st)
+            try:
+                await orch_git.git_commit_step(sid, rec)
+            except Exception as ge:
+                print(f"[step {sid}] git commit failed: {str(ge)[:180]}", flush=True)
+            print(f"[step {sid}] MAX_ROUNDS but the applied edit IS on disk — green "
+                  f"instead of yellow", flush=True)
+            return rec
         if not _tried:
             rec["rounds"] = 0
             rec["rounds_reset_reason"] = (

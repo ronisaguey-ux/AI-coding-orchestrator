@@ -17,12 +17,7 @@ import argparse, asyncio, json, os, re, subprocess, sys, time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-# This repo drops the `orch_` filename prefix (see 8713607); alias the modules
-# so the engine source stays byte-identical to what runs in production.
-import config as orch_config
-import git_ops as orch_git
-import lanes as orch_lanes
-import verify as orch_verify
+import orch_config, orch_git, orch_lanes, orch_queue as oq, orch_verify
 
 # 09-05: the whole engine now resolves through orch_config (defaults < file <
 # env < CLI), so the gateway envs and the engine options read ONE source.
@@ -147,6 +142,10 @@ def _model_cool_s(streak: int) -> int:
     return base + max(0, streak - 1) * step
 
 GROUP_CAP = int(CFG.group_cap)  # orch.yaml group_cap (user: >=15 per batch)
+# 09-14 (owner, S2): a batch larger than the lane count leaves slack, so a lane
+# always finds a claimable step after a sibling cools. The barrier tail grows
+# with the batch, so this is deliberately modest.
+BATCH_CAP = int(os.environ.get("ORCH_BATCH_CAP", "30"))
 PARALLEL = min(8, max(1, int(os.environ.get("EXEC_PARALLEL", "8"))))  # 09-09 (roni): raise cap so omniroute (API lane) parallelizes; gemini stays serial (1 tab). Memory-safe: omniroute calls are lightweight HTTP.
 SAVE_LOCK = asyncio.Semaphore(1)  # serialize state dumps (dict-change-during-iteration guard for concurrent groups)
 EXEC_SYSTEM = (
@@ -205,9 +204,30 @@ VERIFY_SYSTEM = (
 def load_state() -> dict:
     if STATE_FILE.exists():
         try:
-            return json.loads(STATE_FILE.read_text())
+            st = json.loads(STATE_FILE.read_text())
         except Exception:
-            pass
+            return {"steps": {}}
+        # 09-15: normalise escalated residue at LOAD time, not at save time.
+        # Patching the merge in save_state_serialized did not work because several
+        # code paths call save_state() directly, which writes the memory copy
+        # verbatim - so memory that still held 536 legacy `escalated` records kept
+        # writing them back. Load is the one place every path goes through, and
+        # with the escalation phase OFF there is no escalation state to preserve.
+        if not ESCALATIONS_ENABLED:
+            _n = 0
+            for _r in (st.get("steps") or {}).values():
+                if isinstance(_r, dict) and _r.get("status") == "escalated":
+                    _r["status"] = "pending"
+                    _r.pop("escalated_at", None)
+                    _r.pop("escalated_by", None)
+                    _r["escalation_retired_reason"] = (
+                        "escalated residue normalised to pending at load - the "
+                        "escalation phase is disabled in the config")
+                    _n += 1
+            if _n:
+                print(f"[eng] normalised {_n} legacy 'escalated' step(s) -> pending "
+                      f"at load (escalations are disabled)", flush=True)
+        return st
     return {"steps": {}}
 
 
@@ -260,7 +280,45 @@ async def save_state_serialized(st: dict) -> None:
         if isinstance(disk, dict) and isinstance(disk.get("steps"), dict):
             dsteps = disk["steps"]
             ssteps = st.get("steps") or {}
-            TERMINAL = ("green", "escalated", "obsolete", "blocked")
+            # 09-14: "yellow" (code yellow — a pass flagged for review) was
+            # MISSING from this set. The escalation persona wrote a valid yellow
+            # on P1B0R0F4#2, save_state_serialized merged the disk's older
+            # "escalated" back over it (disk terminal, memory not), and the queue
+            # driver then raised YellowJustificationError and killed the run.
+            # A yellow is terminal and must never be resurrected by a stale
+            # snapshot.
+            # 09-15: `escalated` is LEGACY when the escalation phase is off. The
+            # merge rule below is "a terminal status on disk beats a non-terminal
+            # one in memory", which is right for a concurrent executor but WRONG
+            # here: reopen_dead_escalations flips the old records to pending in
+            # memory, the disk still says escalated (terminal), and the merge
+            # restores it on the very next save. Measured: 486 reopened at startup,
+            # then 536 escalated back and every yellow (0) gone. With the switch
+            # OFF, escalated must NOT count as terminal, so a reopen always wins.
+            if ESCALATIONS_ENABLED:
+                TERMINAL = ("green", "escalated", "obsolete", "blocked", "yellow")
+            else:
+                TERMINAL = ("green", "obsolete", "blocked", "yellow")
+                # 09-15: removing `escalated` from TERMINAL above stopped the DISK
+                # from resurrecting a reopen, but it left the opposite hole: with
+                # neither side terminal the merge keeps the memory copy, so an
+                # escalated record the engine is holding in memory is written back
+                # on EVERY save. Measured: 502 legacy records (escalated_at AND
+                # escalated_by both None, none created after 09-14) reappeared
+                # within 9 minutes of being retired, three separate times, and each
+                # pass cost ~90 steps of churn. With the phase OFF there is no
+                # escalation state to preserve, so any escalated record - on either
+                # side - is normalised to pending here. That is the only place that
+                # sees BOTH copies.
+                for _d in (ssteps, dsteps):
+                    for _r in _d.values():
+                        if isinstance(_r, dict) and _r.get("status") == "escalated":
+                            _r["status"] = "pending"
+                            _r.pop("escalated_at", None)
+                            _r.pop("escalated_by", None)
+                            _r["escalation_retired_reason"] = (
+                                "escalated residue normalised to pending — the "
+                                "escalation phase is disabled in the config")
             for sid, srec in ssteps.items():
                 drec = dsteps.get(sid)
                 if not isinstance(drec, dict):
@@ -346,15 +404,47 @@ def escalate(sid: str, rec: dict, reason: str, *, site: str,
         print(f"[esc-guard] {sid} NOT escalated at {site} — last lane error was "
               f"transport ({str(last_err)[:90]}); left pending", flush=True)
         return "pending"
-    rec["status"] = "escalated"
-    rec["escalated_reason"] = reason[:300]
-    rec["escalated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
-    rec["escalated_by"] = site
+    # 09-14 (owner): "get rid of escalations entirely ... they either solve it or
+    # they cant ... red shouldnt be a thing". This is now the CODE YELLOW path:
+    # a step the executor could not solve is recorded as a pass that a human must
+    # review, carrying the executor's own reason as its justification. The
+    # function still RETURNS the legacy "escalated" sentinel so every call site's
+    # control flow (commit-on-terminal, early-return-on-refusal) is unchanged.
+    if ESCALATIONS_ENABLED:
+        # escalations_enabled: true — the historical path: a terminal escalation
+        # that the escalation persona gets one final shot at.
+        rec["status"] = "escalated"
+        rec["escalated_reason"] = reason[:300]
+        rec["escalated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+        rec["escalated_by"] = site
+        if verify is not None:
+            la = rec.setdefault("last_apply", {})
+            if isinstance(la, dict):
+                la["verify"] = verify
+        signal_escalation(sid, rec)
+        return "escalated"
+    # escalations_enabled: false (default) — the executor decides: it either
+    # lands a working edit (green) or it cannot (yellow, carrying this reason).
+    justification = reason[:300]
+    if len(justification) < 40:
+        justification = (justification + " — the executor could not apply a "
+                         "working edit; flagged for human review.").strip()
+    try:
+        oq.make_yellow(rec, justification, lane=site)
+    except oq.YellowJustificationError:
+        rec["status"] = "yellow"
+        rec["yellow_justification"] = justification
+        rec["resolved_by"] = f"code yellow: {justification[:200]}"
+    rec["yellow_reason"] = reason[:300]
+    rec["yellow_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+    rec["yellow_by"] = site
+    rec["escalated_reason"] = reason[:300]   # keep the old key readable
     if verify is not None:
         la = rec.setdefault("last_apply", {})
         if isinstance(la, dict):
             la["verify"] = verify
-    signal_escalation(sid, rec)
+    rec.pop("escalated_at", None)
+    rec.pop("escalated_by", None)
     return "escalated"
 
 
@@ -372,7 +462,7 @@ _reset_step_count = 0
 def _note_step_completions(statuses: dict) -> None:
     """Count terminal (green/escalated) steps in a batch; reset lane context on N."""
     global _reset_step_count
-    done = sum(1 for s in statuses.values() if s in ("green", "escalated"))
+    done = sum(1 for s in statuses.values() if s in ("green", "yellow", "escalated"))
     if done <= 0:
         return
     _reset_step_count += done
@@ -803,6 +893,63 @@ def parse_json(text) -> dict:
     return orch_lanes.normalize_edits(orch_lanes.parse_json_object(text))
 
 
+def _all_noop(edits: list) -> bool:
+    """True when every edit asks for a change that is already the file's content.
+
+    A lane returning old_string == new_string is not proposing a fix; it is
+    stating the code already reads the way it wants. Treated as the
+    already-satisfied verdict rather than a phantom green (see apply_edits).
+    """
+    if not edits:
+        return False
+    for e in edits or []:
+        if str(e.get("old_string") or "") != str(e.get("new_string") or ""):
+            return False
+    return True
+
+
+def _applied_edits_landed(rec: dict) -> bool:
+    """True when the step's last apply is real AND its result is on disk.
+
+    09-15: the pre_loop_max_rounds site retired steps as yellow with the reason
+    "round budget already spent ... no lane call made" while their ``last_apply``
+    read ``{ok: True, edits: [...]}`` and the new content WAS in the file -
+    measured 3 such steps (P1B1R0F11#60, P1B1R0F0#118, P1B3R0F9#84), every one
+    of them already carrying its edit on disk. Yellow means "a lane looked at
+    this and could not"; a step whose edit landed is finished work. Retiring it
+    yellow throws the credit away and the plan re-does the work later.
+
+    The check reads the file, so it cannot be satisfied by a claim in the reply.
+    """
+    la = rec.get("last_apply") or {}
+    if not la.get("ok"):
+        return False
+    edits = la.get("edits") or []
+    if not edits:
+        return False
+    landed = 0
+    for e in edits:
+        f = str(e.get("file") or "")
+        if not f or not in_repo(f):
+            return False
+        path = REPO / f.lstrip("/")
+        if not path.exists():
+            return False
+        try:
+            body = path.read_text(errors="ignore")
+        except Exception:
+            return False
+        new = str(e.get("new_string") or "")
+        old = str(e.get("old_string") or "")
+        if new:
+            if new in body:
+                landed += 1
+        elif old:
+            if old not in body:
+                landed += 1
+    return landed == len(edits)
+
+
 def apply_edits(edits: list) -> tuple:
     """Exact string replace with py syntax guard (proven 8_26 logic).
 
@@ -868,6 +1015,20 @@ def apply_edits(edits: list) -> tuple:
             results.append({"file": f, "ok": False, "msg": f"read fail: {ex}"})
             continue
         if old and old in cur:
+            # 09-15: a NO-OP edit (old_string == new_string) used to be reported
+            # as "applied". The replace finds the string, writes the file back
+            # byte-identical, git finds nothing to commit, and the step greened
+            # with no commit behind it. green_truth_watch then condemned it as a
+            # PHANTOM and RESTARTED THE ENGINE (measured: 3 phantoms in 15 min,
+            # P1B0R0F8#122 / P1B0R0F11#57 / P1B0R0F14, each restart discarding
+            # in-flight lane calls). It is not a phantom and it is not a fix: the
+            # lane is telling us the code is ALREADY the way it wants it, which is
+            # exactly the already-satisfied verdict green_truth exempts.
+            if old == new:
+                results.append({"file": f, "ok": True, "already_satisfied": True,
+                                "msg": "no-op edit: old_string == new_string "
+                                       "(already satisfied)"})
+                continue
             if f.endswith(".py"):
                 try:
                     ast.parse(cur.replace(old, new, 1))
@@ -890,6 +1051,10 @@ def apply_edits(edits: list) -> tuple:
                         results.append({"file": f, "ok": False,
                                         "msg": f"syntax break (fuzzy edit rejected): {se}"})
                         continue
+                if fz == cur:
+                    results.append({"file": f, "ok": True, "already_satisfied": True,
+                                    "msg": "no-op fuzzy re-anchor (already satisfied)"})
+                    continue
                 path.write_text(fz, errors="ignore")
                 results.append({"file": f, "ok": True, "msg": "applied (fuzzy re-anchor)"})
             else:
@@ -965,11 +1130,61 @@ async def run_step(session, step: dict, st: dict) -> dict:
     # never retried. 63 steps were stuck this way and the green counter went flat
     # while the engine churned batches. Escalate them instead of silently skipping.
     if rec.get("rounds", 0) >= MAX_ROUNDS:
+        # 09-15: this site retired 112 steps as yellow across one run with the
+        # reason "round budget already spent ... no lane call made" - and most of
+        # them never had a real verdict. A transport failure must not consume a
+        # round (the engine's own doctrine), but these steps carry rounds=3 with a
+        # last_lane_error of the transport kind, so the budget was spent on
+        # failures that said nothing about the code.
+        #
+        # A step that never got a considered answer is not "the executor tried and
+        # could not" - it is work still owed. Give it the round back and let a lane
+        # attempt it. Only a step whose rounds ended in a real, non-transport
+        # verdict is yellowed here.
+        _le = str(rec.get("last_lane_error") or "")
+        _la = rec.get("last_apply") or {}
+        # 09-15: `bool(_la)` was too weak. A last_apply of {rnd, ok:True} with NO
+        # edits, NO apply_msg and NO lane is not an attempt - measured 22 such
+        # records retired as yellow, and they carry no evidence that any lane ever
+        # looked at the step. An attempt means a lane actually ran: a named lane, or
+        # an edit that applied, or a reason that was recorded.
+        _has_lane = bool(str(_la.get("lane") or "").strip())
+        _has_edits = bool(_la.get("edits")) or bool(str(_la.get("apply_msg") or "").strip())
+        _tried = bool(_la) and (_has_lane or _has_edits) and not is_transport_error(_le)
+        if _tried and _applied_edits_landed(rec):
+            # The edit is on disk, so this is finished work, not a step a lane
+            # gave up on. Green it with real evidence instead of retiring it
+            # yellow at MAX_ROUNDS. Safe from the phantom-green gate by
+            # construction: the file itself was read to reach this branch.
+            rec["status"] = "green"
+            rec["resolved_by"] = (
+                "edit already applied and present on disk — recorded green "
+                "instead of yellow (round budget exhausted)")
+            _la2 = dict(_la)
+            _la2["verified_by"] = "pre_loop_max_rounds:content-on-disk"
+            rec["last_apply"] = _la2
+            await save_state_serialized(st)
+            try:
+                await orch_git.git_commit_step(sid, rec)
+            except Exception as ge:
+                print(f"[step {sid}] git commit failed: {str(ge)[:180]}", flush=True)
+            print(f"[step {sid}] MAX_ROUNDS but the applied edit IS on disk — green "
+                  f"instead of yellow", flush=True)
+            return rec
+        if not _tried:
+            rec["rounds"] = 0
+            rec["rounds_reset_reason"] = (
+                "round budget was spent on failures that were not verdicts "
+                "(transport or no apply recorded); re-queued for a real attempt")
+            await save_state_serialized(st)
+            print(f"[step {sid}] rounds were spent without a verdict — reset to 0 "
+                  f"and re-queued instead of retiring as yellow", flush=True)
+            return rec
         escalate(sid, rec,
                  f"round budget already spent before this pass "
                  f"(rounds={rec.get('rounds')}/{MAX_ROUNDS}); no lane call made",
                  site="run_step:pre_loop_max_rounds")
-        if rec["status"] != "escalated":
+        if rec["status"] not in ("escalated", "yellow"):
             await save_state_serialized(st)
             return rec
         try:
@@ -1080,7 +1295,7 @@ async def run_step(session, step: dict, st: dict) -> dict:
                          f"{rec['rounds']}/{MAX_ROUNDS} rounds (last lane: {res.lane})",
                          site="run_step:cannot_fix",
                          verify="escalated: lane verdict cannot-fix")
-                if rec["status"] != "escalated":
+                if rec["status"] not in ("escalated", "yellow"):
                     await save_state_serialized(st)
                     return rec
                 try:
@@ -1179,7 +1394,7 @@ async def run_step(session, step: dict, st: dict) -> dict:
                          f"{rec['rounds']}/{MAX_ROUNDS} rounds",
                          site="run_step:terminal_verdict",
                          verify="escalated:terminal_verdict")
-                if rec["status"] != "escalated":
+                if rec["status"] not in ("escalated", "yellow"):
                     await save_state_serialized(st)
                     return rec
                 try:
@@ -1196,7 +1411,14 @@ async def run_step(session, step: dict, st: dict) -> dict:
             return rec
         ok, msg = apply_edits(edits)
         rec["last_apply"] = {"rnd": rnd + 1, "ok": ok, "edits": edits,
-                             "apply_msg": msg, "lane": res.lane}
+                             "apply_msg": msg, "lane": res.lane,
+                             "verify": ("already satisfied (no-op edit)"
+                                        if ok and _all_noop(edits) else None)}
+        if ok and _all_noop(edits):
+            # The lane changed nothing because nothing needed changing. Say so in
+            # the field green_truth_watch reads, or it condemns this as a phantom
+            # and restarts the engine for a step that was never broken.
+            rec["resolved_by"] = "lane verdict: already satisfied (no-op edit)"
         checks = run_checks(files)
         vres = await lane_call_result(
             session, VERIFY_SYSTEM,
@@ -1249,7 +1471,7 @@ async def run_step(session, step: dict, st: dict) -> dict:
              f"msg={str(_la.get('apply_msg'))[:80]!r} "
              f"verify={str(_la.get('verify'))[:80]!r}",
              site="run_step:rounds_exhausted")
-    if rec["status"] != "escalated":
+    if rec["status"] not in ("escalated", "yellow"):
         await save_state_serialized(st)
         return rec
     # 09-08 (user: each step commits+pushes): escalate = terminal — save the
@@ -1260,6 +1482,207 @@ async def run_step(session, step: dict, st: dict) -> dict:
         print(f"[step {sid}] git commit failed: {str(ge)[:180]}", flush=True)
     await save_state_serialized(st)
     return rec
+
+
+
+
+# ---------------------------------------------------------------------------
+# Per-step batch queue engine (owner spec 2026-09-14).
+#
+#   batch of GROUP_CAP steps -> EVERY lane works that batch, one step per lane
+#   call -> each lane claims the next step whose files no other lane holds ->
+#   NO lane touches the next batch until this one is terminal (green or yellow)
+#   -> a lane cooldown is NOT an escalation: the lane parks and its step is
+#   handed to a sibling together with the step's history log.
+#
+# Set ORCH_QUEUE_ENGINE=0 to fall back to the old batch-group loop.
+# ---------------------------------------------------------------------------
+_QUEUE_ENGINE = os.environ.get("ORCH_QUEUE_ENGINE", "1") == "1"
+# 09-14 (owner): escalation is a config option, not a built-in stage.
+#   ORCH_ESCALATIONS_ENABLED / orch.yaml `escalations_enabled`
+#     false (default) -> the executor decides: green, or yellow with its reason.
+#     true            -> unsolvable steps go to an escalation persona for one
+#                        final shot. Shipped so other users can have escalations.
+ESCALATIONS_ENABLED = bool(getattr(CFG, "escalations_enabled", False))
+HANDOFF = oq.StepHandoff()
+
+ESCALATION_SYSTEM = (
+    "You are the ESCALATION PERSONA — the last line of defence for one oculus fix "
+    "step. Execution lanes have already tried and failed. You get ONE final shot. "
+    "You are given the step, its files, and the FULL HISTORY of every previous "
+    "attempt (read the history log file named in the prompt). "
+    "Decide honestly between exactly two outcomes: "
+    "(1) you can still fix it — answer {\"verdict\":\"green\",\"edits\":[{\"file\":\"...\","
+    "\"old_string\":\"...\",\"new_string\":\"...\"}],\"notes\":\"...\"}; or "
+    "(2) it genuinely cannot be fixed here — answer {\"verdict\":\"yellow\","
+    "\"justification\":\"<a specific, verifiable reason a reviewer can act on: what "
+    "you tried, what is missing, why no lane can close it>\"}. "
+    "A yellow REQUIRES a real justification of at least 40 characters; a one-word or "
+    "copy-paste reason is rejected. Never answer yellow because you are unsure — "
+    "yellow means 'this is a pass that a human must review'. "
+    "Answer ONE JSON object only, no fences, no prose."
+)
+
+
+def _lane_cool_seconds(err: str) -> int:
+    """How long to park the lane whose call failed, by failure kind.
+
+    A cooldown is NOT an escalation: the step keeps its place in the batch
+    queue and a sibling lane takes it, handed the history log.
+    """
+    e = (err or "").lower()
+    if "429" in e or "rate limit" in e or "rate_limit" in e or "too frequent" in e:
+        return int(os.environ.get("ORCH_LANE_COOL_RATE_S", "900"))
+    if "timeout" in e or "timed out" in e:
+        return int(os.environ.get("ORCH_LANE_COOL_TIMEOUT_S", "120"))
+    return int(os.environ.get("ORCH_LANE_COOL_ERROR_S", "60"))
+
+
+async def execute_step_pinned(session, lane: str, step: dict, st: dict) -> "oq.StepOutcome":
+    """ONE step, ONE lane, ONE call — the queue's unit of work.
+
+    Reuses run_step's whole verdict machine (cannot-fix / already-satisfied /
+    phantom-green / rounds / per-step commit) by pinning the lane pool to the
+    lane the scheduler handed us.
+    """
+    sid = step["finding_id"]
+    POOL.pinned = lane
+    try:
+        rec = await run_step(session, step, st)
+    except Exception as e:
+        return oq.StepOutcome("retry", lane=lane,
+                              error=f"{type(e).__name__}: {e}")
+    finally:
+        POOL.pinned = None
+    rec = rec if isinstance(rec, dict) else (st.get("steps", {}).get(sid) or {})
+    status = rec.get("status")
+    err = str(rec.get("last_lane_error") or "")
+    if status in ("green", "yellow"):
+        return oq.StepOutcome(status, lane=lane, edits=(rec.get("last_apply") or {}).get("edits") or [])
+    if status == "escalated":
+        return oq.StepOutcome("escalate", lane=lane,
+                              note=str(rec.get("escalated_reason") or ""),
+                              edits=(rec.get("last_apply") or {}).get("edits") or [])
+    cooled = _lane_cool_seconds(err) if err else 0
+    return oq.StepOutcome("retry", lane=lane, error=err or None, cooled_s=cooled,
+                          edits=(rec.get("last_apply") or {}).get("edits") or [])
+
+
+async def escalate_final(session, sid: str, st: dict, lane: str | None = None) -> str:
+    """The escalation persona's ONE final shot: fix it (green) or code it yellow.
+
+    The persona is handed the step, its files, and the path of the step's history
+    log so it can see everything the execution lanes already tried.
+    """
+    rec = st["steps"].setdefault(sid, {"rounds": 0, "status": "pending"})
+    step = _STEP_BY_ID.get(sid) or {}
+    files = [x for x in (step.get("files") or []) if x and in_repo(x)]
+    ctx = "\n\n".join(file_text(f) for f in files[:2])
+    hist = HANDOFF.render(sid)
+    prompt = (f"STEP {sid}: {step.get('title')}\n"
+              f"STATE: {step.get('finding')}\nFIX GUIDANCE: {step.get('fix')}\n"
+              f"MECHANISM: {step.get('mechanism')}\n"
+              f"FILES: {', '.join(files)}\n\n"
+              f"WHY EXECUTION GAVE UP: {rec.get('escalated_reason') or rec.get('last_lane_error') or 'n/a'}\n\n"
+              f"{hist}\nFILE CONTENTS:\n{ctx}\n\nDECIDE NOW — one JSON object.")
+    # Pinned to the lane the queue handed this task to, so the escalation runs
+    # on a real worker instead of hopping the whole pool under load.
+    POOL.pinned = lane
+    try:
+        res = await POOL.call(session, ESCALATION_SYSTEM, prompt, want_edits=False)
+    finally:
+        POOL.pinned = None
+    if not res.ok:
+        print(f"[esc] {sid}: escalation lane unavailable ({res.error[:90]}) — left escalated",
+              flush=True)
+        return "escalated"
+    verdict = parse_json(res.content)
+    v = str(verdict.get("verdict") or "").strip().lower()
+    if v in ("green", "fixed") or verdict.get("edits"):
+        edits = verdict.get("edits") or []
+        if edits:
+            ok, msg = apply_edits(edits)
+            rec["last_apply"] = {"rnd": rec.get("rounds", 0) + 1, "ok": ok,
+                                 "edits": edits, "apply_msg": msg, "lane": res.lane,
+                                 "verify": "green: escalation persona applied the fix"}
+            if not ok:
+                print(f"[esc] {sid}: persona edits failed to apply ({msg[:90]})", flush=True)
+                return "escalated"
+        rec["status"] = "green"
+        rec["resolved_by"] = "escalation persona: fixed on the final shot"
+        try:
+            await orch_git.git_commit_step(sid, rec)
+        except Exception as ge:
+            print(f"[step {sid}] git commit failed: {str(ge)[:180]}", flush=True)
+        print(f"[esc] {sid}: GREEN (escalation persona fixed it)", flush=True)
+        return "green"
+    justification = str(verdict.get("justification") or verdict.get("reason") or "").strip()
+    try:
+        oq.make_yellow(rec, justification, lane="escalation")
+    except oq.YellowJustificationError as e:
+        print(f"[esc] {sid}: persona yellow REJECTED — {e}", flush=True)
+        return "escalated"
+    rec["yellow_history_log"] = str(HANDOFF.path(sid))
+    print(f"[esc] {sid}: YELLOW (flagged for review) — {justification[:120]}", flush=True)
+    await save_state_serialized(st)
+    return "yellow"
+
+
+async def run_queue_batches(session, batches: list, st: dict) -> None:
+    """S3 (owner 09-14): ONE global work queue, lanes never idle.
+
+    A batch is an ACCOUNTING boundary, not a work boundary: the moment every
+    step of a batch is terminal, `on_batch_done` commits and reports it, while
+    the lanes have already moved on to whichever claimable step is next in the
+    plan. File safety is unchanged — `drive_plan` uses ONE reservations table
+    across every batch, so no two lanes anywhere hold the same file.
+    """
+    lane_names = [ln.name for ln in POOL.lanes]
+    steps_by_id = {s["finding_id"]: s for batch in batches for s in batch}
+    if not steps_by_id:
+        print("[qeng] nothing pending — plan drained", flush=True)
+        return
+    _STEP_BY_ID.update(steps_by_id)
+    ids = [[s["finding_id"] for s in batch] for batch in batches]
+    roster = oq.LaneRoster(lane_names)
+    locked = [s["finding_id"] for s in _STEP_BY_ID.values()
+              if "locked" in str(s.get("tags") or [])]
+    print(f"[qeng] escalation persona: "
+          f"{'ON' if ESCALATIONS_ENABLED else 'OFF (executor decides green/yellow)'}",
+          flush=True)
+    print(f"[qeng] S3 work-stealing engine: {len(ids)} batches, "
+          f"{len(steps_by_id)} steps, {len(lane_names)} lanes, "
+          f"batch_cap={BATCH_CAP}", flush=True)
+
+    async def _exec(lane, sid):
+        return await execute_step_pinned(session, lane, steps_by_id[sid], st)
+
+    async def _esc(lane, sid):
+        return await escalate_final(session, sid, st, lane=lane)
+
+    def _batch_done(bi, snap):
+        try:
+            _note_step_completions(snap)
+        except Exception as e:
+            print(f"[qeng] completion hook failed: {e}", flush=True)
+
+    try:
+        snap = await oq.drive_plan(ids, st["steps"], roster, HANDOFF, _exec,
+                                   on_escalate=(_esc if ESCALATIONS_ENABLED else None),
+                                   steps_by_id=steps_by_id, poll_s=5.0,
+                                   log=lambda m: print(m, flush=True),
+                                   on_batch_done=_batch_done)
+    except oq.BatchStalled as e:
+        print(f"[qeng] PLAN STALLED — {e}", flush=True)
+        snap = {}
+    await save_state_serialized(st)
+    if snap:
+        n_t = sum(1 for v in snap.values() if v in ("green", "yellow"))
+        print(f"[qeng] plan pass done: {n_t}/{len(snap)} terminal "
+              f"(parked lanes: {roster.parked()})", flush=True)
+
+
+_STEP_BY_ID: dict = {}
 
 
 async def run_group(session, steps: list, st: dict) -> dict:
@@ -1592,6 +2015,38 @@ async def run_group(session, steps: list, st: dict) -> dict:
     return {s["finding_id"]: st["steps"].get(s["finding_id"], {}).get("status") for s in steps}
 
 
+def pack_diverse(steps: list, cap: int) -> list:
+    """Pack steps into batches of at most `cap` with DISJOINT file sets.
+
+    09-14 (owner): the linear plan slice produced batches whose LIVE members
+    all targeted the same file — measured BATCH 1 carried 3 live steps on
+    `weight_store_integrity_...json`, so the file reservations let ONE lane
+    work and nine lanes sat idle for the whole barrier. The pending pool holds
+    9,984 steps across 1,352 distinct files, so a 15-step disjoint batch is
+    always available; the batch just has to be CHOSEN for diversity instead of
+    taken in plan order. Leftovers carry to the next batch, so no step is lost.
+    """
+    remaining = list(steps)
+    out = []
+    while remaining:
+        used, batch, rest, i = set(), [], [], 0
+        while i < len(remaining) and len(batch) < cap:
+            s = remaining[i]
+            i += 1
+            fs = {f for f in (s.get("files") or []) if f}
+            if fs and (fs & used):
+                rest.append(s)
+                continue
+            used |= fs
+            batch.append(s)
+        rest.extend(remaining[i:])
+        if not batch:                       # every remaining step collides
+            batch, rest = [remaining[0]], remaining[1:]
+        out.append(batch)
+        remaining = rest
+    return out
+
+
 def pack_steps(steps: list) -> list:
     """Density pack up to GROUP_CAP regardless of file overlap.
     09-05 (user): "make each batch have at least 15 steps" — the disjoint-file
@@ -1710,6 +2165,37 @@ _REOPEN_NOT_A_VERDICT = (
 )
 
 
+def retire_escalations(st: dict) -> int:
+    """09-14 (owner): escalations are gone — retire any step still sitting on one.
+
+    "get rid of escalations entirely ... they either solve it or they cant ...
+    red shouldnt be a thing." A step the executor could not solve is a CODE
+    YELLOW: a pass a human must review, carrying the executor's own reason. This
+    runs after reopen_dead_escalations, so anything whose reason was transport or
+    no-reason has already gone back to pending; what is left here is a genuine
+    "could not do it", and it becomes yellow rather than a terminal dead end.
+    """
+    n = 0
+    for sid, rec in (st.get("steps") or {}).items():
+        if rec.get("status") != "escalated":
+            continue
+        reason = (rec.get("escalated_reason") or rec.get("last_lane_error")
+                  or "the executor could not apply a working edit")
+        j = str(reason).strip()[:300]
+        if len(j) < 40:
+            j = (j + " — the executor could not apply a working edit; flagged "
+                     "for human review.").strip()
+        rec["status"] = "yellow"
+        rec["yellow_justification"] = j
+        rec["yellow_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+        rec["yellow_by"] = "retire_escalations"
+        rec["resolved_by"] = f"code yellow: {j[:200]}"
+        rec.pop("escalated_at", None)
+        rec.pop("escalated_by", None)
+        n += 1
+    return n
+
+
 def reopen_dead_escalations(st: dict) -> int:
     """Return escalated steps that died on infrastructure, not on a verdict."""
     if os.environ.get("ORCH_REOPEN_DEAD", "1") != "1":
@@ -1788,18 +2274,31 @@ async def main():
     # 09-07: green-truth invariant BEFORE state load — any phantom that the
     # 5-min watch (or a previous run) reopened must never be re-saved as green
     # by this process's in-memory copy of a pre-repair state file.
+    # 09-14: this was a BLOCKING 120s subprocess call on the startup path, and the
+    # watch itself waits on the state lock the escalation solver holds — measured
+    # the engine sitting at cpu=00:00:00 with ZERO log output because the child
+    # never returned. The watch is housekeeping, never a gate: bound it hard and
+    # let the engine start regardless.
     try:
-        subprocess.run([sys.executable, str(Path(__file__).parent / "green_truth_watch.py")],
-                       capture_output=True, timeout=120, check=False)
-    except Exception:
-        pass  # watch failure must never block the engine
+        _gt = subprocess.run([sys.executable, str(Path(__file__).parent / "green_truth_watch.py")],
+                             capture_output=True, timeout=20, check=False)
+        if _gt.returncode != 0:
+            print(f"[eng] green-truth pass exited {_gt.returncode} (non-fatal)", flush=True)
+    except subprocess.TimeoutExpired:
+        print("[eng] green-truth pass exceeded 20s — skipped (non-fatal)", flush=True)
+    except Exception as _e:
+        print(f"[eng] green-truth pass unavailable ({_e}) — continuing", flush=True)
     st = load_state()
     _orphans = recover_orphaned_executing(st)
     # 09-14 (worker): re-open work the engine killed for reasons that were never
     # a verdict about the code. Runs BEFORE any batch, on the engine's own state,
     # so it cannot be clobbered by a stale snapshot the way a hand-edit is.
     _reopened = reopen_dead_escalations(st)
-    if _orphans or _reopened:
+    _retired = 0 if ESCALATIONS_ENABLED else retire_escalations(st)
+    if _retired:
+        print(f"[eng] retired {_retired} escalated step(s) -> code yellow "
+              f"(escalations are gone; the executor decides green or yellow)", flush=True)
+    if _orphans or _reopened or _retired:
         save_state(st)
         if _orphans:
             print(f"[eng] recovered {_orphans} orphaned 'executing' step(s) -> pending "
@@ -1841,6 +2340,33 @@ async def main():
     sel = batches
     if args.batch is not None:
         sel = [batches[args.batch - 1]]
+    # 09-14: repack the PENDING pool by file diversity so a batch's live steps
+    # never contend for the same reservation (see pack_diverse).
+    if _QUEUE_ENGINE:
+        _pend = [s for s in todo
+                 if (st["steps"].get(s["finding_id"]) or {}).get("status")
+                 in (None, "pending", "executing")]
+        # 09-14: ORDER MATTERS FOR PRIORITY, AND ONLY FOR PRIORITY. Measured on
+        # the plan: it is priority-sorted in 6 repeated waves (24 runs, 5
+        # inversions / 14,356 steps), and 58% of consecutive steps share a file.
+        # The dependency language in the step text is prose about code coupling,
+        # not step->step sequencing (89 hits, none a "run X before Y"). So the
+        # repack must NOT shuffle priority: sort the pool by (priority rank,
+        # plan index) FIRST, then fill each batch with the highest-priority
+        # candidates whose files are still free. Priority order is preserved
+        # exactly; file diversity is won by skipping a colliding candidate and
+        # taking the next one down the same ordered list.
+        _prank = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
+        _order = {s["finding_id"]: i for i, s in enumerate(todo)}
+        _before_d = len(batches)
+        _pend.sort(key=lambda s: (_prank.get(str(s.get("priority") or "").upper(), 4),
+                                  _order.get(s["finding_id"], 1 << 30)))
+        batches = pack_diverse(_pend, BATCH_CAP)
+        print(f"[eng] repacked {len(_pend)} pending steps into {len(batches)} "
+              f"file-disjoint batches (cap {GROUP_CAP}, was {_before_d})", flush=True)
+        sel = batches
+        if args.batch is not None:
+            sel = [batches[args.batch - 1]]
     tok = None
     import aiohttp
     # 09-14: this was a flat 900s while the configured lane_timeout is 400s, so a
@@ -1892,16 +2418,22 @@ async def main():
         # full speed (observed: `[BATCH 1] 1 steps, 0 pending` hundreds of times
         # with --limit 1).
         sel_ids = {s["finding_id"] for batch in sel for s in batch}
-        while True:
-            await asyncio.gather(*(run_one(ib) for ib in enumerate(sel, 1)))
-            still = sum(1 for fid in sel_ids
-                        if (st["steps"].get(fid) or {}).get("status") in (None, "pending", "executing"))
-            if still == 0:
-                break
-            if any(ln.is_available(time.time()) for ln in POOL.lanes):
-                continue  # lanes live again — re-scan for pickups
-            print(f"[wait] {still} steps pending, pool blocked — sleeping 240s", flush=True)
-            await asyncio.sleep(240)
+        _STEP_BY_ID.update({s["finding_id"]: s for batch in sel for s in batch})
+        if _QUEUE_ENGINE:
+            # 09-14 (owner): one batch at a time, every lane on it, barrier at
+            # the end. The old loop ran PARALLEL batch-groups at once.
+            await run_queue_batches(session, sel, st)
+        else:
+            while True:
+                await asyncio.gather(*(run_one(ib) for ib in enumerate(sel, 1)))
+                still = sum(1 for fid in sel_ids
+                            if (st["steps"].get(fid) or {}).get("status") in (None, "pending", "executing"))
+                if still == 0:
+                    break
+                if any(ln.is_available(time.time()) for ln in POOL.lanes):
+                    continue  # lanes live again — re-scan for pickups
+                print(f"[wait] {still} steps pending, pool blocked — sleeping 240s", flush=True)
+                await asyncio.sleep(240)
         await save_state_serialized(st)
         aggr = dict((k, v.get("status")) for k, v in st["steps"].items())
         print(f"EXEC_DONE: total={len(aggr)} green={sum(1 for x in aggr.values() if x == 'green')} "
