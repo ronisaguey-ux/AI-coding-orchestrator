@@ -786,6 +786,21 @@ def main() -> int:
         print(cfg.render())
         return 0
 
+    # 09-15: the escalation phase is a CONFIG OPTION (orch.yaml
+    # `escalations_enabled`, default off). With it off, `escalated` is a legacy
+    # status the executor no longer writes and this solver's entire job is to
+    # drain records that should not exist. Measured while the switch was ALREADY
+    # off: the timer resurrected 497 `escalated` records and the save-merge then
+    # reverted every code yellow in the state (548 -> 0).
+    #
+    # The timer stays enabled so an operator who turns the phase ON still gets it;
+    # with the phase OFF a pass must be a no-op rather than writing dead records
+    # back into the live state.
+    if not getattr(cfg, "escalations_enabled", False):
+        print(f"{LOG_PREFIX} escalations are disabled in config "
+              f"(escalations_enabled=false) — solver is a no-op")
+        return 0
+
     solver = EscalationSolver(cfg, dry_run=args.dry_run)
     if not args.watch:
         return asyncio.run(solver.run(args.limit, args.step))
