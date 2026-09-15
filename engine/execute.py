@@ -1101,7 +1101,14 @@ async def run_step(session, step: dict, st: dict) -> dict:
         # verdict is yellowed here.
         _le = str(rec.get("last_lane_error") or "")
         _la = rec.get("last_apply") or {}
-        _tried = bool(_la) and not is_transport_error(_le)
+        # 09-15: `bool(_la)` was too weak. A last_apply of {rnd, ok:True} with NO
+        # edits, NO apply_msg and NO lane is not an attempt - measured 22 such
+        # records retired as yellow, and they carry no evidence that any lane ever
+        # looked at the step. An attempt means a lane actually ran: a named lane, or
+        # an edit that applied, or a reason that was recorded.
+        _has_lane = bool(str(_la.get("lane") or "").strip())
+        _has_edits = bool(_la.get("edits")) or bool(str(_la.get("apply_msg") or "").strip())
+        _tried = bool(_la) and (_has_lane or _has_edits) and not is_transport_error(_le)
         if not _tried:
             rec["rounds"] = 0
             rec["rounds_reset_reason"] = (
