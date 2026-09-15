@@ -380,6 +380,31 @@ class BatchQueue:
                 return sid
         return None
 
+    def claim_task(self, holder, prefer=("escalate", "execute")):
+        """Next unit of work for this holder, as (sid, kind).
+
+        ESCALATION WORK IS OFFERED FIRST. An escalated step is one whose card is
+        already on the table, and closing it is what lets a batch finish, so it
+        must not wait behind fresh work. `kind` is "escalate" (the escalation
+        persona's final shot) or "execute" (a normal lane attempt). Both kinds
+        take the step's file reservations, because the escalation persona may
+        still apply edits.
+        """
+        for kind in prefer:
+            for sid in self.order:
+                if sid in self.inflight:
+                    continue
+                st = self.status(sid)
+                if kind == "execute" and st != "pending":
+                    continue
+                if kind == "escalate" and st != "escalated":
+                    continue
+                if self.res.can_reserve(self.files(sid), holder):
+                    self.res.reserve(self.files(sid), holder)
+                    self.inflight[sid] = holder
+                    return sid, kind
+        return None
+
     def snapshot(self) -> dict:
         return {sid: self.status(sid) for sid in self.order}
 
@@ -584,19 +609,23 @@ def pack_batches(step_ids, group_cap=DEFAULT_GROUP_CAP):
 
 async def drive_plan(batches, records, roster, handoff, execute_step, on_escalate, *,
                      steps_by_id=None, poll_s=None, log=None, max_stall_rounds=600,
-                     on_batch_done=None):
-    """S3 — work stealing across batches. Lanes NEVER idle.
+                     on_batch_done=None, max_escalation_attempts=3):
+    """ONE global work queue that carries BOTH kinds of work.
 
-    The owner's batch barrier is kept as an ACCOUNTING boundary: a batch is
-    reported the moment every one of its steps is terminal, and `on_batch_done`
-    fires then. It is no longer a WORK boundary — a lane that finds nothing
-    claimable in the batch it happens to be looking at takes the next claimable
-    step anywhere in the plan. That removes the measured tail where the last
-    step of a batch held nine idle lanes.
+    The owner's rule (09-14): "escalations are supposed to be resolved as soon as
+    they occur, also add escalations to per step queues". So there is no separate
+    escalator sitting on the side. A lane that finishes a step pulls the next
+    task from the same queue, and the queue offers ESCALATION work first: the
+    moment a step lands in `escalated` it becomes claimable by whichever lane is
+    next free, and that lane runs the escalation persona's one final shot.
 
-    Safety is unchanged: ONE reservations table spans the whole plan, so no two
-    lanes anywhere can hold the same file at the same time, and the batch a step
-    belongs to is tracked only for reporting and commit granularity.
+    Safety is unchanged — one reservations table spans the whole plan, and both
+    kinds of task take the step's file reservations, because the escalation
+    persona may apply edits of its own.
+
+    A lane is never idle while any task is claimable, and the batch stays an
+    accounting boundary: `on_batch_done` fires when every step of a batch is
+    terminal.
     """
     poll_s = DEFAULT_POLL_S if poll_s is None else poll_s
     log = log or (lambda *a, **k: None)
@@ -621,25 +650,44 @@ async def drive_plan(batches, records, roster, handoff, execute_step, on_escalat
         return (records.get(sid) or {}).get("status") or "pending"
 
     inflight: dict = {}
+    esc_attempts: dict = {}
 
     def claim(holder):
-        for sid in order:
-            if sid in inflight or status(sid) != "pending":
-                continue
-            fs = step_files(steps_by_id.get(sid))
-            if res.can_reserve(fs, holder):
-                res.reserve(fs, holder)
-                inflight[sid] = holder
-                return sid
+        for kind in ("escalate", "execute"):
+            for sid in order:
+                if sid in inflight or parked(sid):
+                    continue
+                st = status(sid)
+                if kind == "execute" and st != "pending":
+                    continue
+                if kind == "escalate" and st != "escalated":
+                    continue
+                fs = step_files(steps_by_id.get(sid))
+                if res.can_reserve(fs, holder):
+                    res.reserve(fs, holder)
+                    inflight[sid] = holder
+                    return sid, kind
         return None
 
     def release(sid):
         h = inflight.pop(sid, None)
-        if h and h != "__escalation__":
+        if h:
             res.release(h)
 
+    def parked(sid):
+        """A step whose escalation spent its attempt budget is NOT re-claimable.
+
+        Without this the queue re-offered it on every pass: the escalation
+        persona answered nothing, the step stayed non-terminal, the worker
+        claimed it again forever and the batch barrier never lifted (measured:
+        the give-up test hung until its timeout). Parked steps are excluded from
+        claiming and from the barrier, but they keep their `escalated` status so
+        the solver and a human can still see them.
+        """
+        return bool((records.get(sid) or {}).get("escalation_gave_up"))
+
     def all_done():
-        return all(is_terminal(records.get(s)) for s in order)
+        return all(is_terminal(records.get(s)) or parked(s) for s in order)
 
     reported: set = set()
 
@@ -649,13 +697,46 @@ async def drive_plan(batches, records, roster, handoff, execute_step, on_escalat
                 continue
             if all(is_terminal(records.get(s)) for s in members[bi]):
                 reported.add(bi)
-                log(f"[plan] batch {bi} complete "
-                    f"({len(members[bi])} steps) — committing boundary")
+                log(f"[plan] batch {bi} complete ({len(members[bi])} steps)")
                 if on_batch_done:
                     try:
                         on_batch_done(bi, {s: status(s) for s in members[bi]})
                     except Exception as e:
                         log(f"[plan] on_batch_done({bi}) raised: {e}")
+
+    async def run_escalation(lane, sid):
+        """The escalation persona's one final shot, ON this lane, right now."""
+        n = esc_attempts.get(sid, 0) + 1
+        esc_attempts[sid] = n
+        log(f"[plan] {lane} -> ESCALATION final shot on {sid} "
+            f"(attempt {n}/{max_escalation_attempts})")
+        try:
+            verdict = await on_escalate(lane, sid)
+        except Exception as e:
+            verdict = "escalated"
+            log(f"[plan] escalation of {sid} on {lane} errored: {e}")
+        rec = records.setdefault(sid, {"rounds": 0, "status": "escalated"})
+        if verdict == "green":
+            rec["status"] = "green"
+            rec["resolved_by"] = "escalation persona: fixed on the final shot"
+        elif verdict == "yellow":
+            if rec.get("status") != "yellow":
+                raise YellowJustificationError(
+                    f"escalation persona declared {sid} yellow with no recorded "
+                    f"justification")
+        else:
+            # No verdict — usually the lane itself was unreachable. Keep the step
+            # claimable so the NEXT free lane can try, and only give up once the
+            # attempt budget is spent, saying so out loud.
+            rec["escalation_attempts"] = n
+            if n >= max_escalation_attempts:
+                rec["status"] = "escalated"
+                rec["escalation_gave_up"] = (
+                    f"no verdict from {n} lane attempt(s); last lane {lane}")
+                log(f"[plan] {sid} escalation gave up after {n} attempt(s) — "
+                    f"left escalated (needs the solver/human)")
+            else:
+                rec["status"] = "escalated"
 
     async def worker(lane):
         while not all_done():
@@ -663,17 +744,22 @@ async def drive_plan(batches, records, roster, handoff, execute_step, on_escalat
             if wait > 0:
                 await asyncio.sleep(min(wait, poll_s))
                 continue
-            sid = claim(lane)
-            if sid is None:
+            task = claim(lane)
+            if task is None:
                 await asyncio.sleep(poll_s)
                 continue
-            log(f"[plan] {lane} claimed {sid} (batch {batch_of[sid]}, "
-                f"files {step_files(steps_by_id.get(sid))[:2]})")
+            sid, kind = task
+            if kind == "escalate":
+                await run_escalation(lane, sid)
+                release(sid)
+                report_batches()
+                log(f"[plan] {sid} -> {status(sid)} (escalation, {lane})")
+                continue
+            log(f"[plan] {lane} claimed {sid} (batch {batch_of[sid]})")
             try:
                 out = await execute_step(lane, sid)
             except Exception as e:
-                out = StepOutcome("retry", lane=lane,
-                                  error=f"{type(e).__name__}: {e}")
+                out = StepOutcome("retry", lane=lane, error=f"{type(e).__name__}: {e}")
             if not isinstance(out, StepOutcome):
                 out = StepOutcome(str(out), lane=lane)
             out.lane = out.lane or lane
@@ -683,41 +769,16 @@ async def drive_plan(batches, records, roster, handoff, execute_step, on_escalat
                 roster.cool(lane, out.cooled_s)
                 release(sid)
                 log(f"[plan] {lane} cooled {out.cooled_s}s — {sid} handed off "
-                      f"with history {handoff.path(sid).name}")
+                    f"with history {handoff.path(sid).name}")
                 continue
             apply_outcome(records, sid, out)
+            if status(sid) == "escalated":
+                # In the queue as escalation work from the very next claim, so a
+                # free lane resolves it immediately instead of at a restart.
+                esc_attempts.pop(sid, None)
             release(sid)
             report_batches()
             log(f"[plan] {sid} -> {status(sid)} by {out.lane}")
-
-    async def escalator():
-        while not all_done():
-            sid = next((x for x in order
-                        if x not in inflight and status(x) == "escalated"), None)
-            if sid is None:
-                await asyncio.sleep(poll_s)
-                continue
-            inflight[sid] = "__escalation__"
-            log(f"[plan] escalation persona final shot on {sid} (batch {batch_of[sid]})")
-            try:
-                verdict = await on_escalate(sid)
-            except Exception as e:
-                log(f"[plan] escalation of {sid} errored: {e}")
-                inflight.pop(sid, None)
-                await asyncio.sleep(poll_s)
-                continue
-            rec = records.setdefault(sid, {})
-            if verdict == "green":
-                rec["status"] = "green"
-            elif verdict == "yellow" and rec.get("status") != "yellow":
-                raise YellowJustificationError(
-                    f"escalation persona declared {sid} yellow with no recorded "
-                    f"justification")
-            inflight.pop(sid, None)
-            report_batches()
-            log(f"[plan] {sid} -> {status(sid)} (escalation persona)")
-            if verdict not in TERMINAL:
-                await asyncio.sleep(poll_s)
 
     def snapshot():
         return {s: status(s) for s in order}
@@ -734,19 +795,17 @@ async def drive_plan(batches, records, roster, handoff, execute_step, on_escalat
                 continue
             stall["rounds"] += 1
             if stall["rounds"] >= max_stall_rounds:
-                stuck = [s for s in order if not is_terminal(records.get(s))]
+                stuck = [s for s in order
+                         if not is_terminal(records.get(s)) and not parked(s)]
                 raise BatchStalled(
                     f"plan made no progress for {max_stall_rounds} polls; "
                     f"stuck={stuck[:8]} parked={roster.parked()} "
                     f"locked={sorted(res.locked_files())[:8]}")
 
     tasks = [asyncio.create_task(worker(l)) for l in roster.lane_names()]
-    tasks.append(asyncio.create_task(escalator()))
     tasks.append(asyncio.create_task(watch()))
     try:
         await asyncio.gather(*tasks)
-    except asyncio.CancelledError:
-        raise
     finally:
         for t in tasks:
             if not t.done():
