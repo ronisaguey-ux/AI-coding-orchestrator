@@ -204,9 +204,30 @@ VERIFY_SYSTEM = (
 def load_state() -> dict:
     if STATE_FILE.exists():
         try:
-            return json.loads(STATE_FILE.read_text())
+            st = json.loads(STATE_FILE.read_text())
         except Exception:
-            pass
+            return {"steps": {}}
+        # 09-15: normalise escalated residue at LOAD time, not at save time.
+        # Patching the merge in save_state_serialized did not work because several
+        # code paths call save_state() directly, which writes the memory copy
+        # verbatim - so memory that still held 536 legacy `escalated` records kept
+        # writing them back. Load is the one place every path goes through, and
+        # with the escalation phase OFF there is no escalation state to preserve.
+        if not ESCALATIONS_ENABLED:
+            _n = 0
+            for _r in (st.get("steps") or {}).values():
+                if isinstance(_r, dict) and _r.get("status") == "escalated":
+                    _r["status"] = "pending"
+                    _r.pop("escalated_at", None)
+                    _r.pop("escalated_by", None)
+                    _r["escalation_retired_reason"] = (
+                        "escalated residue normalised to pending at load - the "
+                        "escalation phase is disabled in the config")
+                    _n += 1
+            if _n:
+                print(f"[eng] normalised {_n} legacy 'escalated' step(s) -> pending "
+                      f"at load (escalations are disabled)", flush=True)
+        return st
     return {"steps": {}}
 
 
