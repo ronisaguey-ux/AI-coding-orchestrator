@@ -303,10 +303,15 @@ def default_lanes(cfg=None) -> list[Lane]:
         # returns `insufficient balance` while V4-Flash bills fine, so only the
         # models that actually bill are listed here. Like orcarouter this is an
         # API lane: no tab, no mutex, no anti-ban gap.
-        Lane("bitdeer", "https://api-inference.bitdeer.ai/v1/chat/completions",
-             ["deepseek-ai/DeepSeek-V4-Flash"],
-             60, 180, prompt_cap=24000, timeout=120,
-             auth="AIni2RlIlDeDOEclStU3"),
+        # 09-15: BITDEER PULLED. Dead lane, failing on every draw:
+        #   [lanes] bitdeer failed (http 502: <!DOCTYPE html> ... Cloudflare)
+        #   and a bare 401 on /v1/models. Measured 3 failures in 12 min, each one
+        #   burning a hop and a cooldown slot on a lane that cannot answer.
+        #   Re-enable only after /v1/models returns 200 and one real completion does.
+#        Lane("bitdeer", "https://api-inference.bitdeer.ai/v1/chat/completions",
+#             ["deepseek-ai/DeepSeek-V4-Flash"],
+#             60, 180, prompt_cap=24000, timeout=120,
+#             auth="AIni2RlIlDeDOEclStU3"),
         # 09-13 (owner): ChatGPT webchat lane (Free account, text chat only —
         # image analysis is capped but text is unlimited). Gateway :8087 on the
         # owner's CDP 9224 Chrome. Four harness bugs had to be fixed first
@@ -342,7 +347,7 @@ def default_lanes(cfg=None) -> list[Lane]:
         # `skipEmptyMessageRows` quirk applies. Verified live: HTTP 200, PONG in 5s.
         Lane("chatgpt", "http://127.0.0.1:8087/v1/chat/completions",
              ["chatgpt webchat"], 120, 300,
-             prompt_cap=32000, timeout=210),  # 09-14: 12000 truncated the file contents to ~9.6K so chatgpt couldn't see the code; raise so the full prompt gets through
+             prompt_cap=32000, timeout=300),  # 09-14: 210s guillotined the thinking model mid-answer ("chatgpt failed (timeout after 210s)"); gateway HARD_CAP_MS now 310s so the gateway always outlives this budget.  # 09-14: 12000 truncated the file contents to ~9.6K so chatgpt couldn't see the code; raise so the full prompt gets through
         # 09-14 (owner): Dahl Inference — OpenAI-compatible API lane on
         # decentralised GPU infra, 100M free tokens per key, no account needed.
         # Docs: https://docs.dahl.global/ | base https://inference.dahl.global/v1
@@ -393,9 +398,15 @@ def default_lanes(cfg=None) -> list[Lane]:
         Lane("gemini", "http://127.0.0.1:8085/v1/chat/completions",
              ["gemini 3.7 flash webchat"], 300, 900,
              prompt_cap=12000, timeout=720),  # gemini gw HARD_CAP is UNSET -> auto-derives 720s; 330s guillotined slow-but-healthy replies (Bob: let gemini cook)  # 09-14: 2500 -> 12000. Bob: "the messages aren't even
-        Lane("freebuff", "http://127.0.0.1:8088/v1/chat/completions",
-             ["freebuff webchat"], 90, 270,
-             prompt_cap=32000, timeout=420),  # 09-14 (owner): Freebuff coding-agent webchat (GLM 5.3 Flash, Thinking). Thinking model is slow (~4-5min); timeout matches the gateway's 420s so it completes instead of guillotining.
+        # 09-15: FREEBUFF PULLED. Proven unusable as a lane, not a budget problem:
+        #   the gateway log shows "freebuff reasoning effort -> Low", the prompt sent,
+        #   then 9m21s later "send timed out" with the tab never producing an answer.
+        #   Playwright on the tab confirms it: it answers a 20-char "Say PONG" fine and
+        #   stays silent on a real 7.7K prompt. Re-enable only after a hand-driven send
+        #   on a FRESH chat returns real content.
+        #         Lane("freebuff", "http://127.0.0.1:8088/v1/chat/completions",
+#             ["freebuff webchat"], 90, 270,
+#             prompt_cap=32000, timeout=520),  # 09-14: was 420, and the gateway HARD_CAP was 400 so freebuff never got to finish ("freebuff failed (timeout after 420s)"); cap is now 540s and this budget sits under it.  # 09-14 (owner): Freebuff coding-agent webchat (GLM 5.3 Flash, Thinking). Thinking model is slow (~4-5min); timeout matches the gateway's 420s so it completes instead of guillotining.
                                 # going thru ... and its supposed to have the see next
                                 # chunk". A 2500-char user turn leaves gemini almost no
                                 # file context and no room to call see_next_chunk, so it
