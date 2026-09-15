@@ -441,10 +441,18 @@ def apply_outcome(records: dict, sid, res, escalations: bool = False) -> str:
     if o == "green":
         rec["status"] = "green"
     elif o == "yellow":
+        # 09-15: this used to RAISE, and that single raise took the whole engine
+        # down (measured: "lane gemini returned yellow for P1B0R0F2#6 with no
+        # recorded justification" -> exit code 1, 13 minutes of work lost, systemd
+        # restart). A lane reporting "I cannot fix this" is a normal outcome, not a
+        # contract violation, so DERIVE the justification from the lane's own note
+        # instead of killing the run. Same padding rule as the escalate path.
         if not rec.get("yellow_justification"):
-            raise YellowJustificationError(
-                f"lane {res.lane} returned yellow for {sid} with no recorded "
-                f"justification")
+            j = (getattr(res, "note", "") or getattr(res, "error", "") or "").strip()
+            if len(j) < MIN_YELLOW_JUSTIFICATION:
+                j = (j + " The lane reported it could not fix this step; flagged "
+                         "for human review.").strip()
+            make_yellow(rec, j, lane=getattr(res, "lane", None))
         rec["status"] = "yellow"
     elif o == "escalate" and escalations:
         rec["status"] = "escalated"
@@ -480,9 +488,11 @@ def _apply_outcome(queue, sid, res, escalations: bool = False) -> str:
         rec["status"] = "green"
     elif o == "yellow":
         if not rec.get("yellow_justification"):
-            raise YellowJustificationError(
-                f"lane {res.lane} returned yellow for {sid} with no recorded "
-                f"justification")
+            j = (getattr(res, "note", "") or getattr(res, "error", "") or "").strip()
+            if len(j) < MIN_YELLOW_JUSTIFICATION:
+                j = (j + " The lane reported it could not fix this step; flagged "
+                         "for human review.").strip()
+            make_yellow(rec, j, lane=getattr(res, "lane", None))
         rec["status"] = "yellow"
     elif o == "escalate":
         # 09-14 (owner): "get rid of escalations entirely ... they either solve
@@ -746,9 +756,10 @@ async def drive_plan(batches, records, roster, handoff, execute_step, *,
                     rec["resolved_by"] = "escalation persona: fixed on the final shot"
                 elif verdict == "yellow":
                     if rec.get("status") != "yellow":
-                        raise YellowJustificationError(
-                            f"escalation persona declared {sid} yellow with no "
-                            f"recorded justification")
+                        # Same rule as apply_outcome: derive, never crash.
+                        j = (rec.get("escalated_reason") or rec.get("last_lane_error")
+                             or "the escalation persona reported it could not fix this step")
+                        make_yellow(rec, str(j)[:300], lane=lane)
                 elif n >= max_escalation_attempts:
                     rec["escalation_gave_up"] = (
                         f"no verdict from {n} lane attempt(s); last lane {lane}")
