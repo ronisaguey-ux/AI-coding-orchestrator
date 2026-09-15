@@ -278,6 +278,26 @@ async def save_state_serialized(st: dict) -> None:
                 TERMINAL = ("green", "escalated", "obsolete", "blocked", "yellow")
             else:
                 TERMINAL = ("green", "obsolete", "blocked", "yellow")
+                # 09-15: removing `escalated` from TERMINAL above stopped the DISK
+                # from resurrecting a reopen, but it left the opposite hole: with
+                # neither side terminal the merge keeps the memory copy, so an
+                # escalated record the engine is holding in memory is written back
+                # on EVERY save. Measured: 502 legacy records (escalated_at AND
+                # escalated_by both None, none created after 09-14) reappeared
+                # within 9 minutes of being retired, three separate times, and each
+                # pass cost ~90 steps of churn. With the phase OFF there is no
+                # escalation state to preserve, so any escalated record - on either
+                # side - is normalised to pending here. That is the only place that
+                # sees BOTH copies.
+                for _d in (ssteps, dsteps):
+                    for _r in _d.values():
+                        if isinstance(_r, dict) and _r.get("status") == "escalated":
+                            _r["status"] = "pending"
+                            _r.pop("escalated_at", None)
+                            _r.pop("escalated_by", None)
+                            _r["escalation_retired_reason"] = (
+                                "escalated residue normalised to pending — the "
+                                "escalation phase is disabled in the config")
             for sid, srec in ssteps.items():
                 drec = dsteps.get(sid)
                 if not isinstance(drec, dict):
