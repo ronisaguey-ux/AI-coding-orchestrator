@@ -358,6 +358,21 @@ def escalate(sid: str, rec: dict, reason: str, *, site: str,
     # review, carrying the executor's own reason as its justification. The
     # function still RETURNS the legacy "escalated" sentinel so every call site's
     # control flow (commit-on-terminal, early-return-on-refusal) is unchanged.
+    if ESCALATIONS_ENABLED:
+        # escalations_enabled: true — the historical path: a terminal escalation
+        # that the escalation persona gets one final shot at.
+        rec["status"] = "escalated"
+        rec["escalated_reason"] = reason[:300]
+        rec["escalated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+        rec["escalated_by"] = site
+        if verify is not None:
+            la = rec.setdefault("last_apply", {})
+            if isinstance(la, dict):
+                la["verify"] = verify
+        signal_escalation(sid, rec)
+        return "escalated"
+    # escalations_enabled: false (default) — the executor decides: it either
+    # lands a working edit (green) or it cannot (yellow, carrying this reason).
     justification = reason[:300]
     if len(justification) < 40:
         justification = (justification + " — the executor could not apply a "
@@ -1299,6 +1314,12 @@ async def run_step(session, step: dict, st: dict) -> dict:
 # Set ORCH_QUEUE_ENGINE=0 to fall back to the old batch-group loop.
 # ---------------------------------------------------------------------------
 _QUEUE_ENGINE = os.environ.get("ORCH_QUEUE_ENGINE", "1") == "1"
+# 09-14 (owner): escalation is a config option, not a built-in stage.
+#   ORCH_ESCALATIONS_ENABLED / orch.yaml `escalations_enabled`
+#     false (default) -> the executor decides: green, or yellow with its reason.
+#     true            -> unsolvable steps go to an escalation persona for one
+#                        final shot. Shipped so other users can have escalations.
+ESCALATIONS_ENABLED = bool(getattr(CFG, "escalations_enabled", False))
 HANDOFF = oq.StepHandoff()
 
 ESCALATION_SYSTEM = (
@@ -1442,12 +1463,18 @@ async def run_queue_batches(session, batches: list, st: dict) -> None:
     roster = oq.LaneRoster(lane_names)
     locked = [s["finding_id"] for s in _STEP_BY_ID.values()
               if "locked" in str(s.get("tags") or [])]
+    print(f"[qeng] escalation persona: "
+          f"{'ON' if ESCALATIONS_ENABLED else 'OFF (executor decides green/yellow)'}",
+          flush=True)
     print(f"[qeng] S3 work-stealing engine: {len(ids)} batches, "
           f"{len(steps_by_id)} steps, {len(lane_names)} lanes, "
           f"batch_cap={BATCH_CAP}", flush=True)
 
     async def _exec(lane, sid):
         return await execute_step_pinned(session, lane, steps_by_id[sid], st)
+
+    async def _esc(lane, sid):
+        return await escalate_final(session, sid, st, lane=lane)
 
     def _batch_done(bi, snap):
         try:
@@ -1457,6 +1484,7 @@ async def run_queue_batches(session, batches: list, st: dict) -> None:
 
     try:
         snap = await oq.drive_plan(ids, st["steps"], roster, HANDOFF, _exec,
+                                   on_escalate=(_esc if ESCALATIONS_ENABLED else None),
                                    steps_by_id=steps_by_id, poll_s=5.0,
                                    log=lambda m: print(m, flush=True),
                                    on_batch_done=_batch_done)
@@ -2082,7 +2110,7 @@ async def main():
     # a verdict about the code. Runs BEFORE any batch, on the engine's own state,
     # so it cannot be clobbered by a stale snapshot the way a hand-edit is.
     _reopened = reopen_dead_escalations(st)
-    _retired = retire_escalations(st)
+    _retired = 0 if ESCALATIONS_ENABLED else retire_escalations(st)
     if _retired:
         print(f"[eng] retired {_retired} escalated step(s) -> code yellow "
               f"(escalations are gone; the executor decides green or yellow)", flush=True)
