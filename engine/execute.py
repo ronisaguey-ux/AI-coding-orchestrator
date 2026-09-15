@@ -1047,6 +1047,29 @@ async def run_step(session, step: dict, st: dict) -> dict:
     # never retried. 63 steps were stuck this way and the green counter went flat
     # while the engine churned batches. Escalate them instead of silently skipping.
     if rec.get("rounds", 0) >= MAX_ROUNDS:
+        # 09-15: this site retired 112 steps as yellow across one run with the
+        # reason "round budget already spent ... no lane call made" - and most of
+        # them never had a real verdict. A transport failure must not consume a
+        # round (the engine's own doctrine), but these steps carry rounds=3 with a
+        # last_lane_error of the transport kind, so the budget was spent on
+        # failures that said nothing about the code.
+        #
+        # A step that never got a considered answer is not "the executor tried and
+        # could not" - it is work still owed. Give it the round back and let a lane
+        # attempt it. Only a step whose rounds ended in a real, non-transport
+        # verdict is yellowed here.
+        _le = str(rec.get("last_lane_error") or "")
+        _la = rec.get("last_apply") or {}
+        _tried = bool(_la) and not is_transport_error(_le)
+        if not _tried:
+            rec["rounds"] = 0
+            rec["rounds_reset_reason"] = (
+                "round budget was spent on failures that were not verdicts "
+                "(transport or no apply recorded); re-queued for a real attempt")
+            await save_state_serialized(st)
+            print(f"[step {sid}] rounds were spent without a verdict — reset to 0 "
+                  f"and re-queued instead of retiring as yellow", flush=True)
+            return rec
         escalate(sid, rec,
                  f"round budget already spent before this pass "
                  f"(rounds={rec.get('rounds')}/{MAX_ROUNDS}); no lane call made",
