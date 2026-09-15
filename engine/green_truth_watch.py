@@ -148,6 +148,22 @@ def main() -> int:
         r["status"] = "pending"
         r["phantom_reopened"] = r.get("phantom_reopened") or time.strftime("%Y-%m-%d %H:%M green_truth_watch")
         bad.append(sid)
+    # 09-15: LEGACY `escalated` records keep coming back. Measured: 536 of them
+    # (502 with escalated_at AND escalated_by both None, i.e. never written by the
+    # current escalate()) reappeared within 5 minutes of the engine retiring them,
+    # and green 5525 dropped to 5441 with them. Escalations are switched OFF in the
+    # config, so an `escalated` record is not a verdict the engine can produce - it
+    # is residue from the phase that no longer exists. This watch is one of only
+    # two writers of the state file, so retiring them HERE, on every pass, is what
+    # stops them lingering. A record with a real escalated_by is left alone.
+    legacy = [sid for sid, r in steps.items()
+              if r.get("status") == "escalated"
+              and not r.get("escalated_by") and not r.get("escalated_at")]
+    if legacy:
+        bad.extend(legacy)
+        print(f"[green-truth] {len(legacy)} legacy escalated step(s) (no escalated_by/"
+              f"escalated_at - residue of the removed escalation phase) -> pending",
+              flush=True)
     if bad:
         # 09-08 (user: make progress actually persist): NEVER dump our stale
         # `st` snapshot — it can clobber NEW greens the engine saved concurrently
