@@ -852,6 +852,21 @@ def parse_json(text) -> dict:
     return orch_lanes.normalize_edits(orch_lanes.parse_json_object(text))
 
 
+def _all_noop(edits: list) -> bool:
+    """True when every edit asks for a change that is already the file's content.
+
+    A lane returning old_string == new_string is not proposing a fix; it is
+    stating the code already reads the way it wants. Treated as the
+    already-satisfied verdict rather than a phantom green (see apply_edits).
+    """
+    if not edits:
+        return False
+    for e in edits or []:
+        if str(e.get("old_string") or "") != str(e.get("new_string") or ""):
+            return False
+    return True
+
+
 def apply_edits(edits: list) -> tuple:
     """Exact string replace with py syntax guard (proven 8_26 logic).
 
@@ -917,6 +932,20 @@ def apply_edits(edits: list) -> tuple:
             results.append({"file": f, "ok": False, "msg": f"read fail: {ex}"})
             continue
         if old and old in cur:
+            # 09-15: a NO-OP edit (old_string == new_string) used to be reported
+            # as "applied". The replace finds the string, writes the file back
+            # byte-identical, git finds nothing to commit, and the step greened
+            # with no commit behind it. green_truth_watch then condemned it as a
+            # PHANTOM and RESTARTED THE ENGINE (measured: 3 phantoms in 15 min,
+            # P1B0R0F8#122 / P1B0R0F11#57 / P1B0R0F14, each restart discarding
+            # in-flight lane calls). It is not a phantom and it is not a fix: the
+            # lane is telling us the code is ALREADY the way it wants it, which is
+            # exactly the already-satisfied verdict green_truth exempts.
+            if old == new:
+                results.append({"file": f, "ok": True, "already_satisfied": True,
+                                "msg": "no-op edit: old_string == new_string "
+                                       "(already satisfied)"})
+                continue
             if f.endswith(".py"):
                 try:
                     ast.parse(cur.replace(old, new, 1))
@@ -939,6 +968,10 @@ def apply_edits(edits: list) -> tuple:
                         results.append({"file": f, "ok": False,
                                         "msg": f"syntax break (fuzzy edit rejected): {se}"})
                         continue
+                if fz == cur:
+                    results.append({"file": f, "ok": True, "already_satisfied": True,
+                                    "msg": "no-op fuzzy re-anchor (already satisfied)"})
+                    continue
                 path.write_text(fz, errors="ignore")
                 results.append({"file": f, "ok": True, "msg": "applied (fuzzy re-anchor)"})
             else:
@@ -1245,7 +1278,14 @@ async def run_step(session, step: dict, st: dict) -> dict:
             return rec
         ok, msg = apply_edits(edits)
         rec["last_apply"] = {"rnd": rnd + 1, "ok": ok, "edits": edits,
-                             "apply_msg": msg, "lane": res.lane}
+                             "apply_msg": msg, "lane": res.lane,
+                             "verify": ("already satisfied (no-op edit)"
+                                        if ok and _all_noop(edits) else None)}
+        if ok and _all_noop(edits):
+            # The lane changed nothing because nothing needed changing. Say so in
+            # the field green_truth_watch reads, or it condemns this as a phantom
+            # and restarts the engine for a step that was never broken.
+            rec["resolved_by"] = "lane verdict: already satisfied (no-op edit)"
         checks = run_checks(files)
         vres = await lane_call_result(
             session, VERIFY_SYSTEM,
