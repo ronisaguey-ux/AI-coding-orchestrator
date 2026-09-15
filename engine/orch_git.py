@@ -151,12 +151,46 @@ def _commit_blocking(sid: str, files: list[str]) -> None:
             sys.stderr.write(f"[git] commit {sid} failed: {detail[:400]}\n")
 
 
+# 09-15: GitHub rejects the WHOLE push when any commit in the range touches
+# `.github/workflows/` and the token lacks the `workflow` scope:
+#   ! [remote rejected] HEAD -> main (refusing to allow a Personal Access Token
+#     to create or update workflow `.github/workflows/template-integrity.yml`
+#     without `workflow` scope)
+# Measured: ONE such commit (P1B5R0F12#25) blocked 75 commits for hours and the
+# engine logged `push failed after retries` 24 times, re-attempting a rejection
+# that can never succeed — the work stayed local-only while every retry burned a
+# cycle. A permanent rejection gets reported ONCE, with the fix, and no retry.
+_PERMANENT_PUSH_MARKERS = (
+    "without `workflow` scope",
+    "refusing to allow a Personal Access Token",
+    "protected branch",
+    "non-fast-forward",
+    "GH013",
+)
+
+
+def _push_is_permanent(stderr: str) -> bool:
+    e = str(stderr or "")
+    return any(m in e for m in _PERMANENT_PUSH_MARKERS)
+
+
 def _push_retry(attempt=0):
+    p = None
     for attempt in range(3):
         p = _run(["git", "push", "origin", "HEAD:main"])
         if p.returncode == 0:
             return
+        if _push_is_permanent(p.stderr):
+            break
         if attempt < 2:
             import time
             time.sleep(4)
+    if p is not None and _push_is_permanent(p.stderr):
+        sys.stderr.write(
+            "[git] push REJECTED PERMANENTLY (not a transient failure, not "
+            "retried): " + p.stderr.strip()[:300] + "\n"
+            "[git] FIX: add the `workflow` scope to the GitHub token, or stop "
+            "committing `.github/workflows/` from the engine. Commits stay local "
+            "until then; nothing is lost.\n")
+        return
     sys.stderr.write(f"[git] push failed after retries: {p.stderr[:160]}\n")
