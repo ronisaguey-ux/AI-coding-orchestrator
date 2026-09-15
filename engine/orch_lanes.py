@@ -421,6 +421,14 @@ def default_lanes(cfg=None) -> list[Lane]:
           if _dahl_key() else []),
         Lane("gemini", "http://127.0.0.1:8085/v1/chat/completions",
              ["gemini 3.7 flash webchat"], 300, 900,
+             prompt_cap=12000, timeout=720),
+        # 09-15 (Bob): "Try to open concurrent gemini threads, add a 2nd chat".
+        # A SECOND gemini gateway on its own port, attached to its own tab in the
+        # same chrome, with its OWN WEBCHAT_ACCOUNT so the two do not share the
+        # send lock and genuinely run in parallel. Verified live: gw2 answered
+        # "PONG" while gw1 was mid-send.
+        Lane("gemini2", "http://127.0.0.1:8089/v1/chat/completions",
+             ["gemini 3.7 flash webchat 2"], 300, 900,
              prompt_cap=12000, timeout=720),  # gemini gw HARD_CAP is UNSET -> auto-derives 720s; 330s guillotined slow-but-healthy replies (Bob: let gemini cook)  # 09-14: 2500 -> 12000. Bob: "the messages aren't even
         # 09-15: FREEBUFF PULLED. Proven unusable as a lane, not a budget problem:
         #   the gateway log shows "freebuff reasoning effort -> Low", the prompt sent,
