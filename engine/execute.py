@@ -1753,11 +1753,23 @@ async def run_step(session, step: dict, st: dict) -> dict:
     # escalations sat at rounds==3 with last_apply.ok=true and real edits. Record
     # WHY: the rounds were spent and the verify lane never returned green.
     _la = rec.get("last_apply") or {}
+    _rs_files = [str(e.get("file") or e.get("filePath") or "").strip()
+                 for e in (_la.get("edits") or []) if isinstance(e, dict)]
+    _rs_files = [f for f in _rs_files if f] or list(rec.get("files") or []) \
+        or PLAN_FILES.get(sid) or []
+    _rs_said = str(_la.get("lane_said") or "").strip()
+    if not _rs_said:
+        # The lane's own words live in last_lane_error when it never produced an
+        # apply. A terse "verify=None" is not a justification (owner 09-16).
+        _rs_said = str(rec.get("last_lane_error") or "").strip()
     escalate(sid, rec,
-             f"round budget exhausted ({rec.get('rounds')}/{MAX_ROUNDS}) without a "
-             f"green verify; last apply ok={_la.get('ok')} "
-             f"msg={str(_la.get('apply_msg'))[:80]!r} "
-             f"verify={str(_la.get('verify'))[:80]!r}",
+             f"round budget exhausted after {rec.get('rounds')}/{MAX_ROUNDS} rounds "
+             f"without a green verify. Target file(s): "
+             f"{', '.join(_rs_files) or 'unknown (the plan names no file)'}. "
+             f"Last apply ok={_la.get('ok')} lane={_la.get('lane') or 'unnamed'} "
+             f"msg={str(_la.get('apply_msg'))[:200]!r}. "
+             + (f"The lane's own words: {_rs_said[:700]}" if _rs_said
+                else "No lane left a written reason."),
              site="run_step:rounds_exhausted")
     if rec["status"] not in ("escalated", "yellow"):
         await save_state_serialized(st)
