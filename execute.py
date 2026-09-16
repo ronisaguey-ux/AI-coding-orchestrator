@@ -245,8 +245,13 @@ def load_state() -> dict:
                 # rebuilt even though it is long - measured: one yellow sat at
                 # exactly 300 chars, truncated, and the length test passed it.
                 if (len(_j) >= 160 and "own words" in _j
-                        and _j.rstrip()[-1:] in ".!?)]" and len(_j) != 300):
-                    continue          # already detailed and whole, leave it alone
+                        and _j.rstrip()[-1:] in ".!?)]" and len(_j) != 300
+                        and "not recorded" not in _j):
+                    # Skip only a reason that is detailed AND whole AND names its
+                    # subject. A placeholder ("Target file(s): not recorded") is not
+                    # a justification however long it is - measured: two yellows
+                    # passed the length test while saying exactly that.
+                    continue
                 _new = yellow_justification_detail(_k, _r)
                 if _new:
                     _r["yellow_reason"] = _new
