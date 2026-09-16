@@ -825,7 +825,7 @@ async def drive_plan(batches, records, roster, handoff, execute_step, *,
                         # Same rule as apply_outcome: derive, never crash.
                         j = (rec.get("escalated_reason") or rec.get("last_lane_error")
                              or "the escalation persona reported it could not fix this step")
-                        make_yellow(rec, str(j)[:300], lane=lane)
+                        make_yellow(rec, str(j)[:2000], lane=lane)
                 elif n >= max_escalation_attempts:
                     rec["escalation_gave_up"] = (
                         f"no verdict from {n} lane attempt(s); last lane {lane}")
