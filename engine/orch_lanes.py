@@ -419,9 +419,18 @@ def default_lanes(cfg=None) -> list[Lane]:
                 key_refresh=_dahl_mint_key,
                 headers={"User-Agent": _BROWSER_UA})]
           if _dahl_key() else []),
-        Lane("gemini", "http://127.0.0.1:8085/v1/chat/completions",
-             ["gemini 3.7 flash webchat"], 300, 900,
-             prompt_cap=12000, timeout=720),
+# 09-16: GEMINI PULLED. It cannot commit a send on its tab. Evidence:
+#   - 3h window: 23 step-claims, 1 green, 11 'timeout after 720s', and the
+#     gateway logged 18 sends / 0 responses.
+#   - After clearing five stray app tabs, pinning gw1 to one exact CDP target
+#     (TAB_ID) and reloading it clean, a 3,178-char probe STILL logged
+#     'prompt still in composer after the click' - the send never commits.
+#   - Same signature as gemini2 and NoteGPT: the click reaches the node and
+#     nothing submits. Not a budget problem and not a login problem.
+# Re-enable only after a hand-driven send in that tab returns real content.
+#         Lane("gemini", "http://127.0.0.1:8085/v1/chat/completions",
+#              ["gemini 3.7 flash webchat"], 300, 900,
+#              prompt_cap=12000, timeout=720),
         # 09-15: re-enabled after I parked it on a WRONG attribution. gw1 and gw2 share
         # one chrome, but the CDP churn is gw1's OWN behaviour - measured 50 reconnect
         # events / 4 min with gw2 stopped vs 52 with it running. Sharing is not the
