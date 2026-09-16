@@ -222,7 +222,7 @@ def default_lanes(cfg=None) -> list[Lane]:
              # positional form silently bound the API key to prompt_cap and
              # left auth="" → the lane was dropped by the `or ln.auth` filter.
         Lane("deepseek", "http://127.0.0.1:8080/v1/chat/completions",
-             ["anymodel"], 90, 270, prompt_cap=12000, timeout=270),
+             ["anymodel"], 90, 270, prompt_cap=32000, timeout=270),
         # 09-12 (owner): two more signed-in deepseek webchats, each on its own
         # profile, as separate lanes. All three share the gateway's 30s send
         # spacing (MIN_SEND_INTERVAL_MS + /tmp/deepseek_last_send), so they can
@@ -234,9 +234,9 @@ def default_lanes(cfg=None) -> list[Lane]:
         # batch 1 never completed, green stayed flat). Cap it like gemini and
         # openrouter: the small prompts (557-1104 chars) answered in 3-6s.
         Lane("deepseek2", "http://127.0.0.1:8081/v1/chat/completions",
-             ["anymodel"], 90, 270, prompt_cap=12000, timeout=270),
+             ["anymodel"], 90, 270, prompt_cap=32000, timeout=270),
         Lane("deepseek4", "http://127.0.0.1:8083/v1/chat/completions",
-             ["anymodel"], 90, 270, prompt_cap=12000, timeout=270),
+             ["anymodel"], 90, 270, prompt_cap=32000, timeout=270),
         # PULLED 09-13: every auto/* combo now 402/401 on an oc/* model
         # Lane("omniroute", "http://127.0.0.1:20128/v1/chat/completions",
              # 09-12 LATER: the auto/* combos load-balance and now route onto
