@@ -480,7 +480,7 @@ def escalate(sid: str, rec: dict, reason: str, *, site: str,
         # escalations_enabled: true — the historical path: a terminal escalation
         # that the escalation persona gets one final shot at.
         rec["status"] = "escalated"
-        rec["escalated_reason"] = reason[:300]
+        rec["escalated_reason"] = _clip_reason(reason)
         rec["escalated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
         rec["escalated_by"] = site
         if verify is not None:
@@ -491,7 +491,7 @@ def escalate(sid: str, rec: dict, reason: str, *, site: str,
         return "escalated"
     # escalations_enabled: false (default) — the executor decides: it either
     # lands a working edit (green) or it cannot (yellow, carrying this reason).
-    justification = reason[:300]
+    justification = _clip_reason(reason)
     if len(justification) < 40:
         justification = (justification + " — the executor could not apply a "
                          "working edit; flagged for human review.").strip()
@@ -501,10 +501,10 @@ def escalate(sid: str, rec: dict, reason: str, *, site: str,
         rec["status"] = "yellow"
         rec["yellow_justification"] = justification
         rec["resolved_by"] = f"code yellow: {justification[:200]}"
-    rec["yellow_reason"] = reason[:300]
+    rec["yellow_reason"] = _clip_reason(reason)
     rec["yellow_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
     rec["yellow_by"] = site
-    rec["escalated_reason"] = reason[:300]   # keep the old key readable
+    rec["escalated_reason"] = _clip_reason(reason)   # keep the old key readable
     if verify is not None:
         la = rec.setdefault("last_apply", {})
         if isinstance(la, dict):
@@ -1015,6 +1015,27 @@ def _applied_edits_landed(rec: dict) -> bool:
                 landed += 1
     return landed == len(edits)
 
+
+MAX_YELLOW_REASON = int(os.environ.get("ORCH_MAX_YELLOW_REASON", "2000"))
+
+
+def _clip_reason(text: str, limit: int = None) -> str:
+    """Trim a justification only at the very end, and only on a word boundary.
+
+    09-16: the reason was cut at a flat 300 chars, which chopped the lane's own
+    explanation mid-word - measured on the live state, four yellows ended
+    "...that nee", "...uses s", "...only 1", "...so the". Owner wants a DETAILED
+    justification, so give it room and never bisect a word to get there.
+    """
+    t = " ".join(str(text or "").split())
+    n = limit or MAX_YELLOW_REASON
+    if len(t) <= n:
+        return t
+    cut = t[:n]
+    sp = cut.rfind(" ")
+    if sp > n * 0.6:
+        cut = cut[:sp]
+    return cut.rstrip(" ,;:") + " [...]"
 
 def _lane_said(content: str, sid: str = "", limit: int = 700) -> str:
     """The lane's OWN words about this step, kept instead of thrown away.
@@ -2403,7 +2424,7 @@ def retire_escalations(st: dict) -> int:
             continue
         reason = (rec.get("escalated_reason") or rec.get("last_lane_error")
                   or "the executor could not apply a working edit")
-        j = str(reason).strip()[:300]
+        j = _clip_reason(str(reason).strip())
         if len(j) < 40:
             j = (j + " — the executor could not apply a working edit; flagged "
                      "for human review.").strip()
