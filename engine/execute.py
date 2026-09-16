@@ -950,6 +950,28 @@ def _applied_edits_landed(rec: dict) -> bool:
     return landed == len(edits)
 
 
+def _capture_landed(rec: dict) -> None:
+    """Stamp the step, AT APPLY TIME, that its edit is on disk.
+
+    09-15: the plan edits some files many times over (README.md 53 steps,
+    data_pipeline/bar_builder.py 51, oculus/pipeline.py 49 - 1,260 files are
+    touched by more than one step). Step N's region is rewritten by step N+1, so
+    by the time anyone reviews step N its exact new_string is gone, and the only
+    surviving proof was the per-step git commit. Capture the evidence while it is
+    still true: verify the content on disk immediately after the apply and stamp
+    `last_apply.landed_verified`. A later review can then trust the stamp instead
+    of having to reconstruct what happened. Never overwrites a False.
+    """
+    try:
+        if _applied_edits_landed(rec):
+            la = rec.get("last_apply")
+            if isinstance(la, dict):
+                la["landed_verified"] = True
+                la["landed_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+    except Exception:
+        pass  # an evidence stamp must never break the run it is observing
+
+
 def apply_edits(edits: list) -> tuple:
     """Exact string replace with py syntax guard (proven 8_26 logic).
 
@@ -960,11 +982,46 @@ def apply_edits(edits: list) -> tuple:
     import ast
     if not edits:
         return False, "no edits proposed (lane returned nothing usable)"
+    # 09-15: lanes keep returning the RIGHT edit under the WRONG key names, and
+    # the engine then reads `e.get("file")` as "" and tries to read the repo ROOT
+    # - which fails with "Is a directory" and retires a perfectly good edit as
+    # "no edit was ever produced". Measured in the yellow pile: `filePath` /
+    # `oldStr` / `newStr` (P1B4R0F10#8) and a JSON-PATCH shaped
+    # `{op, path, value}` (P1B1R0F11#23). Accept the aliases instead of throwing
+    # the work away, and refuse an empty target path with a clear message.
+    _aliases = {
+        "file": ("file", "filePath", "file_path", "path", "filename"),
+        "old_string": ("old_string", "oldStr", "old_str", "old", "oldText"),
+        "new_string": ("new_string", "newStr", "new_str", "new", "newText",
+                       "content", "text"),
+    }
+
+    def _pick(e: dict, key: str) -> str:
+        for cand in _aliases[key]:
+            if e.get(cand) not in (None, ""):
+                return str(e[cand])
+        return ""
+
     results = []
     for e in edits or []:
-        f = str(e.get("file") or "")
-        old = str(e.get("old_string") or "")
-        new = str(e.get("new_string") or "")
+        if not isinstance(e, dict):
+            results.append({"file": "", "ok": False,
+                            "msg": f"refused: edit is {type(e).__name__}, not an object"})
+            continue
+        if "op" in e and "path" in e and "value" in e:
+            results.append({"file": "", "ok": False,
+                            "msg": ("refused: this is a JSON-PATCH object "
+                                    f"({e.get('op')} {e.get('path')}), not a file edit; "
+                                    "the contract needs file/old_string/new_string")})
+            continue
+        f = _pick(e, "file")
+        old = _pick(e, "old_string")
+        new = _pick(e, "new_string")
+        if not f:
+            results.append({"file": "", "ok": False,
+                            "msg": ("refused: the edit names no target file (keys "
+                                    f"present: {sorted(e.keys())[:6]})")})
+            continue
         # 09-09 (Bob): never touch a file that escapes repo_dir (../webchat-api etc).
         if not in_repo(f):
             results.append({"file": f, "ok": False,
@@ -1963,6 +2020,7 @@ async def run_group(session, steps: list, st: dict) -> dict:
             continue
         ok, msg = apply_edits(mine)
         rec["last_apply"] = {"rnd": rec["rounds"], "ok": ok, "edits": mine, "apply_msg": msg}
+        _capture_landed(rec)
         checks = run_checks(files)
         rec["last_apply"]["checks"] = checks[-600:]
         vres = await lane_call_result(
@@ -2032,6 +2090,7 @@ async def run_group(session, steps: list, st: dict) -> dict:
             _, msg2 = apply_edits(new_edits)
             rec["last_apply"] = {"rnd": rec["rounds"], "ok": ok,
                                  "edits": new_edits, "apply_msg": msg2}
+            _capture_landed(rec)
             # Only escalate once the step has actually spent its rounds. The
             # group path used to escalate after a SINGLE attempt while
             # run_step allowed MAX_ROUNDS, so a step's retry budget depended
