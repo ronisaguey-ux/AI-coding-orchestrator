@@ -353,10 +353,19 @@ def default_lanes(cfg=None) -> list[Lane]:
         # real answer sat in an earlier row. That is now handled: the gateway runs
         # `WEBCHAT_MODE=chatgpt` (drop-in 95-mode.conf) so the mode's
         # `skipEmptyMessageRows` quirk applies. Verified live: HTTP 200, PONG in 5s.
-        Lane("chatgpt", "http://127.0.0.1:8087/v1/chat/completions",
-             ["chatgpt webchat"], 120, 420,
-             prompt_cap=32000, timeout=420),  # 09-15 (Bob: the lane "is not
-             # functioning correctly"): engine budget 300s against a gateway HARD_CAP
+# 09-16: CHATGPT PULLED (soft-capped again). Evidence, measured not assumed:
+#   - gateway 90 min: 18 sends / 0 responses / 16 'Webchat response is empty
+#     after 240s', plus 'fresh-chat open failed: Target crashed'.
+#   - its tab: ONE assistant row, 0 chars, composer empty - it generates
+#     nothing. Same soft-cap shape as 09-13.
+#   - engine side, only 4 greens in 90 min carried chatgpt's own edits; the
+#     rest it was credited with were greened by the landed-edit check while it
+#     merely held the step (see the yield-metric footgun in AGENTS.md).
+# Re-enable when the Free quota resets AND one real completion returns content.
+#         Lane("chatgpt", "http://127.0.0.1:8087/v1/chat/completions",
+#              ["chatgpt webchat"], 120, 420,
+#              prompt_cap=32000, timeout=420),  # 09-15 (Bob: the lane "is not
+#              # functioning correctly"): engine budget 300s against a gateway HARD_CAP
              # of 310s left a 10s margin, so on any thinking-heavy reply the ENGINE
              # timed out first ("chatgpt failed (timeout after 300s)") and the pool
              # then cooled the lane ("all models of this lane are cooled" x7), which
