@@ -57,6 +57,13 @@ _TRANSPORT_MARKERS = (
     # exactly that string — a lane that never answered is not a verdict about the
     # code, so those must retry, never terminate.
     "timeout after", "timed out",
+    # 09-16: a provider-side 401 "model not supported" is the same class as the 429
+    # above - the LANE could not be reached, so it says nothing about the code.
+    # Measured: 11 yellow steps sat at rounds=3 whose ONLY lane error was
+    # `http 401: oc/north-mini-code-free: auth — [401]: Model north-mini-code-free
+    # is not supported`, i.e. the whole round budget went on a model the provider had
+    # already withdrawn. Those steps never received a considered answer.
+    "http 401", "[401]", "is not supported (HTTP", "model is not supported",
 )
 
 
@@ -94,6 +101,27 @@ _BASE_ALREADY = (
     # fell through to PENDING.
     " satisfied (", " is satisfied", "satisfied (verified",
 )
+# 09-16: the list above only held PAST-tense forms, so 23 measured verdicts fell
+# through and were retired yellow although the lane had said the work was already
+# there. Counted across the live state, the phrasings the lanes actually used were:
+# already imports x3, already fully x2, already implements x2, already uses x2,
+# already validates/escalates/forwards/lists/starts x1 each, already exist,
+# already fixed/resolved/removed/replaced/complete, already been. A lane writing
+# "already imports numpy as np at line 13" is the SAME verdict as "already
+# implemented" - the config's `already_satisfied_action` is what decides the
+# outcome, and it never got the chance to run.
+#
+# Deliberately NOT a bare `already \w+`: "already tried", "already burned",
+# "already spent" and "already claimed" describe the ENGINE's attempts, not the
+# state of the code, and matching them would mint phantom greens.
+_ALREADY_VERB = re.compile(
+    # an adverb may sit between: measured "is already FULLY populated", "is already
+    # fully present in the current file" - both real verdicts the first form missed.
+    r"\balready\s+(?:fully\s+|completely\s+|already\s+)?(?:imports?|implements?|uses?|exists?|validates?|escalates?|"
+    r"forwards?|lists?|starts?|contains?|declares?|defines?|carries|populated|"
+    r"complete|fixed|resolved|removed|replaced|absent|present|"
+    r"been\s+(?:applied|implemented|fixed|added|updated|removed|changed|replaced))\b",
+    re.I)
 
 
 def is_already_satisfied(text: str) -> bool:
@@ -102,7 +130,9 @@ def is_already_satisfied(text: str) -> bool:
         return False
     extra = getattr(_ORCH_CFG, "already_satisfied_phrases", None) if _ORCH_CFG else None
     phrases = list(_BASE_ALREADY) + [str(x).lower() for x in (extra or [])]
-    return any(p in low for p in phrases)
+    if any(p in low for p in phrases):
+        return True
+    return bool(_ALREADY_VERB.search(low))
 
 # OpenRouter free pool (user key 09-05) — API-speed FREE lane; model "openrouter/free"
 # auto-routes to whatever :free model is available; (url, model, cool_base, cool_esc, auth)
@@ -275,7 +305,12 @@ def load_state() -> dict:
                 if not isinstance(_r, dict) or _r.get("status") != "yellow":
                     continue
                 _la = _r.get("last_apply") or {}
-                if _la.get("ok") and _applied_edits_landed(_r):
+                # 09-16: do NOT require _la["ok"]. Measured on P1B4R0F10#7:
+                # ok=False with "old_string not found (context changed)", yet the
+                # step's new_string IS on data_pipeline/bar_builder.py - the change
+                # landed by another route and the apply record never saw it succeed.
+                # _applied_edits_landed() is the real evidence: it READS the file.
+                if _la.get("edits") and _edits_content_on_disk(_r):
                     _r["status"] = "green"
                     _r["resolved_by"] = (
                         "yellow review: the step's edit is present on disk (verified "
@@ -301,13 +336,21 @@ def load_state() -> dict:
             for _k, _r in (st.get("steps") or {}).items():
                 if not isinstance(_r, dict) or _r.get("status") != "yellow":
                     continue
+                # 09-16: the marker records WHAT WAS FOUND, not merely that a check
+                # ran. Storing a bare True permanently blocked recovery: measured on
+                # P1B5R0F5#25 and P1B2R0F8#91 - both had their own fix(step) commit
+                # and both sat yellow, because a previous load had marked them checked
+                # before the commit existed and every later load skipped them.
+                # A stored commit means already recovered; an empty string means
+                # "check again next load", which is cheap and recovers the step the
+                # moment its commit lands.
                 if _r.get("_git_checked"):
                     continue
-                _r["_git_checked"] = True
                 _out = subprocess.run(
                     ["git", "-C", str(REPO), "log", "--oneline", "--all",
                      f"--grep=fix(step {_k})", "-1"],
                     capture_output=True, text=True, timeout=20)
+                _r["_git_checked"] = _out.stdout.strip()
                 if _out.stdout.strip():
                     _r["status"] = "green"
                     _r["resolved_by"] = (
@@ -352,8 +395,149 @@ def load_state() -> dict:
                       flush=True)
         except Exception as _e:
             print(f"[eng] yellow verdict pass skipped: {str(_e)[:120]}", flush=True)
+        # 09-16: a step whose EVERY target is RUNTIME STATE - the engine's own state
+        # file, Bob's inbox, a log, an artifacts manifest, .gitignore - is not work
+        # the plan can do. The engine cannot legitimately edit a file another process
+        # owns, and a landed edit there CLOBBERS it. Measured: the engine has already
+        # committed Bob's inbox 15 times and live_state.json 4, and a step rewrote
+        # .gitignore down to one rule, deleting the .env / *.token rules (302 paths
+        # left untracked-but-not-ignored = a broad `git add .` would have committed
+        # credentials). Retired at load, the one place every path passes, using the
+        # SAME all-targets rule as the 351 cross-repo steps: every target must be
+        # runtime state, so a step that also names real source is still workable.
+        try:
+            _o = 0
+            for _k, _r in (st.get("steps") or {}).items():
+                if not isinstance(_r, dict):
+                    continue
+                if _r.get("status") not in ("pending", "yellow", "executing"):
+                    continue
+                _fs = [str(_f).lstrip("./") for _f in (PLAN_FILES.get(_k) or []) if _f]
+                if not _fs or not all(_is_runtime_target(_f) for _f in _fs):
+                    continue
+                _r["status"] = "obsolete"
+                _r["obsolete_reason"] = (
+                    "every target file for this step is runtime state maintained by "
+                    "the engine or a monitor (" + ", ".join(_fs) + "), not source the "
+                    "plan authored. A lane cannot legitimately edit a file another "
+                    "process owns, and a landed edit there clobbers live state - this "
+                    "is the class that removed the .gitignore secret rules and has "
+                    "already committed Bob's inbox many times. Retired with the same "
+                    "all-targets rule as the cross-repo steps; no lane attempt lost.")
+                _o += 1
+            if _o:
+                print(f"[eng] retired {_o} step(s) whose every target is runtime state",
+                      flush=True)
+        except Exception as _e:
+            print(f"[eng] runtime-target retirement skipped: {str(_e)[:120]}", flush=True)
+        # 09-16: a yellow whose recorded lane verdict IS the already-satisfied
+        # verdict is finished work - orch.yaml sets already_satisfied_action=green,
+        # so the engine's own config says this is a green. The only reason these sat
+        # yellow is that the phrase list missed the phrasing the lane used (measured:
+        # 23 such verdicts, 0 matched). The detector is fixed; this pass re-applies
+        # it to the records that were already written.
+        # It lives at LOAD because an external flip does NOT stick - measured: 21
+        # recovered, then the engine wrote its in-memory copy back and all 21 were
+        # yellow again (green 7433 -> 7413).
+        try:
+            _as = 0
+            for _k, _r in (st.get("steps") or {}).items():
+                if not isinstance(_r, dict) or _r.get("status") != "yellow":
+                    continue
+                _said = str((_r.get("last_apply") or {}).get("lane_said") or "")
+                if not _said or not is_already_satisfied(_said):
+                    continue
+                _r["status"] = "green"
+                _r["resolved_by"] = (
+                    "already satisfied: the lane's own verdict is that the code "
+                    "already carries the fix (orch.yaml sets "
+                    "already_satisfied_action=green); recovered at load")
+                _r["yellow_watch_review"] = {
+                    "verdict": "recovered",
+                    "evidence": "lane verdict: the work is already present",
+                }
+                _as += 1
+            if _as:
+                print(f"[eng] recovered {_as} yellow step(s) whose lane verdict was "
+                      f"'already satisfied'", flush=True)
+        except Exception as _e:
+            print(f"[eng] already-satisfied recovery skipped: {str(_e)[:120]}", flush=True)
+        # 09-16: a step retired while its only lane error was a TRANSPORT condition
+        # never received a verdict about the code, so its round budget must not stand.
+        # Measured on the live state: 11 yellows at rounds=3 whose only error was
+        # `http 401: ... Model north-mini-code-free is not supported`. The engine's own
+        # doctrine is that a transport failure never consumes a round; those predate the
+        # marker being added, so recover them here. load_state() is the one place every
+        # path passes - an external flip is overwritten by the next save.
+        try:
+            _tr = 0
+            for _k, _r in (st.get("steps") or {}).items():
+                if not isinstance(_r, dict) or _r.get("status") != "yellow":
+                    continue
+                _err = str(_r.get("last_lane_error") or "")
+                if not _err or not is_transport_error(_err):
+                    continue
+                _r["status"] = "pending"
+                _r["rounds"] = 0
+                _r["requeued_reason"] = (
+                    "retired while the only lane error was a transport condition, so no "
+                    "lane ever gave a verdict about the code: " + _err[:160])
+                _r["yellow_watch_review"] = {
+                    "verdict": "recovered",
+                    "evidence": "transport-only lane error; the round budget was never validly spent",
+                }
+                _tr += 1
+            if _tr:
+                print(f"[eng] re-queued {_tr} step(s) whose only lane error was transport",
+                      flush=True)
+        except Exception as _e:
+            print(f"[eng] transport-requeue pass skipped: {str(_e)[:120]}", flush=True)
         return st
     return {"steps": {}}
+
+
+# 09-16: files a running process owns. A plan step naming ONLY these is unworkable:
+# the engine would be editing live state another process writes, and a landed edit
+# there destroys it. Kept as a plain list so it can be read and argued with.
+_RUNTIME_TARGETS = (
+    "audits_plans/cross_eval_state.json",
+    "audits_plans/claude_main_inbox.json",
+    "audits_plans/master_oculus_plan_8_10.md",
+    "claude_webchat_inbox.json",
+    "claude_main_inbox.json",
+    "live/live_state.json",
+    "artifacts/pre_verify_manifest.json",
+    "scratch/sot_shared_state_desync_analysis.json",
+    "truth_logs/run_manifest.json",
+    "logs/metrics_1786158813.json",
+    ".gitignore",
+)
+_RUNTIME_PREFIXES = ("logs/", "truth_logs/", "audit_logs/", "artifacts/",
+                     "graphify-out/", "alt_data_quarantine/")
+
+
+def _git_has_step_commit(sid: str) -> bool:
+    """Does this step have its own fix(step <sid>) commit? The same grep
+    green_truth_watch.step_committed() makes, so a green kept on this evidence
+    can never be a phantom."""
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(REPO), "log", "--oneline", "--all",
+             f"--grep=fix(step {sid})", "-1"],
+            capture_output=True, text=True, timeout=20)
+        return bool(out.stdout.strip())
+    except Exception:
+        return False
+
+
+def _is_runtime_target(path: str) -> bool:
+    """True when a path is runtime state a live process owns, not authored source."""
+    p = str(path or "").lstrip("./")
+    if p in _RUNTIME_TARGETS:
+        return True
+    if p.endswith(".log") or p.endswith(".bak-orch"):
+        return True
+    return p.startswith(_RUNTIME_PREFIXES)
 
 
 def yellow_justification_detail(sid: str, rec: dict) -> str:
@@ -1089,6 +1273,41 @@ def _all_noop(edits: list) -> bool:
     return True
 
 
+def _edits_content_on_disk(rec: dict) -> bool:
+    """True when the step's recorded new_string is READ off the target file.
+
+    Same evidence green_truth_watch.edits_present() uses. Deliberately does NOT
+    require last_apply.ok: an apply that reported "old_string not found (context
+    changed)" can still be satisfied because the change landed by another route
+    (measured: P1B4R0F10#7 - new_string 'volume=volume' is on
+    data_pipeline/bar_builder.py while its apply recorded ok=False).
+    """
+    edits = ((rec.get("last_apply") or {}).get("edits")) or []
+    if not edits:
+        return False
+    hit = 0
+    for e in edits:
+        f = str(e.get("file") or e.get("path") or e.get("filePath") or "")
+        new = e.get("new_string")
+        if new is None:
+            new = e.get("newStr")
+        if not f or new is None or not str(new):
+            return False
+        if not in_repo(f):
+            return False
+        path = REPO / f.lstrip("/")
+        if not path.exists():
+            return False
+        try:
+            body = path.read_text(errors="ignore")
+        except Exception:
+            return False
+        if str(new) not in body:
+            return False
+        hit += 1
+    return hit > 0
+
+
 def _applied_edits_landed(rec: dict) -> bool:
     """True when the step's last apply is real AND its result is on disk.
 
@@ -1133,6 +1352,63 @@ def _applied_edits_landed(rec: dict) -> bool:
 
 PLAN_TITLES = {}
 
+def _resolve_plan_path(rel: str) -> str:
+    """Point a plan path at the file that is actually there.
+
+    09-16: the plan typed `pre-commit-config.yaml` for 15 steps; the repo's file is
+    `.pre-commit-config.yaml`. Nothing resolved it, so every one of those steps was
+    handed no file content and answered cannot-fix forever. Only a leading dot is
+    tried, and only when the literal path does NOT exist - so a real path is never
+    rewritten and a missing file stays missing (it is not invented).
+    """
+    r = str(rel or "").lstrip("./")
+    if not r:
+        return r
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if os.path.exists(os.path.join(root, r)):
+        return r
+    head, tail = os.path.split(r)
+    dotted = os.path.join(head, "." + tail) if head else "." + tail
+    if os.path.exists(os.path.join(root, dotted)):
+        return dotted
+    # 09-16: the same class of typo, one step further - the plan (and the lanes)
+    # also write `core/init.py` for `core/__init__.py`. Unresolved, those steps are
+    # handed NO file content and answer cannot-fix forever.
+    stem, ext = os.path.splitext(tail)
+    if ext and not stem.startswith("__"):
+        dunder = os.path.join(head, "__" + stem + "__" + ext)
+        if os.path.exists(os.path.join(root, dunder)):
+            return dunder
+    return r
+
+
+def _resolve_dunder_path(f: str) -> str:
+    """Point a dunder-stripped lane path at the file that is really there.
+
+    09-16: lanes return `oculus/reporting/init.py` when they mean
+    `oculus/reporting/__init__.py` - the double underscores are lost in the reply.
+    Measured on gemini, dahl AND chatgpt, so it is not one lane's quirk. The apply
+    then died with `read fail: [Errno 2] .../init.py`; 32 steps in the live state
+    carry such a path. Worse, when old_string was empty the CREATE branch wrote a
+    JUNK TWIN beside the real module - measured `core/init.py` (5 bytes: `pass`)
+    next to `core/__init__.py`, and `scratch/init.py`, both since committed.
+
+    Only the stripped -> dunder direction is tried, and only when the literal path
+    does NOT exist, so a real path is never rewritten and a missing file stays
+    missing (it is not invented).
+    """
+    r = str(f or "").lstrip("/")
+    if not r or (REPO / r).exists():
+        return f
+    head, tail = os.path.split(r)
+    stem, ext = os.path.splitext(tail)
+    if not ext or stem.startswith("__"):
+        return f
+    cand = os.path.join(head, "__" + stem + "__" + ext)
+    if (REPO / cand).exists():
+        return cand
+    return f
+
 
 def _load_plan_files() -> dict:
     """sid -> the step's target files, straight from the plan on disk."""
@@ -1154,7 +1430,8 @@ def _load_plan_files() -> dict:
                 if not sid:
                     continue
                 if f:
-                    out[sid] = [str(x) for x in (f if isinstance(f, list) else [f]) if x]
+                    _fs = [str(x) for x in (f if isinstance(f, list) else [f]) if x]
+                    out[sid] = [_resolve_plan_path(x) for x in _fs]
                 _t = str(stp.get("title") or "").strip()
                 if _t:
                     PLAN_TITLES[sid] = " ".join(_t.split())
@@ -1300,6 +1577,13 @@ def apply_edits(edits: list) -> tuple:
             results.append({"file": f, "ok": False,
                             "msg": "refused: target outside repo_dir"})
             continue
+        # 09-16: a lane that writes `init.py` for `__init__.py` must not lose the
+        # edit AND must not spawn a junk twin - retarget it at the real file.
+        _f2 = _resolve_dunder_path(f)
+        if _f2 != f:
+            print(f"[eng] dunder path {f} -> {_f2} "
+                  f"(lane stripped the underscores)", flush=True)
+            f = _f2
         path = REPO / f.lstrip("/")
         # CREATE: absent file + empty old_string -> write new_string as full content
         if not path.exists() and old == "" and new:
