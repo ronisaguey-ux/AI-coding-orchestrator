@@ -273,6 +273,11 @@ def yellow_justification_detail(sid: str, rec: dict) -> str:
     files = [str(e.get("file") or e.get("filePath") or "").strip()
              for e in (la.get("edits") or []) if isinstance(e, dict)]
     files = [f for f in files if f] or [str(x) for x in (rec.get("files") or []) if x]
+    if not files:
+        # The record lost the target (an unapplied edit carries no `file`). The
+        # plan is the authority for what the step is about - measured: 77 yellows
+        # read "Target file(s): not recorded", which is not a justification.
+        files = PLAN_FILES.get(sid) or []
     tried = la.get("tried_lanes") or ([la.get("lane")] if la.get("lane") else [])
     old = str(rec.get("yellow_reason") or rec.get("resolved_by") or "").strip()
     rounds = rec.get("rounds", "?")
@@ -1020,6 +1025,33 @@ def _applied_edits_landed(rec: dict) -> bool:
                 landed += 1
     return landed == len(edits)
 
+
+def _load_plan_files() -> dict:
+    """sid -> the step's target files, straight from the plan on disk."""
+    out = {}
+    try:
+        for cand in (os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  "..", "..", "audits_plans", "oculus_cross_eval_plan_9_4_fixed.json"),):
+            if not os.path.exists(cand):
+                continue
+            data = json.load(open(cand))
+            steps = data.get("steps") if isinstance(data, dict) else data
+            if isinstance(steps, dict):
+                steps = list(steps.values())
+            for stp in steps or []:
+                if not isinstance(stp, dict):
+                    continue
+                sid = stp.get("finding_id") or stp.get("sid") or stp.get("id")
+                f = stp.get("files") or stp.get("file")
+                if sid and f:
+                    out[sid] = [str(x) for x in (f if isinstance(f, list) else [f]) if x]
+            break
+    except Exception:
+        pass
+    return out
+
+
+PLAN_FILES = _load_plan_files()
 
 MAX_YELLOW_REASON = int(os.environ.get("ORCH_MAX_YELLOW_REASON", "2000"))
 
