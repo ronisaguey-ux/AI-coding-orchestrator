@@ -1553,7 +1553,8 @@ async def run_step(session, step: dict, st: dict) -> dict:
                 escalate(sid, rec,
                          f"cannot-fix verdict on {rec['rounds']} separate attempts "
                          f"(cap {MAX_ROUNDS}), tried by {', '.join(_tried)}. "
-                         f"Target file(s): {', '.join(rec.get('files') or []) or 'not recorded'}. "
+                         f"Target file(s): "
+                         f"{', '.join(rec.get('files') or PLAN_FILES.get(sid) or []) or 'unknown (the plan names no file)'}. "
                          f"The lane that gave up LAST ({res.lane}) said, in its own "
                          f"words: {_said or '(no explanation given - see lane log)'}. "
                          f"Nothing was edited on any attempt, so no lane would touch "
