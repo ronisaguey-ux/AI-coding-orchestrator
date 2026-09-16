@@ -54,12 +54,31 @@ class BatchStalled(RuntimeError):
     """The batch barrier would never lift: fail loudly instead of hanging."""
 
 
+# 09-16 (owner): "get rid of the cannot fix justification as a yellow, it needs
+# to give a detailed justification not just a vague 'cannot fix' excuse". A bare
+# excuse is not a reason, so it is refused where a yellow is actually born - the
+# one place every caller passes through.
+_VAGUE_JUSTIFICATION = re.compile(
+    r"^\s*(?:lane\s+)?(?:returned\s+)?cannot[\s-]?fix\b[\s.:!-]*$"
+    r"|^\s*no\s+edits?\s+(?:were\s+)?(?:emitted|produced)[\s.:!-]*$"
+    r"|^\s*(?:the\s+)?(?:lane|model)\s+(?:could\s+not|couldn't)\s+fix\s+it[\s.:!-]*$"
+    r"|^\s*cannot\s+fix\s+this[\s.:!-]*$"
+    r"|^\s*(?:no|nothing)\s+(?:edit|change)\s+(?:was\s+)?made[\s.:!-]*$",
+    re.I)
+
+
 def validate_justification(text: str) -> str:
+    """A yellow is a terminal PASS, so its justification must say WHY in substance."""
     j = (text or "").strip()
     if len(j) < MIN_YELLOW_JUSTIFICATION:
         raise YellowJustificationError(
             "code yellow needs a justification of at least "
             f"{MIN_YELLOW_JUSTIFICATION} chars, got {len(j)}: {j[:80]!r}")
+    if _VAGUE_JUSTIFICATION.match(j):
+        raise YellowJustificationError(
+            "code yellow justification is a vague excuse, not a reason - it must "
+            "carry the lane's actual explanation and what was attempted: "
+            f"{j[:120]!r}")
     return j
 
 
