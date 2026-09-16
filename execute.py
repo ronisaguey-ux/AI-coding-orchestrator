@@ -325,6 +325,46 @@ def load_state() -> dict:
                       flush=True)
         except Exception as _e:
             print(f"[eng] on-disk yellow recovery skipped: {str(_e)[:120]}", flush=True)
+        # 09-16: a yellow whose apply died on a DUNDER-STRIPPED path is not finished
+        # work and not a broken step - it is a step that never got its turn. The
+        # lane returned `oculus/runtime/init.py` for `oculus/runtime/__init__.py`,
+        # the apply hit ENOENT, the rounds burned and the step retired yellow. Now
+        # that _resolve_dunder_path() retargets it, the edit lands - so re-queue it
+        # as PENDING (never green: nothing has been applied yet). Evidence, not a
+        # guess: the old_string must be ON DISK in the file the resolver points at.
+        try:
+            _q = 0
+            for _k, _r in (st.get("steps") or {}).items():
+                if not isinstance(_r, dict) or _r.get("status") != "yellow":
+                    continue
+                _la = _r.get("last_apply") or {}
+                _miss = re.search(r"No such file or directory: '([^']+)'",
+                                  str(_la.get("apply_msg") or ""))
+                if not _miss:
+                    continue
+                _rel = _miss.group(1).replace(str(REPO) + os.sep, "", 1)
+                _fix = _resolve_dunder_path(_rel)
+                if _fix == _rel:
+                    continue
+                _real = Path(REPO) / _fix
+                if not _real.exists():
+                    continue
+                _txt = _real.read_text(errors="ignore")
+                _eds = [e for e in (_la.get("edits") or []) if e.get("old_string")]
+                if not _eds or not all(e["old_string"] in _txt for e in _eds):
+                    continue
+                _r["status"] = "pending"
+                _r["rounds"] = 0
+                _r["requeued_reason"] = (
+                    "apply died on a dunder-stripped path (%s); it resolves to %s "
+                    "and the edit's old_string is on disk, so the step gets its turn"
+                    % (_rel, _fix))
+                _q += 1
+            if _q:
+                print(f"[eng] re-queued {_q} yellow step(s) whose apply died on a "
+                      f"dunder-stripped path", flush=True)
+        except Exception as _e:
+            print(f"[eng] dunder re-queue skipped: {str(_e)[:120]}", flush=True)
         # 09-16: the second recovery rule - a yellow whose OWN fix(step <sid>)
         # commit exists is finished work too. Doing this from an external script
         # does NOT stick (the engine writes its in-memory yellow back), and it
