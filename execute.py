@@ -227,8 +227,74 @@ def load_state() -> dict:
             if _n:
                 print(f"[eng] normalised {_n} legacy 'escalated' step(s) -> pending "
                       f"at load (escalations are disabled)", flush=True)
+        # 09-16 (owner): "get rid of the cannot fix justification as a yellow,
+        # it needs to give a detailed justification not just a vague 'cannot fix'
+        # excuse." Rebuild a vague yellow's reason from the evidence the record
+        # already holds, at LOAD time - the one place every path passes. Doing it
+        # as a one-off state edit does not stick: the engine holds its own copy
+        # from before the edit and writes the old reason straight back (measured:
+        # 119 backfilled, 0 survived the next save).
+        try:
+            _b = 0
+            for _k, _r in (st.get("steps") or {}).items():
+                if not isinstance(_r, dict) or _r.get("status") != "yellow":
+                    continue
+                _j = str(_r.get("yellow_reason") or "")
+                if len(_j) >= 160 and "own words" in _j:
+                    continue          # already detailed, leave it alone
+                _new = yellow_justification_detail(_k, _r)
+                if _new:
+                    _r["yellow_reason"] = _new
+                    _r["yellow_reason_source"] = "rebuilt from the record at load (09-16)"
+                    _b += 1
+            if _b:
+                print(f"[eng] rebuilt {_b} vague yellow justification(s) from the "
+                      f"step records at load", flush=True)
+        except Exception as _e:
+            print(f"[eng] yellow justification rebuild skipped: {str(_e)[:120]}", flush=True)
         return st
     return {"steps": {}}
+
+
+def yellow_justification_detail(sid: str, rec: dict) -> str:
+    """Say WHY in substance: the attempts, the lanes, the files, the lane's words.
+
+    Owner 09-16. The engine had the evidence and discarded it, so a yellow read
+    as an excuse. Everything here comes from the record itself - it is a
+    re-statement, never an invention.
+    """
+    la = rec.get("last_apply") or {}
+    said = str(la.get("lane_said") or "").strip()
+    files = [str(e.get("file") or e.get("filePath") or "").strip()
+             for e in (la.get("edits") or []) if isinstance(e, dict)]
+    files = [f for f in files if f] or [str(x) for x in (rec.get("files") or []) if x]
+    tried = la.get("tried_lanes") or ([la.get("lane")] if la.get("lane") else [])
+    old = str(rec.get("yellow_reason") or rec.get("resolved_by") or "").strip()
+    rounds = rec.get("rounds", "?")
+    if "cannot-fix" in old.lower():
+        head = (f"cannot-fix verdict after {rounds} separate attempt(s) (cap "
+                f"{MAX_ROUNDS}) by {', '.join(tried) or 'an unnamed lane'}")
+    elif not la:
+        head = (f"no lane ever produced an attempt for this step (rounds={rounds})")
+    else:
+        head = (f"round budget spent ({rounds} rounds, cap {MAX_ROUNDS}) without an "
+                f"edit landing")
+    parts = [head + ".",
+             f"Target file(s): {', '.join(files) or 'not recorded'}."]
+    if said:
+        parts.append(f"The lane's own words: {said}")
+    elif la.get("apply_msg"):
+        parts.append(f"The last apply reported: {str(la.get('apply_msg'))[:300]!r}.")
+    elif old:
+        parts.append(f"Recorded reason: {old}")
+    if la.get("ok") is False:
+        parts.append("No attempt applied an edit.")
+    out = " ".join(parts).strip()
+    if len(out) < 40:
+        return ""
+    if out == old:
+        return ""
+    return out
 
 
 def save_state(st: dict) -> None:
