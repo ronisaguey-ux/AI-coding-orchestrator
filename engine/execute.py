@@ -240,8 +240,13 @@ def load_state() -> dict:
                 if not isinstance(_r, dict) or _r.get("status") != "yellow":
                     continue
                 _j = str(_r.get("yellow_reason") or "")
-                if len(_j) >= 160 and "own words" in _j:
-                    continue          # already detailed, leave it alone
+                # Skip only a reason that is BOTH detailed and complete. A reason
+                # the old 300-char clip cut mid-sentence ("...in the ") has to be
+                # rebuilt even though it is long - measured: one yellow sat at
+                # exactly 300 chars, truncated, and the length test passed it.
+                if (len(_j) >= 160 and "own words" in _j
+                        and _j.rstrip()[-1:] in ".!?)]" and len(_j) != 300):
+                    continue          # already detailed and whole, leave it alone
                 _new = yellow_justification_detail(_k, _r)
                 if _new:
                     _r["yellow_reason"] = _new
@@ -1065,7 +1070,11 @@ def _lane_said(content: str, sid: str = "", limit: int = 700) -> str:
     # Cut at the NEXT step's verdict so this step carries only its own reason.
     t = re.split(r"\s*;\s*cannot[\s-]?fix", t, maxsplit=1)[0]
     t = re.split(r"\s*cannot[\s-]?fix\s*:", t, maxsplit=1)[0]
-    return t.strip()[:limit]
+    # The reply is raw JSON, so the extracted passage can still carry its closing
+    # scaffolding - measured: "... any fabricated anchor would fail."} - and a
+    # justification that ends in '"} reads as machine noise, not a reason.
+    t = re.sub(r'["\s}\]\\]+$', "", t).strip()
+    return t[:limit]
 
 
 def _capture_landed(rec: dict) -> None:
