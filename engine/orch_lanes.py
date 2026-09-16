@@ -433,9 +433,16 @@ def default_lanes(cfg=None) -> list[Lane]:
         # same chrome, with its OWN WEBCHAT_ACCOUNT so the two do not share the
         # send lock and genuinely run in parallel. Verified live: gw2 answered
         # "PONG" while gw1 was mid-send.
-        Lane("gemini2", "http://127.0.0.1:8089/v1/chat/completions",
-             ["gemini 3.7 flash webchat 2"], 300, 900,
-             prompt_cap=12000, timeout=720),  # gemini gw HARD_CAP is UNSET -> auto-derives 720s; 330s guillotined slow-but-healthy replies (Bob: let gemini cook)  # 09-14: 2500 -> 12000. Bob: "the messages aren't even
+# 09-16: GEMINI2 PULLED. It is now pinned to its own CDP target (TAB_ID) so the
+# two gateways no longer fight over one composer, and it STILL does not send:
+# measured 3 sends / 0 received in 40 min, and a hand-driven 24-char "PONG"
+# probe sat on "prompt still in composer after the click" for 190s+ with no
+# answer. Both tabs are the SAME google account and Gemini serializes an
+# account, so the second lane just burns a hop on a send that never commits.
+# Re-enable only after a hand-driven send on its own tab returns real content.
+#         Lane("gemini2", "http://127.0.0.1:8089/v1/chat/completions",
+#              ["gemini 3.7 flash webchat 2"], 300, 900,
+#              prompt_cap=12000, timeout=720),  # gemini gw HARD_CAP is UNSET -> auto-derives 720s; 330s guillotined slow-but-healthy replies (Bob: let gemini cook)  # 09-14: 2500 -> 12000. Bob: "the messages aren't even
         # 09-15: FREEBUFF PULLED. Proven unusable as a lane, not a budget problem:
         #   the gateway log shows "freebuff reasoning effort -> Low", the prompt sent,
         #   then 9m21s later "send timed out" with the tab never producing an answer.
