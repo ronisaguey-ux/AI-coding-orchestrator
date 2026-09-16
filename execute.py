@@ -950,6 +950,37 @@ def _applied_edits_landed(rec: dict) -> bool:
     return landed == len(edits)
 
 
+def _lane_said(content: str, sid: str = "", limit: int = 700) -> str:
+    """The lane's OWN words about this step, kept instead of thrown away.
+
+    09-16 (owner): "get rid of the cannot fix justification as a yellow, it needs
+    to give a detailed justification not just a vague 'cannot fix' excuse". Lanes
+    DO explain themselves - measured on /tmp/lane_empty_debug.jsonl:
+      "cannot-fix:P1B6R0F0#11: Atomic writes already implemented in save_state
+       using tempfile.mkstemp and os.replace; ..."
+    The engine kept the words "lane returned cannot-fix" and threw the evidence
+    away, so a yellow read as an excuse and nobody could tell whether the step was
+    genuinely impossible or the lane was just lazy. A yellow is a terminal PASS:
+    its justification has to carry the reason.
+    """
+    t = " ".join(str(content or "").split())
+    if not t:
+        return ""
+    low = t.lower()
+    for key in (f"cannot-fix:{sid.lower()}", f"cannot fix:{sid.lower()}"):
+        if key in low:
+            t = t[low.index(key) + len(key):].lstrip(": -\u2013\u2014").strip()
+            break
+    else:
+        m = re.search(r"cannot[\s-]?fix", low)
+        if m:
+            t = t[m.end():].lstrip(": -\u2013\u2014").strip()
+    # Cut at the NEXT step's verdict so this step carries only its own reason.
+    t = re.split(r"\s*;\s*cannot[\s-]?fix", t, maxsplit=1)[0]
+    t = re.split(r"\s*cannot[\s-]?fix\s*:", t, maxsplit=1)[0]
+    return t.strip()[:limit]
+
+
 def _capture_landed(rec: dict) -> None:
     """Stamp the step, AT APPLY TIME, that its edit is on disk.
 
@@ -1206,6 +1237,15 @@ async def run_step(session, step: dict, st: dict) -> dict:
         # looked at the step. An attempt means a lane actually ran: a named lane, or
         # an edit that applied, or a reason that was recorded.
         _has_lane = bool(str(_la.get("lane") or "").strip())
+        _la_files = [str(e.get("file") or e.get("filePath") or "").strip()
+                     for e in (_la.get("edits") or []) if isinstance(e, dict)]
+        _la_files = [f for f in _la_files if f]
+        # The lane's own explanation, kept from the apply record. Without this the
+        # yellow reads as "the lane ran and nothing landed", which is not a reason
+        # (owner 09-16: no vague justifications).
+        _la_said = str(_la.get("lane_said") or "").strip()
+        _NO_EXPLANATION = ("(no explanation recorded - the lane's reply is in the "
+                           "step log)")
         _has_edits = bool(_la.get("edits")) or bool(str(_la.get("apply_msg") or "").strip())
         _tried = bool(_la) and (_has_lane or _has_edits) and not is_transport_error(_le)
         if _tried and _applied_edits_landed(rec):
@@ -1244,7 +1284,12 @@ async def run_step(session, step: dict, st: dict) -> dict:
         _r = rec.get("rounds", 0)
         escalate(sid, rec,
                  f"round budget already spent (rounds={_r}, cap {MAX_ROUNDS}); "
-                 f"a lane ran and its answer did not land an edit this pass",
+                 f"a lane ran and its answer did not land an edit this pass. "
+                 f"Target file(s): {', '.join(_la_files) or ', '.join(files) or 'not recorded'}. "
+                 f"The last lane to answer ({_la.get('lane') or 'unknown'}) said, in "
+                 f"its own words: {_la_said or _NO_EXPLANATION}. "
+                 f"Last apply ok={_la.get('ok')} "
+                 f"msg={str(_la.get('apply_msg'))[:160]!r}",
                  site="run_step:pre_loop_max_rounds")
         if rec["status"] not in ("escalated", "yellow"):
             await save_state_serialized(st)
@@ -1341,9 +1386,15 @@ async def run_step(session, step: dict, st: dict) -> dict:
                 # the remaining lanes and only let the verdict kill the step
                 # once it has survived the full round budget.
                 rec["rounds"] = rnd + 1
+                _tried = rec.setdefault("tried_lanes", [])
+                if res.lane not in _tried:
+                    _tried.append(res.lane)
+                _said = _lane_said(res.content, sid)
                 rec["last_apply"] = {"rnd": rnd + 1, "ok": False, "edits": [],
                                      "apply_msg": "lane returned cannot-fix",
-                                     "lane": res.lane}
+                                     "lane": res.lane,
+                                     "lane_said": _said,
+                                     "tried_lanes": list(_tried)}
                 if rec["rounds"] < MAX_ROUNDS:
                     rec["status"] = "pending"
                     rec["last_apply"]["verify"] = (
@@ -1353,8 +1404,13 @@ async def run_step(session, step: dict, st: dict) -> dict:
                           f"(round {rec['rounds']}/{MAX_ROUNDS}, not yet terminal)", flush=True)
                     return rec
                 escalate(sid, rec,
-                         f"lane verdict cannot-fix, corroborated across "
-                         f"{rec['rounds']}/{MAX_ROUNDS} rounds (last lane: {res.lane})",
+                         f"cannot-fix verdict on {rec['rounds']} separate attempts "
+                         f"(cap {MAX_ROUNDS}), tried by {', '.join(_tried)}. "
+                         f"Target file(s): {', '.join(rec.get('files') or []) or 'not recorded'}. "
+                         f"The lane that gave up LAST ({res.lane}) said, in its own "
+                         f"words: {_said or '(no explanation given - see lane log)'}. "
+                         f"Nothing was edited on any attempt, so no lane would touch "
+                         f"this step.",
                          site="run_step:cannot_fix",
                          verify="escalated: lane verdict cannot-fix")
                 if rec["status"] not in ("escalated", "yellow"):
