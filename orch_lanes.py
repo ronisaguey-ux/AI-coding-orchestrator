@@ -437,9 +437,16 @@ def default_lanes(cfg=None) -> list[Lane]:
 #   - Same signature as gemini2 and NoteGPT: the click reaches the node and
 #     nothing submits. Not a budget problem and not a login problem.
 # Re-enable only after a hand-driven send in that tab returns real content.
-#         Lane("gemini", "http://127.0.0.1:8085/v1/chat/completions",
-#              ["gemini 3.7 flash webchat"], 300, 900,
-#              prompt_cap=12000, timeout=720),
+        # 09-16: prompt_cap 12000 -> 32000. Measured from gemini's own replies in
+        # /tmp/lane_empty_debug.jsonl, every one of them is a cannot-fix that names
+        # the SAME cause: "file content truncated beyond line 38", "not present in
+        # provided file chunks", "chunk is truncated ... beyond the visible window".
+        # The lane is not refusing the work - it cannot SEE the file. It answers and
+        # gets cooled, and 11 claims produced 0 greens. Every lane that earns greens
+        # sits at 24000-32000; gemini was the only one still at 12000.
+        Lane("gemini", "http://127.0.0.1:8085/v1/chat/completions",
+             ["gemini 3.7 flash webchat"], 300, 900,
+             prompt_cap=32000, timeout=720),
         # 09-15: re-enabled after I parked it on a WRONG attribution. gw1 and gw2 share
         # one chrome, but the CDP churn is gw1's OWN behaviour - measured 50 reconnect
         # events / 4 min with gw2 stopped vs 52 with it running. Sharing is not the
