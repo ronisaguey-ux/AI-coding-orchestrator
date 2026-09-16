@@ -294,7 +294,17 @@ def yellow_justification_detail(sid: str, rec: dict) -> str:
     if said:
         parts.append(f"The lane's own words: {said}")
     elif la.get("apply_msg"):
-        parts.append(f"The last apply reported: {str(la.get('apply_msg'))[:300]!r}.")
+        _am = str(la.get("apply_msg"))
+        if "cannot-fix" in _am.lower():
+            # "the lane returned cannot-fix" is the exact vague excuse the owner
+            # rejected. Say what the step NEEDED instead - that is evidence.
+            _t = PLAN_TITLES.get(sid, "")
+            parts.append(
+                "No lane produced an edit and none left a written reason; the "
+                + (f"step requires: {_t}. " if _t else "step's text is in the plan. ")
+                + f"Recorded apply result: {_am!r}.")
+        else:
+            parts.append(f"The last apply reported: {_am[:300]!r}.")
     elif old:
         parts.append(f"Recorded reason: {old}")
     if la.get("ok") is False:
@@ -1026,6 +1036,9 @@ def _applied_edits_landed(rec: dict) -> bool:
     return landed == len(edits)
 
 
+PLAN_TITLES = {}
+
+
 def _load_plan_files() -> dict:
     """sid -> the step's target files, straight from the plan on disk."""
     out = {}
@@ -1043,14 +1056,20 @@ def _load_plan_files() -> dict:
                     continue
                 sid = stp.get("finding_id") or stp.get("sid") or stp.get("id")
                 f = stp.get("files") or stp.get("file")
-                if sid and f:
+                if not sid:
+                    continue
+                if f:
                     out[sid] = [str(x) for x in (f if isinstance(f, list) else [f]) if x]
+                _t = str(stp.get("title") or "").strip()
+                if _t:
+                    PLAN_TITLES[sid] = " ".join(_t.split())
             break
     except Exception:
         pass
     return out
 
 
+PLAN_TITLES = {}
 PLAN_FILES = _load_plan_files()
 
 MAX_YELLOW_REASON = int(os.environ.get("ORCH_MAX_YELLOW_REASON", "2000"))
