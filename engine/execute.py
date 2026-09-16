@@ -1476,6 +1476,7 @@ async def run_step(session, step: dict, st: dict) -> dict:
                              "apply_msg": msg, "lane": res.lane,
                              "verify": ("already satisfied (no-op edit)"
                                         if ok and _all_noop(edits) else None)}
+        _capture_landed(rec)
         if ok and _all_noop(edits):
             # The lane changed nothing because nothing needed changing. Say so in
             # the field green_truth_watch reads, or it condemns this as a phantom
@@ -1542,6 +1543,7 @@ async def run_step(session, step: dict, st: dict) -> dict:
                      f"{ctx}\n")
         rec["last_apply"] = {"rnd": rnd + 1, "ok": okay2, "edits": new_edits,
                              "apply_msg": msg2, "lane": res.lane}
+        _capture_landed(rec)
     # 09-14 (worker, B1): THIS was the silent killer. The round loop fell out
     # here and set `escalated` with no reason at all — 108 of the 155 no-reason
     # escalations sat at rounds==3 with last_apply.ok=true and real edits. Record
@@ -1687,6 +1689,7 @@ async def escalate_final(session, sid: str, st: dict, lane: str | None = None) -
             rec["last_apply"] = {"rnd": rec.get("rounds", 0) + 1, "ok": ok,
                                  "edits": edits, "apply_msg": msg, "lane": res.lane,
                                  "verify": "green: escalation persona applied the fix"}
+            _capture_landed(rec)
             if not ok:
                 print(f"[esc] {sid}: persona edits failed to apply ({msg[:90]})", flush=True)
                 return "escalated"
