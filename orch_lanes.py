@@ -420,9 +420,18 @@ def default_lanes(cfg=None) -> list[Lane]:
         # engine prompt (row empty + aria-busy the whole time, then it fills with a
         # real edit contract). A 420s budget guillotined it 60s short. Chain is
         # grace 400s < this 600s < gateway TIMEOUT 650s.
-        Lane("chatgpt", "http://127.0.0.1:8087/v1/chat/completions",
-             ["chatgpt webchat"], 120, 420,
-             prompt_cap=32000, timeout=600),
+        # 09-17 PULLED (latency, NOT a broken lane - Bob was right that it works):
+        # ChatGPT needs ~360s per generation and exposes no stop control, which is
+        # genuinely fine for a human. It is NOT fine for the pool: measured, the
+        # engine ended up with ALL SIX worker connections parked on :8087
+        # (ss: 6x ESTAB to 8087, cpu 00:00:05 over 465s, wchan=ep_poll) and
+        # logged nothing for 3+ minutes - 0 commits in 8. A 6-minute lane that
+        # the pool can pick freely is a wedge, not a worker.
+        # Re-enable only with a way to stop the pool piling onto it (e.g. a
+        # concurrency cap of 1), never on a latency change alone.
+        # Lane("chatgpt", "http://127.0.0.1:8087/v1/chat/completions",
+        # ["chatgpt webchat"], 120, 420,
+        # prompt_cap=32000, timeout=600),
 #              # functioning correctly"): engine budget 300s against a gateway HARD_CAP
              # of 310s left a 10s margin, so on any thinking-heavy reply the ENGINE
              # timed out first ("chatgpt failed (timeout after 300s)") and the pool
