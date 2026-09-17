@@ -1110,6 +1110,27 @@ def escalate(sid: str, rec: dict, reason: str, *, site: str,
     rec["yellow_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
     rec["yellow_by"] = site
     rec["escalated_reason"] = _clip_reason(reason)   # keep the old key readable
+    # 09-17: stamp the review verdict AT BIRTH. It used to be written only by the load-time
+    # pass, so a yellow created between two loads carried none and the watch's "unreviewed"
+    # number climbed until the next restart (measured: 34 in one pass, 4 five minutes after a
+    # restart). The verdict states evidence the retire path already holds - a re-statement,
+    # never an invention. Existing records are untouched.
+    if not rec.get("yellow_watch_review"):
+        _la = rec.get("last_apply") or {}
+        _m = str(_la.get("apply_msg") or "")
+        if "cannot-fix" in _m:
+            _why = "the lane looked and reported cannot-fix; no edit to check against disk"
+        elif "syntax break" in _m:
+            _why = ("the lane's own edit failed the syntax guard (%s)" % _m[:80])
+        elif "old_string not found" in _m:
+            _why = ("the lane's old_string is not on disk and the target is inside the "
+                    "24000-char window, so the lane DID see the file - a stale quote")
+        elif not _la:
+            _why = "no apply was ever recorded for this step"
+        else:
+            _why = "apply recorded: %s" % (_m[:100] or "no message")
+        rec["yellow_watch_review"] = {"verdict": "checked, not recoverable",
+                                      "evidence": _why}
     if verify is not None:
         la = rec.setdefault("last_apply", {})
         if isinstance(la, dict):
