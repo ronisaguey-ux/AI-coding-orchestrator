@@ -251,8 +251,17 @@ def default_lanes(cfg=None) -> list[Lane]:
              # keyword — `prompt_cap` sits before it in the dataclass, so the
              # positional form silently bound the API key to prompt_cap and
              # left auth="" → the lane was dropped by the `or ln.auth` filter.
-        Lane("deepseek", "http://127.0.0.1:8080/v1/chat/completions",
-             ["anymodel"], 90, 270, prompt_cap=32000, timeout=270),
+        # 09-16: PARKED - both accounts are under DeepSeek's "Messages too frequent"
+        # throttle, verified by reading the PAGE over CDP (:9229 and :9225 both report
+        # tooFrequent=true while :9227 reads false), and neither produces a reply at
+        # all: :9225's last row is the engine's own 10,831-char prompt, never answered.
+        # Measured cost of leaving them in: 4 and 3 draws in 15 min, ZERO responses,
+        # every draw burning up to the 330s hard cap, and the lane cooldown (120s) kept
+        # letting them straight back in. A lane that claims work and produces nothing is
+        # worse than an absent lane. Re-enable when the throttle lifts (the page's
+        # last row is a normal watermark again and a token send returns).
+        # Lane("deepseek", "http://127.0.0.1:8080/v1/chat/completions",
+        #      ["anymodel"], 90, 270, prompt_cap=32000, timeout=270),
         # 09-12 (owner): two more signed-in deepseek webchats, each on its own
         # profile, as separate lanes. All three share the gateway's 30s send
         # spacing (MIN_SEND_INTERVAL_MS + /tmp/deepseek_last_send), so they can
@@ -263,8 +272,9 @@ def default_lanes(cfg=None) -> list[Lane]:
         # 71370-char send at 14:15:14 never returned; the engine blocked on it,
         # batch 1 never completed, green stayed flat). Cap it like gemini and
         # openrouter: the small prompts (557-1104 chars) answered in 3-6s.
-        Lane("deepseek2", "http://127.0.0.1:8081/v1/chat/completions",
-             ["anymodel"], 90, 270, prompt_cap=32000, timeout=270),
+        # 09-16: PARKED with deepseek above - same throttle, same zero responses.
+        # Lane("deepseek2", "http://127.0.0.1:8081/v1/chat/completions",
+        #      ["anymodel"], 90, 270, prompt_cap=32000, timeout=270),
         Lane("deepseek4", "http://127.0.0.1:8083/v1/chat/completions",
              ["anymodel"], 90, 270, prompt_cap=32000, timeout=270),
         # PULLED 09-13: every auto/* combo now 402/401 on an oc/* model
