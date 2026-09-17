@@ -440,6 +440,53 @@ def load_state() -> dict:
                       f"and the lane sent content to create it", flush=True)
         except Exception as _e:
             print(f"[eng] create re-queue skipped: {str(_e)[:120]}", flush=True)
+        # 09-17: an `old_string not found` on a file BIGGER than the 24000-char window is
+        # not the lane being careless - it is the lane WORKING BLIND. Measured on three
+        # such yellows, each of which quoted a real-looking signature that does not exist
+        # on disk, in a region the window provably hides:
+        #   P1B0R0F3#43  oculus/fitness_calculator.py (55854) 'def calculate_fitness(...'
+        #   P1B2R0F1#126 rust/execution/src/models/fill.rs (59947) 'pub fn is_limit_filled'
+        #   P1B6R0F0#7   config/loader.py (32759) 'supporting_set = set(config.get(...'
+        # Each is a plausible invention, not a stale quote - the lane could not see the
+        # middle of the file and guessed. see_next_chunk now exists precisely for this, so
+        # these get one clean attempt with the tool that was built for them.
+        try:
+            _b = 0
+            for _k, _r in (st.get("steps") or {}).items():
+                if not isinstance(_r, dict) or _r.get("status") != "yellow":
+                    continue
+                _la = _r.get("last_apply") or {}
+                if "old_string not found" not in str(_la.get("apply_msg") or ""):
+                    continue
+                for _e in _la.get("edits") or []:
+                    if not isinstance(_e, dict):
+                        continue
+                    _t = str(_e.get("file") or _e.get("filePath") or _e.get("file_path")
+                             or _e.get("path") or "")
+                    if not _t or "\n" in _t or "{" in _t or not in_repo(_t):
+                        continue
+                    _fp = Path(REPO) / _t.lstrip("/")
+                    try:
+                        _sz = _fp.stat().st_size
+                    except OSError:
+                        continue
+                    if _sz <= 24000:
+                        continue
+                    _r["status"] = "pending"
+                    _r["rounds"] = 0
+                    _r["requeued_reason"] = (
+                        "old_string not found on %s (%d chars, past the %d-char window): the "
+                        "lane was shown only head/tail windows and invented a quote for a "
+                        "region it could not see. see_next_chunk now exists, so it gets one "
+                        "clean attempt with the tool built for it."
+                        % (_t, _sz, 24000))
+                    _b += 1
+                    break
+            if _b:
+                print(f"[eng] re-queued {_b} yellow step(s) whose old_string was invented "
+                      f"for a region beyond the {24000}-char window", flush=True)
+        except Exception as _e:
+            print(f"[eng] big-file re-queue skipped: {str(_e)[:120]}", flush=True)
         # 09-16: the second recovery rule - a yellow whose OWN fix(step <sid>)
         # commit exists is finished work too. Doing this from an external script
         # does NOT stick (the engine writes its in-memory yellow back), and it
