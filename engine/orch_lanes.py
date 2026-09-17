@@ -226,9 +226,16 @@ def default_lanes(cfg=None) -> list[Lane]:
              # engine reads as "empty/no-edits" and hops on. It was ladder-cooling
              # first (streak 3) and stalling every step. The three below return real
              # content; thinkingmachines/inkling:free is agentic-harness-only (error).
-             ["nvidia/nemotron-3-ultra-550b-a55b:free",
-              "poolside/laguna-s-2.1:free",
-              "nex-agi/nex-n2.5-pro:free"],
+             # 09-17: poolside/laguna-s-2.1:free PULLED. Probed live, 4 calls each:
+               #   nvidia/nemotron-3-ultra-550b-a55b:free  4/4 ok (1.4s, 8.6s, 6.7s, 2.3s)
+               #   nex-agi/nex-n2.5-pro:free               4/4 ok (2.9s, 3.2s, 1.0s, 1.0s)
+               #   poolside/laguna-s-2.1:free              1/4 ok - 3x HTTP 429 in 0.2-0.3s
+               #     ("Provider returned error ... temporarily rate-limited upstream")
+               # That is the lane's 26% yield explained: 1 of its 3 models is throttled
+               # upstream most of the time and a 429 costs a whole draw. Do NOT re-add
+               # it on a single 200 - measure 4 calls first.
+               ["nvidia/nemotron-3-ultra-550b-a55b:free",
+                            "nex-agi/nex-n2.5-pro:free"],
              # 09-16: REVERTED to 120s. Raising this budget to 300s on the theory that
              # the median success took 309s made the lane measurably WORSE, so the
              # theory was wrong and the number goes back:
