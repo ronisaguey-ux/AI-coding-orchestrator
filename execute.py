@@ -2376,6 +2376,33 @@ async def run_step(session, step: dict, st: dict) -> dict:
     # escalations sat at rounds==3 with last_apply.ok=true and real edits. Record
     # WHY: the rounds were spent and the verify lane never returned green.
     _la = rec.get("last_apply") or {}
+    # 09-17: THIS site lacked the check the pre_loop_max_rounds site has. Measured on
+    # P1B2R0F5#91: it was re-queued, the lane's edit LANDED (landed_verified True,
+    # landed_at 05:08:20), and one second later this site retired it YELLOW at
+    # `run_step:rounds_exhausted` (05:08:21) without ever looking at the file. Yellow
+    # means "a lane looked and could not"; a step whose edit is on disk is finished
+    # work, and retiring it yellow throws the credit away. Re-read the target before
+    # retiring, exactly as the other park site does.
+    if _applied_edits_landed(rec):
+        rec["status"] = "green"
+        rec["resolved_by"] = (
+            "round budget exhausted, but the step's edit IS present on disk (read off "
+            "the file at the round limit) - recorded green instead of yellow")
+        _la3 = dict(rec.get("last_apply") or {})
+        _la3["verified_by"] = "run_step:rounds_exhausted:content-on-disk"
+        rec["last_apply"] = _la3
+        rec["yellow_watch_review"] = {
+            "verdict": "recovered",
+            "evidence": "content verified on disk at the round limit",
+        }
+        await save_state_serialized(st)
+        try:
+            await orch_git.git_commit_step(sid, rec)
+        except Exception as ge:
+            print(f"[step {sid}] git commit failed: {str(ge)[:180]}", flush=True)
+        print(f"[step {sid}] rounds exhausted but the applied edit IS on disk — green "
+              f"instead of yellow", flush=True)
+        return rec
     _rs_files = [str(e.get("file") or e.get("filePath") or "").strip()
                  for e in (_la.get("edits") or []) if isinstance(e, dict)]
     _rs_files = [f for f in _rs_files if f] or list(rec.get("files") or []) \
