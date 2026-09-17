@@ -526,6 +526,33 @@ def load_state() -> dict:
                       f"carried none", flush=True)
         except Exception as _e:
             print(f"[eng] yellow verdict stamping skipped: {str(_e)[:120]}", flush=True)
+        # 09-17: a yellow refused with "the edit names no target file" is now workable when
+        # the STEP names exactly one file that exists - apply_edits takes a default_file for
+        # exactly this. Measured: 7 such yellows in one day, the 3rd-most-common new class.
+        # Ambiguous steps are left alone (the refusal there is correct).
+        try:
+            _d = 0
+            for _k, _r in (st.get("steps") or {}).items():
+                if not isinstance(_r, dict) or _r.get("status") != "yellow":
+                    continue
+                _la = _r.get("last_apply") or {}
+                if "names no target file" not in str(_la.get("apply_msg") or ""):
+                    continue
+                _sole = _sole_target(_r.get("files") or PLAN_FILES.get(_k) or [])
+                if not _sole:
+                    continue
+                _r["status"] = "pending"
+                _r["rounds"] = 0
+                _r["requeued_reason"] = (
+                    "the lane's edit named no file and the step has exactly one target "
+                    "(%s); apply_edits now falls back to the step's sole target, so this "
+                    "gets a clean attempt" % _sole)
+                _d += 1
+            if _d:
+                print(f"[eng] re-queued {_d} yellow step(s) whose edit named no file but "
+                      f"the step has one unambiguous target", flush=True)
+        except Exception as _e:
+            print(f"[eng] no-file re-queue skipped: {str(_e)[:120]}", flush=True)
         # 09-16: the second recovery rule - a yellow whose OWN fix(step <sid>)
         # commit exists is finished work too. Doing this from an external script
         # does NOT stick (the engine writes its in-memory yellow back), and it
@@ -1748,7 +1775,30 @@ def _capture_landed(rec: dict) -> None:
         pass  # an evidence stamp must never break the run it is observing
 
 
-def apply_edits(edits: list) -> tuple:
+def _sole_target(files) -> str:
+    """The step's ONE resolvable target file, or "" when that is not unambiguous.
+
+    09-17: lanes keep returning a correct edit with NO file key - measured 7 yellows
+    retired as "the edit names no target file" in a single day, the 3rd-most-common new
+    class. The engine's refusal is right in general (an edit with no target cannot be
+    applied), but when the STEP names exactly one file that exists, the lane's intent is
+    not in doubt. Return that path only when it is the single candidate; anything
+    ambiguous returns "" so the refusal stands.
+    """
+    if isinstance(files, str):
+        files = [files]
+    cands = []
+    for f in files or []:
+        f = str(f or "").strip()
+        if not f or "\n" in f or "{" in f:
+            continue
+        r = _resolve_plan_path(f)
+        if (Path(REPO) / r.lstrip("/")).exists():
+            cands.append(r)
+    return cands[0] if len(cands) == 1 else ""
+
+
+def apply_edits(edits: list, default_file: str = "") -> tuple:
     """Exact string replace with py syntax guard (proven 8_26 logic).
 
     09-05: an EMPTY edit list is now an explicit failure. ``all([])`` is
@@ -1799,6 +1849,13 @@ def apply_edits(edits: list) -> tuple:
         f = _pick(e, "file")
         old = _pick(e, "old_string")
         new = _pick(e, "new_string")
+        if not f and default_file:
+            # 09-17: the edit omitted the path but the step names exactly one file that
+            # exists - measured as the 3rd-most-common new yellow class. Use it, and say
+            # so in the result so the record shows the target was inferred, not invented.
+            f = default_file
+            print(f"[eng] edit named no file - applied to the step's sole target {f}",
+                  flush=True)
         if not f:
             results.append({"file": "", "ok": False,
                             "msg": ("refused: the edit names no target file (keys "
@@ -2298,7 +2355,7 @@ async def run_step(session, step: dict, st: dict) -> dict:
             print(f"[step {sid}] repair returned NO edits — left pending (red/no_edits, verify skipped)",
                   flush=True)
             return rec
-        ok, msg = apply_edits(edits)
+        ok, msg = apply_edits(edits, default_file=_sole_target(locals().get("files") or rec.get("files") or PLAN_FILES.get(sid) or []))
         rec["last_apply"] = {"rnd": rnd + 1, "ok": ok, "edits": edits,
                              "apply_msg": msg, "lane": res.lane,
                              "verify": ("already satisfied (no-op edit)"
@@ -2551,7 +2608,7 @@ async def escalate_final(session, sid: str, st: dict, lane: str | None = None) -
     if v in ("green", "fixed") or verdict.get("edits"):
         edits = verdict.get("edits") or []
         if edits:
-            ok, msg = apply_edits(edits)
+            ok, msg = apply_edits(edits, default_file=_sole_target(locals().get("files") or rec.get("files") or PLAN_FILES.get(sid) or []))
             rec["last_apply"] = {"rnd": rec.get("rounds", 0) + 1, "ok": ok,
                                  "edits": edits, "apply_msg": msg, "lane": res.lane,
                                  "verify": "green: escalation persona applied the fix"}
@@ -2887,7 +2944,7 @@ async def run_group(session, steps: list, st: dict) -> dict:
                 rec["status"] = "pending"
                 print(f"[group] step {sid} repair returned NO edits — pending (red/no_edits)", flush=True)
             continue
-        ok, msg = apply_edits(mine)
+        ok, msg = apply_edits(mine, default_file=_sole_target(locals().get("files") or rec.get("files") or PLAN_FILES.get(sid) or []))
         rec["last_apply"] = {"rnd": rec["rounds"], "ok": ok, "edits": mine, "apply_msg": msg}
         _capture_landed(rec)
         checks = run_checks(files)
