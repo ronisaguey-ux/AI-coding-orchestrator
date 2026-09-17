@@ -416,9 +416,13 @@ def default_lanes(cfg=None) -> list[Lane]:
 # The earlier "4 chars returned" was the gateway recovering from a 5.7-HOUR
 # WEDGE that had been cleared minutes before; I read a post-wedge artifact as a
 # permanent defect. The lesson is recorded in AGENTS.md.
+        # 09-17: 420 -> 600. Measured, ChatGPT needs ~360s to its FIRST content on an
+        # engine prompt (row empty + aria-busy the whole time, then it fills with a
+        # real edit contract). A 420s budget guillotined it 60s short. Chain is
+        # grace 400s < this 600s < gateway TIMEOUT 650s.
         Lane("chatgpt", "http://127.0.0.1:8087/v1/chat/completions",
              ["chatgpt webchat"], 120, 420,
-             prompt_cap=32000, timeout=420),
+             prompt_cap=32000, timeout=600),
 #              # functioning correctly"): engine budget 300s against a gateway HARD_CAP
              # of 310s left a 10s margin, so on any thinking-heavy reply the ENGINE
              # timed out first ("chatgpt failed (timeout after 300s)") and the pool
