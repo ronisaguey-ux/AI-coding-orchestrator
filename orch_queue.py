@@ -641,6 +641,11 @@ async def drive_batch(queue: BatchQueue, roster: LaneRoster, handoff: StepHandof
             _apply_outcome(queue, sid, res)
             queue.finish(sid)
             _note(f"[queue] {sid} -> {queue.status(sid)} by {res.lane}")
+            if on_step_done:
+                try:
+                    on_step_done(res.lane, sid, queue.status(sid))
+                except Exception as e:
+                    _note(f"[queue] on_step_done({sid}) raised: {e}")
 
     async def _unused_escalator():
         attempts: dict = {}
@@ -710,7 +715,7 @@ def pack_batches(step_ids, group_cap=DEFAULT_GROUP_CAP):
 async def drive_plan(batches, records, roster, handoff, execute_step, *,
                      on_escalate=None, steps_by_id=None, poll_s=None, log=None,
                      max_stall_rounds=600, on_batch_done=None,
-                     max_escalation_attempts=3):
+                     on_step_done=None, max_escalation_attempts=3):
     """ONE global work queue, lanes never idle, and NO escalation phase.
 
     Owner 09-14: "get rid of escalations entirely, have the initial step executor
@@ -855,7 +860,13 @@ async def drive_plan(batches, records, roster, handoff, execute_step, *,
                 esc_attempts.pop(sid, None)
             release(sid)
             report_batches()
-            log(f"[plan] {sid} -> {status(sid)} by {out.lane}")
+            _st = status(sid)
+            log(f"[plan] {sid} -> {_st} by {out.lane}")
+            if on_step_done:
+                try:
+                    on_step_done(out.lane, sid, _st)
+                except Exception as e:
+                    log(f"[plan] on_step_done({sid}) raised: {e}")
 
     def snapshot():
         return {s: status(s) for s in order}

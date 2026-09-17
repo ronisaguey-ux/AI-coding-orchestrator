@@ -2772,6 +2772,18 @@ async def run_queue_batches(session, batches: list, st: dict) -> None:
     async def _esc(lane, sid):
         return await escalate_final(session, sid, st, lane=lane)
 
+    def _after(lane, sid, status):
+        # 09-17 (BOB): the 5-step context reset was wired to on_batch_done, i.e. once per
+        # BATCH (15 steps, 159 of them) - measured 69 greens in an hour produced ONE reset
+        # instead of ~13. Bob's design is "store history every 5 steps and reset just like
+        # the webchays", so count completions PER STEP here, where every terminal step
+        # lands, and let _note_step_completions fire the reset on its own cadence.
+        try:
+            if status in ("green", "yellow", "escalated"):
+                _note_step_completions({sid: status})
+        except Exception as e:
+            print(f"[qeng] per-step completion hook failed: {e}", flush=True)
+
     def _batch_done(bi, snap):
         try:
             _note_step_completions(snap)
@@ -2783,7 +2795,8 @@ async def run_queue_batches(session, batches: list, st: dict) -> None:
                                    on_escalate=(_esc if ESCALATIONS_ENABLED else None),
                                    steps_by_id=steps_by_id, poll_s=5.0,
                                    log=lambda m: print(m, flush=True),
-                                   on_batch_done=_batch_done)
+                                   on_batch_done=_batch_done,
+                                   on_step_done=_after)
     except oq.BatchStalled as e:
         print(f"[qeng] PLAN STALLED — {e}", flush=True)
         snap = {}
