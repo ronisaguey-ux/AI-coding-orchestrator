@@ -1775,6 +1775,31 @@ def _capture_landed(rec: dict) -> None:
         pass  # an evidence stamp must never break the run it is observing
 
 
+def _is_secrets_path(f: str) -> bool:
+    """True for a credential-bearing file the engine must never write.
+
+    09-17, found by auditing my OWN sole-target fallback: `webchat-api/.env` and
+    `webchat-api/.cookies-deepseek.json` live INSIDE this repo and pass `in_repo()`,
+    so a lane edit with no file key could have been applied straight into a credentials
+    file or a session cookie jar. A lane's guessed edit must never be able to do that.
+
+    Deliberately narrow: `.env` / `.env.*` / `*.token` / cookie jars / `*.pem` / keys.
+    NOT a bare `*secret*` - `tests/test_secrets.py` and `tests/test_rotate_secrets.py`
+    are legitimate targets that appear in the live states and must stay editable.
+    """
+    import re as _re2
+    p = str(f or "").strip().lstrip("./")
+    base = os.path.basename(p).lower()
+    return bool(
+        base == ".env" or base.startswith(".env.")
+        or base.endswith(".token") or base.endswith(".pem")
+        or base.startswith(".cookies") or "cookie" in base
+        or _re2.match(r"^(id_rsa|id_ed25519|id_ecdsa)", base)
+        or base in ("credentials", "credentials.json", "secrets.json", "secrets.yaml",
+                    "secrets.yml", ".netrc", ".htpasswd")
+    )
+
+
 def _sole_target(files) -> str:
     """The step's ONE resolvable target file, or "" when that is not unambiguous.
 
@@ -1791,6 +1816,11 @@ def _sole_target(files) -> str:
     for f in files or []:
         f = str(f or "").strip()
         if not f or "\n" in f or "{" in f:
+            continue
+        if _is_secrets_path(f):
+            # 09-17: never hand a lane's file-less edit a credentials target. Found by
+            # auditing this fallback: webchat-api/.env and .cookies-deepseek.json are
+            # INSIDE the repo and passed in_repo().
             continue
         r = _resolve_plan_path(f)
         if (Path(REPO) / r.lstrip("/")).exists():
@@ -1860,6 +1890,11 @@ def apply_edits(edits: list, default_file: str = "") -> tuple:
             results.append({"file": "", "ok": False,
                             "msg": ("refused: the edit names no target file (keys "
                                     f"present: {sorted(e.keys())[:6]})")})
+            continue
+        if _is_secrets_path(f):
+            # Defence in depth - applies whether the path was the lane's own or inferred.
+            results.append({"file": f, "ok": False,
+                            "msg": "refused: target is a credential/secret file"})
             continue
         # 09-09 (Bob): never touch a file that escapes repo_dir (../webchat-api etc).
         if not in_repo(f):
