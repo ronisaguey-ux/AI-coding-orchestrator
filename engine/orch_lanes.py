@@ -266,6 +266,21 @@ def default_lanes(cfg=None) -> list[Lane]:
              # keyword — `prompt_cap` sits before it in the dataclass, so the
              # positional form silently bound the API key to prompt_cap and
              # left auth="" → the lane was dropped by the `or ln.auth` filter.
+          # 09-17 (BOB): "a new model dropped on openrouter, its a stealth model,
+          # called union alpha, add that as a new lane, apparently gpt6 astra level
+          # intelligence". Verified live BEFORE wiring (id from GET /models:
+          # `stealth/union-alpha`, name "Union Alpha", context 262144, prompt AND
+          # completion price 0 - a free stealth preview):
+          #   contract prompt 11,739 chars -> 4.6s, correct edits JSON, token survived
+          #   contract prompt 24,162 chars -> 5.5s and 3.6s, 2/2 correct, token survived
+          # Unlike the other free ids it does NOT return empty on a large prompt, and
+          # its 262K context carries a real file view, so prompt_cap=24000 (the size
+          # actually MEASURED - lanes that earn greens sit at 24000-32000).
+          # A stealth id can be withdrawn without notice: if it starts 404ing or
+          # returning empty, probe it and pull it rather than cooling it forever.
+          Lane("unionalpha", "https://openrouter.ai/api/v1/chat/completions",
+               ["stealth/union-alpha"],
+               45, 120, prompt_cap=24000, auth=key, timeout=120),
         # 09-16: PARKED - both accounts are under DeepSeek's "Messages too frequent"
         # throttle, verified by reading the PAGE over CDP (:9229 and :9225 both report
         # tooFrequent=true while :9227 reads false), and neither produces a reply at
