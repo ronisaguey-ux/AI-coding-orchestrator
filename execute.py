@@ -394,6 +394,52 @@ def load_state() -> dict:
                       f"dunder-stripped path", flush=True)
         except Exception as _e:
             print(f"[eng] dunder re-queue skipped: {str(_e)[:120]}", flush=True)
+        # 09-17: a yellow whose apply died with `read fail` on a target that does NOT
+        # exist is a step that never got its turn - the CREATE path used to require an
+        # empty old_string, so a RESTORE task fell through to the read and died.
+        # Measured: P1B2R0F7#46 - the plan says "security_utils.py is empty, so
+        # atomic_json_write() is missing ... Restore security_utils.py", the file is now
+        # absent, and the step burned its rounds on an [Errno 2] it could never avoid.
+        # A lane cannot match an old_string against a file that is not there, so this
+        # re-queues it for one clean create attempt. Never green: nothing has landed yet.
+        try:
+            _c = 0
+            for _k, _r in (st.get("steps") or {}).items():
+                if not isinstance(_r, dict) or _r.get("status") != "yellow":
+                    continue
+                _la = _r.get("last_apply") or {}
+                if "read fail" not in str(_la.get("apply_msg") or ""):
+                    continue
+                _eds = [e for e in (_la.get("edits") or []) if isinstance(e, dict)]
+                _good = []
+                for _e in _eds:
+                    _t = str(_e.get("file") or _e.get("filePath") or _e.get("file_path")
+                             or _e.get("path") or "")
+                    _n = str(_e.get("new_string") or _e.get("newStr") or _e.get("new")
+                             or _e.get("content") or "")
+                    # A lane sometimes returns a JSON blob as the "path" (measured on
+                    # P1B2R0F4#62). A real target is one line, has no brace, and stays
+                    # inside the repo - never invent a file from a malformed edit.
+                    if not _t or not _n or "\n" in _t or "{" in _t or not in_repo(_t):
+                        continue
+                    if (Path(REPO) / _t.lstrip("/")).exists():
+                        continue
+                    _good.append(_t)
+                if not _good:
+                    continue
+                _r["status"] = "pending"
+                _r["rounds"] = 0
+                _r["requeued_reason"] = (
+                    "apply died with read fail on %s, which does not exist - the lane sent "
+                    "a new_string, so this is a RESTORE/create and the step gets a clean "
+                    "attempt now that the create path no longer needs an empty old_string"
+                    % ", ".join(_good[:2]))
+                _c += 1
+            if _c:
+                print(f"[eng] re-queued {_c} yellow step(s) whose target does not exist "
+                      f"and the lane sent content to create it", flush=True)
+        except Exception as _e:
+            print(f"[eng] create re-queue skipped: {str(_e)[:120]}", flush=True)
         # 09-16: the second recovery rule - a yellow whose OWN fix(step <sid>)
         # commit exists is finished work too. Doing this from an external script
         # does NOT stick (the engine writes its in-memory yellow back), and it
