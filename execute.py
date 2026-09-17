@@ -553,6 +553,59 @@ def load_state() -> dict:
                       f"the step has one unambiguous target", flush=True)
         except Exception as _e:
             print(f"[eng] no-file re-queue skipped: {str(_e)[:120]}", flush=True)
+        # 09-17: the `blocked` status is a THIRD class the owner does not want ("there's
+        # either greens or yellows"), and every one of these 27 was parked by
+        # `escalation_solver:preflight` - a solver that is DISABLED and MASKED, so the
+        # blocker no longer exists. Resolve them by what is actually true now:
+        #   - a resolvable, NON-SECRET sole target -> re-queue for a clean attempt
+        #   - a secrets target (.env / cookie jar) -> obsolete: the engine must never
+        #     write there (see _is_secrets_path), so the step is unworkable by design
+        #   - no resolvable target -> obsolete, naming what it wanted
+        try:
+            _rq = _ob = 0
+            for _k, _r in (st.get("steps") or {}).items():
+                if not isinstance(_r, dict) or _r.get("status") != "blocked":
+                    continue
+                # The evidence lives in `resolved_by`, NOT blocked_reason - that field is
+                # empty on these records. Measured: resolved_by == 'escalation_solver:preflight'
+                # while blocked_reason/escalated_reason are both ''. Reading the wrong field
+                # made this pass report "re-queued 0, retired 0" on 27 real records.
+                _reason = " ".join(str(_r.get(_f) or "") for _f in
+                                   ("resolved_by", "blocked_reason", "escalated_reason"))
+                if "escalation_solver" not in _reason:
+                    continue
+                _fs = _r.get("files") or PLAN_FILES.get(_k) or []
+                if isinstance(_fs, str):
+                    _fs = [_fs]
+                _res = []
+                for _f in _fs:
+                    _f = str(_f or "").strip()
+                    if not _f:
+                        continue
+                    if _is_secrets_path(_f):
+                        continue
+                    if (Path(REPO) / _resolve_plan_path(_f).lstrip("/")).exists():
+                        _res.append(_resolve_plan_path(_f))
+                if _res:
+                    _r["status"] = "pending"
+                    _r["rounds"] = 0
+                    _r["requeued_reason"] = (
+                        "was blocked by escalation_solver:preflight, a solver that is "
+                        "disabled and masked - the blocker no longer exists, and %s "
+                        "resolves on disk, so the step gets a clean attempt" % _res[0])
+                    _rq += 1
+                else:
+                    _r["status"] = "obsolete"
+                    _r["obsolete_reason"] = (
+                        "was blocked by escalation_solver:preflight (disabled and masked, "
+                        "so the blocker no longer exists) and has no workable target: "
+                        "%s" % (", ".join(str(f) for f in _fs[:2]) or "no file named"))
+                    _ob += 1
+            if _rq or _ob:
+                print(f"[eng] resolved blocked residue: re-queued {_rq}, retired {_ob} as "
+                      f"obsolete (the solver that blocked them is disabled)", flush=True)
+        except Exception as _e:
+            print(f"[eng] blocked-residue pass skipped: {str(_e)[:120]}", flush=True)
         # 09-16: the second recovery rule - a yellow whose OWN fix(step <sid>)
         # commit exists is finished work too. Doing this from an external script
         # does NOT stick (the engine writes its in-memory yellow back), and it
