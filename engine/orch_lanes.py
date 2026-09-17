@@ -1010,6 +1010,16 @@ class LanePool:
             self.log(f"[lanes] gemini/{model} issue ignored — no cooldown "
                      f"(Bob rule: cooldowns are omniroute-only)")
             return
+        # 09-17: a lane that REFUSED a draw because its tab is still generating is not
+        # failing - it is busy, and it will answer if we come back. Measured on chatgpt:
+        # it needs ~360s per generation, so at the engine's draw rate it is busy almost
+        # every time, and the ladder benched it for escalating periods (streaks 1 -> 2 ->
+        # 3 in 30 min) for simply working. That is how a healthy lane gets removed from
+        # the pool. Do not climb the ladder; let the next pick retry it.
+        if "still generating" in (body or "").lower():
+            self.log(f"[lanes] {lane.name}/{model} busy (still generating) — "
+                     f"no cooldown, retry on the next pick")
+            return
         lane.model_fails[model] = lane.model_fails.get(model, 0) + 1
         streak = lane.model_fails[model]
         # 09-06: a per-DAY provider quota does not recover on the streak
