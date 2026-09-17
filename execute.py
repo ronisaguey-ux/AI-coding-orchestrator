@@ -1144,20 +1144,44 @@ def _note_step_completions(statuses: dict) -> None:
 
 
 def _trigger_lane_reset() -> None:
-    """Drop pool history + force a fresh gemini chat (webchat context reset)."""
+    """Reset every lane's context, the way each lane actually holds one.
+
+    09-17 (BOB): "for webchat lanes u dont have to add history into every request,
+    cuz the history is alr inside the chat, only add history to api endpoints ...
+    the way to clear history on webchats is by opening a new chat".
+
+    So an API lane (openrouter, dahl) is reset by dropping its injected history,
+    and a WEBCHAT lane (deepseek*) is reset by opening a NEW CHAT on its gateway -
+    its context lives in the tab, so clearing our history does nothing for it.
+    This used to POST /v1/newchat to gemini's gateway only, so the deepseek tabs
+    accumulated context forever.
+    """
     try:
         POOL.reset_context()
     except Exception as e:
         print(f"[ctx] pool reset_context failed: {e}", flush=True)
-    # gemini is the one webchat tab that genuinely accumulates context; open a
-    # fresh chat via the gateway's /v1/newchat so the lane forgets prior tasks.
-    gemini_gw = getattr(CFG, "gemini_gw_url", "http://127.0.0.1:8085")
+
+    urls: list[str] = []
+    try:
+        for lane in POOL.lanes:
+            if not orch_lanes._lane_is_webchat(lane):
+                continue
+            base = str(lane.url).split("/v1/")[0]
+            if base and base + "/newchat" not in urls:
+                urls.append(base + "/newchat")
+    except Exception as e:
+        print(f"[ctx] could not enumerate webchat gateways: {e}", flush=True)
+    if not urls:
+        # keep the old default so a paused/unlisted gateway is still reset
+        urls = [getattr(CFG, "gemini_gw_url", "http://127.0.0.1:8085") + "/newchat"]
     try:
         import asyncio
-        # fire-and-forget; gateway logs its own progress (we're inside the loop)
-        asyncio.ensure_future(_post(gemini_gw + "/v1/newchat"))
+        # fire-and-forget; each gateway logs its own progress (we're inside the loop)
+        for u in urls:
+            asyncio.ensure_future(_post(u))
+        print(f"[ctx] opened a fresh chat on {len(urls)} webchat gateway(s)", flush=True)
     except Exception as e:
-        print(f"[ctx] lane reset (gemini /v1/newchat) failed: {e}", flush=True)
+        print(f"[ctx] lane reset (/v1/newchat) failed: {e}", flush=True)
 
 
 async def _post(url: str) -> None:
