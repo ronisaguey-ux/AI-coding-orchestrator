@@ -264,7 +264,7 @@ def default_lanes(cfg=None) -> list[Lane]:
         # live send (:8080 -> COOL-8080-225, :8081 -> COOL-8081-25675), so the
         # throttle had lifted. Pool 4 -> 6, which is the throughput lever on the ETA.
         Lane("deepseek", "http://127.0.0.1:8080/v1/chat/completions",
-             ["anymodel"], 90, 270, prompt_cap=20000, timeout=270),
+             ["anymodel"], 90, 270, prompt_cap=20000, timeout=340),
         # 09-12 (owner): two more signed-in deepseek webchats, each on its own
         # profile, as separate lanes. All three share the gateway's 30s send
         # spacing (MIN_SEND_INTERVAL_MS + /tmp/deepseek_last_send), so they can
@@ -277,9 +277,9 @@ def default_lanes(cfg=None) -> list[Lane]:
         # openrouter: the small prompts (557-1104 chars) answered in 3-6s.
         # 09-16: PARKED with deepseek above - same throttle, same zero responses.
         Lane("deepseek2", "http://127.0.0.1:8081/v1/chat/completions",
-             ["anymodel"], 90, 270, prompt_cap=20000, timeout=270),
+             ["anymodel"], 90, 270, prompt_cap=20000, timeout=340),
         Lane("deepseek4", "http://127.0.0.1:8083/v1/chat/completions",
-             ["anymodel"], 90, 270, prompt_cap=20000, timeout=270),
+             ["anymodel"], 90, 270, prompt_cap=20000, timeout=340),
         # PULLED 09-13: every auto/* combo now 402/401 on an oc/* model
         # Lane("omniroute", "http://127.0.0.1:20128/v1/chat/completions",
              # 09-12 LATER: the auto/* combos load-balance and now route onto
