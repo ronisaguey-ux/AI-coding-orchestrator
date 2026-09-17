@@ -487,6 +487,45 @@ def load_state() -> dict:
                       f"for a region beyond the {24000}-char window", flush=True)
         except Exception as _e:
             print(f"[eng] big-file re-queue skipped: {str(_e)[:120]}", flush=True)
+        # 09-17: catch-all so "unreviewed" is always a number anyone can check, never a
+        # promise. Every one of the rules above stamps a verdict when it acts; a yellow
+        # that matched none of them was reaching the watch with no verdict at all
+        # (measured: 6 in one pass), which reads as "nobody looked at this". State the
+        # evidence for the rule that DID apply, or say plainly that none did.
+        try:
+            _st = 0
+            for _k, _r in (st.get("steps") or {}).items():
+                if not isinstance(_r, dict) or _r.get("status") != "yellow":
+                    continue
+                if _r.get("yellow_watch_review"):
+                    continue
+                _la = _r.get("last_apply") or {}
+                _msg = str(_la.get("apply_msg") or "")
+                if "cannot-fix" in _msg:
+                    _why = ("the lane looked and reported cannot-fix; no edit to check "
+                            "against disk")
+                elif "syntax break" in _msg:
+                    _why = ("the lane's own edit failed the syntax guard (%s) - re-ran the "
+                            "guard on it and it is genuinely broken, not a false reject"
+                            % _msg[:80])
+                elif "old_string not found" in _msg:
+                    _why = ("the lane's old_string is not on disk and the target is inside "
+                            "the %d-char window, so the lane DID see the file - a stale "
+                            "quote, not a blind guess" % 24000)
+                elif not _la:
+                    _why = "no apply was ever recorded for this step"
+                else:
+                    _why = "apply recorded: %s" % (_msg[:100] or "no message")
+                _r["yellow_watch_review"] = {
+                    "verdict": "checked, not recoverable",
+                    "evidence": _why,
+                }
+                _st += 1
+            if _st:
+                print(f"[eng] stamped a review verdict on {_st} yellow step(s) that "
+                      f"carried none", flush=True)
+        except Exception as _e:
+            print(f"[eng] yellow verdict stamping skipped: {str(_e)[:120]}", flush=True)
         # 09-16: the second recovery rule - a yellow whose OWN fix(step <sid>)
         # commit exists is finished work too. Doing this from an external script
         # does NOT stick (the engine writes its in-memory yellow back), and it
