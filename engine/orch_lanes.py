@@ -33,6 +33,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+# 09-16 (owner): "if a lane doesnt provide a response in 3min, have its spot added to
+# the que and the next workable lane takes it on." Hard ceiling on how long ONE lane
+# call may hold a worker slot, applied to every lane (see LanePool.call). A lane that
+# misses it is a TRANSPORT failure: the step keeps its rounds and returns to the queue,
+# so the next workable lane picks it up. Override with ORCH_LANE_ANSWER_BUDGET.
+LANE_ANSWER_BUDGET_S = int(os.environ.get("ORCH_LANE_ANSWER_BUDGET", "180"))
+
 # ------------------------------------------------------------------ lanes ---
 # (name, url, models, cooldown_base, cooldown_escalated, auth_token)
 # Models may be a single id or a list tried in order; a rate-limited MODEL is
@@ -212,6 +219,19 @@ def default_lanes(cfg=None) -> list[Lane]:
              ["nvidia/nemotron-3-ultra-550b-a55b:free",
               "poolside/laguna-s-2.1:free",
               "nex-agi/nex-n2.5-pro:free"],
+             # 09-16: REVERTED to 120s. Raising this budget to 300s on the theory that
+             # the median success took 309s made the lane measurably WORSE, so the
+             # theory was wrong and the number goes back:
+             #   BEFORE (120s budget): 34 claims / 10 greens / 29% yield
+             #   AFTER  (300s budget):  9 claims /  1 green / 11% yield, 27 cooldowns
+             # A longer budget just let a hanging call hold the slot 180s longer before
+             # it was cooled - and the cooldowns then took the model out of rotation for
+             # up to 36 min (streak 8, measured). The models themselves are FINE: a live
+             # probe returned HTTP 200 for poolside/laguna-s-2.1:free and
+             # nex-agi/nex-n2.5-pro:free. The median-success reading was confounded -
+             # claim->green spans handoffs, it is not one call's latency.
+             # prompt_cap stays 12000 ON PURPOSE - this lane's free models return EMPTY
+             # content on a large prompt, which the engine reads as "no edits".
              45, 120, prompt_cap=12000, auth=key, timeout=120),  # 09-12: the engine ships a
              # ~60K-char system prompt. The free models answer a small prompt fine
              # (verified live) but return EMPTY on the full one, which the engine
@@ -353,18 +373,29 @@ def default_lanes(cfg=None) -> list[Lane]:
         # real answer sat in an earlier row. That is now handled: the gateway runs
         # `WEBCHAT_MODE=chatgpt` (drop-in 95-mode.conf) so the mode's
         # `skipEmptyMessageRows` quirk applies. Verified live: HTTP 200, PONG in 5s.
-# 09-16: CHATGPT PULLED (soft-capped again). Evidence, measured not assumed:
-#   - gateway 90 min: 18 sends / 0 responses / 16 'Webchat response is empty
-#     after 240s', plus 'fresh-chat open failed: Target crashed'.
-#   - its tab: ONE assistant row, 0 chars, composer empty - it generates
-#     nothing. Same soft-cap shape as 09-13.
-#   - engine side, only 4 greens in 90 min carried chatgpt's own edits; the
-#     rest it was credited with were greened by the landed-edit check while it
-#     merely held the step (see the yield-metric footgun in AGENTS.md).
-# Re-enable when the Free quota resets AND one real completion returns content.
-#         Lane("chatgpt", "http://127.0.0.1:8087/v1/chat/completions",
-#              ["chatgpt webchat"], 120, 420,
-#              prompt_cap=32000, timeout=420),  # 09-15 (Bob: the lane "is not
+# 09-16 RE-ENABLED (Bob: "get it up too"). The earlier pull blamed a Free-plan
+# soft-cap. That was wrong. Re-tested with a FRESH chat: POST /newchat, then a real
+# completion returned {"content":"PONG"} in seconds, and the DOM showed
+# [["user",8],["assistant",4]] with busy=false. The stale thread was the fault, not
+# the account - the same lesson gemini taught: when a lane that used to work stops,
+# the regression is in OUR state, not the model. Every send now opens a fresh chat
+# via the gateway (thread-reset watchdog stays on this lane).
+# 09-16 RE-ENABLED - Bob was right, this is not a chatgpt problem. He pushed back:
+# "thats likely a code issue and not a chatgbt issue, dig into it, chatgpt doesnt
+#  store context across sessions". Digging in, the lane is FINE and my earlier
+# stale-reader verdict was wrong:
+#   - short prompt      ("TOKEN-ALPHA-5521")            -> echoed EXACTLY
+#   - 11,266-char prompt with the token at the END      -> echoed EXACTLY
+#   - 33,066-char prompt with the token at the END      -> echoed EXACTLY
+# (that last one is ABOVE this lane's 32000 prompt_cap, so even an over-cap
+# prompt survives the insert). Each test used a unique token and required the
+# reply to MATCH it - the test I should have run before pulling the lane.
+# The earlier "4 chars returned" was the gateway recovering from a 5.7-HOUR
+# WEDGE that had been cleared minutes before; I read a post-wedge artifact as a
+# permanent defect. The lesson is recorded in AGENTS.md.
+        Lane("chatgpt", "http://127.0.0.1:8087/v1/chat/completions",
+             ["chatgpt webchat"], 120, 420,
+             prompt_cap=32000, timeout=420),
 #              # functioning correctly"): engine budget 300s against a gateway HARD_CAP
              # of 310s left a 10s margin, so on any thinking-heavy reply the ENGINE
              # timed out first ("chatgpt failed (timeout after 300s)") and the pool
@@ -1130,6 +1161,13 @@ class LanePool:
 
         # 09-14 (worker, B4): per-lane budget, falling back to the global.
         lane_budget = int(lane.timeout or self.cfg.lane_timeout)
+        # 09-16 (owner): "if a lane doesnt provide a response in 3min, have its spot
+        # added to the que and the next workable lane takes it on." Ceiling on the
+        # budget, applied here rather than per-lane so it covers every lane there is
+        # and every lane added later. A timeout is a TRANSPORT result: the step does
+        # not consume a round and goes straight back to the queue for the next lane,
+        # which is the hand-off the owner asked for.
+        lane_budget = min(lane_budget, LANE_ANSWER_BUDGET_S)
         timeout = aiohttp.ClientTimeout(
             total=lane_budget,
             connect=int(self.cfg.lane_connect_timeout))
