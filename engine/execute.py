@@ -384,6 +384,15 @@ def load_state() -> dict:
                 # A stored commit means already recovered; an empty string means
                 # "check again next load", which is cheap and recovers the step the
                 # moment its commit lands.
+                # 09-16: a LEGACY bare `True` here blocks recovery FOREVER. The marker
+                # was changed to store WHAT WAS FOUND (a commit string = recovered, an
+                # empty string = check again next load), but a record written before
+                # that change still holds `True`, and `True` is truthy so every later
+                # load skips it. Measured: P1B5R0F5#25 sat yellow with its own
+                # fix(step P1B5R0F5#25) commit (08df2118) present the whole time.
+                # Normalise a real bool away so the step gets re-checked exactly once.
+                if _r.get("_git_checked") is True:
+                    _r.pop("_git_checked", None)
                 if _r.get("_git_checked"):
                     continue
                 _out = subprocess.run(
