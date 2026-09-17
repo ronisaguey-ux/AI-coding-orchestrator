@@ -1679,8 +1679,20 @@ def apply_edits(edits: list) -> tuple:
                   f"(lane stripped the underscores)", flush=True)
             f = _f2
         path = REPO / f.lstrip("/")
-        # CREATE: absent file + empty old_string -> write new_string as full content
-        if not path.exists() and old == "" and new:
+        # CREATE: absent file -> write new_string as full content.
+        # 09-17: this used to require `old == ""`, so a step whose job is to RESTORE a
+        # file that is gone fell through to the read below and died with
+        # `read fail: [Errno 2]`, burning its rounds. Measured: P1B2R0F7#46 - the plan
+        # says "security_utils.py is empty, so atomic_json_write() is missing ...
+        # Restore security_utils.py with atomic_json_write()", the file now does not
+        # exist at all, and the step could never be worked. A lane cannot meaningfully
+        # match an old_string against a file that is not there, so a non-empty
+        # old_string is ignored here rather than turned into a read failure.
+        if not path.exists() and new:
+            if old:
+                print(f"[eng] {f} does not exist — creating it and ignoring the "
+                      f"lane's {len(old)}-char old_string (nothing to match against)",
+                      flush=True)
             if f.endswith(".py") and not f.endswith(".py.in"):
                 try:
                     ast.parse(new)
