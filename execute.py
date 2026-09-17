@@ -351,7 +351,15 @@ def load_state() -> dict:
                 if not _miss:
                     continue
                 _rel = _miss.group(1).replace(str(REPO) + os.sep, "", 1)
+                # 09-17: THREE path typos now resolve, not just the dunder one - the
+                # leading-dot form (.pre-commit-config.yaml) and the dropped src PREFIX
+                # (python/momentum/stochastics.rs -> rust/indicators/src/...). A step whose
+                # apply died on ENOENT for any of them was handed NO content and is not
+                # finished work and not a broken step - it never got its turn. Try every
+                # resolver and re-queue on whichever one changes the path.
                 _fix = _resolve_dunder_path(_rel)
+                if _fix == _rel:
+                    _fix = _resolve_plan_path(_rel)
                 if _fix == _rel:
                     continue
                 _real = Path(REPO) / _fix
