@@ -260,8 +260,11 @@ def default_lanes(cfg=None) -> list[Lane]:
         # letting them straight back in. A lane that claims work and produces nothing is
         # worse than an absent lane. Re-enable when the throttle lifts (the page's
         # last row is a normal watermark again and a token send returns).
-        # Lane("deepseek", "http://127.0.0.1:8080/v1/chat/completions",
-        #      ["anymodel"], 90, 270, prompt_cap=32000, timeout=270),
+        # 09-17: RE-ENABLED. Both parked accounts returned their exact tokens on a
+        # live send (:8080 -> COOL-8080-225, :8081 -> COOL-8081-25675), so the
+        # throttle had lifted. Pool 4 -> 6, which is the throughput lever on the ETA.
+        Lane("deepseek", "http://127.0.0.1:8080/v1/chat/completions",
+             ["anymodel"], 90, 270, prompt_cap=32000, timeout=270),
         # 09-12 (owner): two more signed-in deepseek webchats, each on its own
         # profile, as separate lanes. All three share the gateway's 30s send
         # spacing (MIN_SEND_INTERVAL_MS + /tmp/deepseek_last_send), so they can
@@ -273,8 +276,8 @@ def default_lanes(cfg=None) -> list[Lane]:
         # batch 1 never completed, green stayed flat). Cap it like gemini and
         # openrouter: the small prompts (557-1104 chars) answered in 3-6s.
         # 09-16: PARKED with deepseek above - same throttle, same zero responses.
-        # Lane("deepseek2", "http://127.0.0.1:8081/v1/chat/completions",
-        #      ["anymodel"], 90, 270, prompt_cap=32000, timeout=270),
+        Lane("deepseek2", "http://127.0.0.1:8081/v1/chat/completions",
+             ["anymodel"], 90, 270, prompt_cap=32000, timeout=270),
         Lane("deepseek4", "http://127.0.0.1:8083/v1/chat/completions",
              ["anymodel"], 90, 270, prompt_cap=32000, timeout=270),
         # PULLED 09-13: every auto/* combo now 402/401 on an oc/* model
