@@ -34,11 +34,21 @@ from pathlib import Path
 from typing import Any, Callable
 
 # 09-16 (owner): "if a lane doesnt provide a response in 3min, have its spot added to
-# the que and the next workable lane takes it on." Hard ceiling on how long ONE lane
-# call may hold a worker slot, applied to every lane (see LanePool.call). A lane that
-# misses it is a TRANSPORT failure: the step keeps its rounds and returns to the queue,
-# so the next workable lane picks it up. Override with ORCH_LANE_ANSWER_BUDGET.
-LANE_ANSWER_BUDGET_S = int(os.environ.get("ORCH_LANE_ANSWER_BUDGET", "180"))
+# the que and the next workable lane takes it on" - and, corrected the same evening:
+# "its not supposed to be a 180s total budget, its supposed to be a 180s waiting till
+# a first stream comes from the llm, theres not supposed to be any timer".
+#
+# That timer lives in the GATEWAY, because the gateway is what can see content arrive:
+# `EMPTY_GRACE_MS` (webchat-api/browser.js). Its counter only ever counts while the
+# newest answer row is EMPTY; it RESETS on new content and while a generation is in
+# flight, so a lane that has started answering is never guillotined. Every webchat
+# gateway must carry EMPTY_GRACE_MS=180000.
+#
+# There is deliberately NO equivalent cap in this module. A total-call budget here
+# cannot tell "still thinking" from "wedged" and cuts working lanes - measured: dahl
+# truncated inside its own <think> block, gemini killed mid-generation, throughput
+# 4x down. Per-lane `timeout` stays as a BACKSTOP and must remain ABOVE the gateway
+# hard cap.
 
 # ------------------------------------------------------------------ lanes ---
 # (name, url, models, cooldown_base, cooldown_escalated, auth_token)
@@ -1166,15 +1176,19 @@ class LanePool:
             return LaneResult(ok=False, lane=lane.name,
                               error="all models of this lane are cooled")
 
-        # 09-14 (worker, B4): per-lane budget, falling back to the global.
+        # 09-14 (worker, B4): per-lane budget, falling back to the global. This is a
+        # BACKSTOP, not the answer-wait: it must never cut a lane that is already
+        # producing. The real "has it started answering?" timer is the GATEWAY's
+        # EMPTY_GRACE_MS (180s on every webchat lane) - measured in browser.js, the
+        # empty-grace counter RESETS the moment content arrives and while a
+        # generation is in flight, so once the model starts there is no timer at all.
+        #
+        # 09-16: I briefly capped this at 180s here, reading the owner's "no response
+        # in 3min" as a total-call budget. WRONG - it guillotined lanes mid-work
+        # (dahl truncated inside its own thinking, gemini mid-generation, throughput
+        # 4x down). The 3-minute rule is TIME TO FIRST CONTENT, and it belongs to the
+        # gateway that can actually see the first token.
         lane_budget = int(lane.timeout or self.cfg.lane_timeout)
-        # 09-16 (owner): "if a lane doesnt provide a response in 3min, have its spot
-        # added to the que and the next workable lane takes it on." Ceiling on the
-        # budget, applied here rather than per-lane so it covers every lane there is
-        # and every lane added later. A timeout is a TRANSPORT result: the step does
-        # not consume a round and goes straight back to the queue for the next lane,
-        # which is the hand-off the owner asked for.
-        lane_budget = min(lane_budget, LANE_ANSWER_BUDGET_S)
         timeout = aiohttp.ClientTimeout(
             total=lane_budget,
             connect=int(self.cfg.lane_connect_timeout))
