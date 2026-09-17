@@ -564,7 +564,10 @@ def load_state() -> dict:
         try:
             _rq = _ob = 0
             for _k, _r in (st.get("steps") or {}).items():
-                if not isinstance(_r, dict) or _r.get("status") != "blocked":
+                # 09-17: this pass must cover BOTH residues from the dead solver - the 27
+                # `blocked` and the 9 `obsolete`. Gating on "blocked" alone left the
+                # obsolete nine untouched and the pass looked like it had done its job.
+                if not isinstance(_r, dict) or _r.get("status") not in ("blocked", "obsolete"):
                     continue
                 # The evidence lives in `resolved_by`, NOT blocked_reason - that field is
                 # empty on these records. Measured: resolved_by == 'escalation_solver:preflight'
@@ -572,7 +575,20 @@ def load_state() -> dict:
                 # made this pass report "re-queued 0, retired 0" on 27 real records.
                 _reason = " ".join(str(_r.get(_f) or "") for _f in
                                    ("resolved_by", "blocked_reason", "escalated_reason"))
-                if "escalation_solver" not in _reason:
+                # 09-17: the SAME residue exists in `obsolete`, from the other half of the
+                # dead solver. Measured 9 steps retired obsolete with NO reason at all, every
+                # one carrying `resolved_by: escalation_solver:persona`, every one still
+                # naming a resolvable target - the solver that parked them is disabled and
+                # masked. Treat a reason-less obsolete with that marker exactly like the
+                # blocked residue: re-queue it if it has a workable target, else give it the
+                # reason it never got. A terminal record with no reason is work dropped in
+                # silence, which is the one outcome that must never happen.
+                _is_dead_solver = ("escalation_solver" in _reason)
+                _no_reason_obsolete = (
+                    not _is_dead_solver
+                    and str(_r.get("resolved_by") or "") == ""
+                    and not str(_r.get("obsolete_reason") or ""))
+                if not _is_dead_solver and not _no_reason_obsolete:
                     continue
                 _fs = _r.get("files") or PLAN_FILES.get(_k) or []
                 if isinstance(_fs, str):
