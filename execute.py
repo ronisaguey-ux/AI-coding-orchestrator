@@ -351,7 +351,20 @@ def load_state() -> dict:
                     continue
                 _txt = _real.read_text(errors="ignore")
                 _eds = [e for e in (_la.get("edits") or []) if e.get("old_string")]
-                if not _eds or not all(e["old_string"] in _txt for e in _eds):
+                # 09-17: a READ FAIL means the lane was shown NO FILE AT ALL - the
+                # apply died before it could open the target, so whatever old_string
+                # the lane quoted was invented from a path it never saw. Requiring
+                # that old_string to be on disk therefore rejects exactly the steps
+                # that most deserve a clean attempt: measured P1B5R0F9#161
+                # (config/init.py), P1B1R0F7#76 (oculus/reporting/init.py) and
+                # P1B2R0F8#100 (oculus/runtime/init.py) are all read-fails on a
+                # dunder-stripped path that resolves now, and all three were skipped
+                # by the old_string check. Only require the match when the lane DID
+                # get content (a plain missing-old_string failure).
+                _saw_nothing = "read fail:" in str(_la.get("apply_msg") or "")
+                if not _eds and not _saw_nothing:
+                    continue
+                if _eds and not _saw_nothing and not all(e["old_string"] in _txt for e in _eds):
                     continue
                 _r["status"] = "pending"
                 _r["rounds"] = 0
