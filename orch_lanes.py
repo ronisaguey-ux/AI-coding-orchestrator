@@ -475,9 +475,16 @@ def default_lanes(cfg=None) -> list[Lane]:
         # The lane is not refusing the work - it cannot SEE the file. It answers and
         # gets cooled, and 11 claims produced 0 greens. Every lane that earns greens
         # sits at 24000-32000; gemini was the only one still at 12000.
-        Lane("gemini", "http://127.0.0.1:8085/v1/chat/completions",
-             ["gemini 3.7 flash webchat"], 300, 900,
-             prompt_cap=32000, timeout=720),
+        # 09-16 (owner): "pause gemini for now cuz im using it on a diff computer".
+        # PAUSED - the owner is driving the same Google account from another machine,
+        # and one account serialises its own turns, so our automated sends would
+        # collide with real work. The whole balanced-paren statement is commented, not
+        # just its first line (a half-commented Lane( breaks the parse). The gateway
+        # is stopped too, so nothing can send. Re-enable by uncommenting these three
+        # lines and starting oculus-gemini-gw.
+        # Lane("gemini", "http://127.0.0.1:8085/v1/chat/completions",
+        #      ["gemini 3.7 flash webchat"], 300, 900,
+        #      prompt_cap=32000, timeout=720),
         # 09-15: re-enabled after I parked it on a WRONG attribution. gw1 and gw2 share
         # one chrome, but the CDP churn is gw1's OWN behaviour - measured 50 reconnect
         # events / 4 min with gw2 stopped vs 52 with it running. Sharing is not the
