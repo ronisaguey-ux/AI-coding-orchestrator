@@ -622,6 +622,36 @@ def load_state() -> dict:
                       f"obsolete (the solver that blocked them is disabled)", flush=True)
         except Exception as _e:
             print(f"[eng] blocked-residue pass skipped: {str(_e)[:120]}", flush=True)
+        # 09-17: retire steps whose PLAN TEXT IS EMPTY. The engine builds the task as
+        #   STEP <sid>: <title> / STATE: <finding> / FIX GUIDANCE: <fix> / MECHANISM: <mechanism>
+        # and measured on this plan 1,142 steps carry nothing in ANY of those - the title is
+        # literally "Fix P1B0R0F0: " with nothing after the colon. A lane handed that can only
+        # answer cannot-fix, which is exactly what its verdicts say in their own words
+        # ("No defect or intended change is specified; STATE, FIX GUIDANCE, and MECHANISM are
+        # empty"). 591 were still PENDING, i.e. guaranteed to burn a lane call and retire
+        # yellow. Retire them with the reason instead - the same disposition the out-of-repo
+        # and runtime-target classes already get. Reversible: flip status back to pending.
+        try:
+            _e = 0
+            for _k, _r in (st.get("steps") or {}).items():
+                if not isinstance(_r, dict) or _r.get("status") not in ("pending", "yellow"):
+                    continue
+                _txt = PLAN_STEP_TEXT.get(_k)
+                if _txt is None:
+                    continue
+                _txt = _txt.replace("Fix %s:" % _k, " ").replace("Fix %s" % _k, " ")
+                if len(_txt.strip()) < 30:
+                    _r["status"] = "obsolete"
+                    _r["obsolete_reason"] = (
+                        "the plan step carries no guidance at all - its title, finding, fix, "
+                        "mechanism, impact and reason are all empty, so no lane can act on it "
+                        "(every attempt answers cannot-fix for exactly that reason)")
+                    _e += 1
+            if _e:
+                print(f"[eng] retired {_e} step(s) whose plan text is empty - no lane can act "
+                      f"on a step with no defect or guidance", flush=True)
+        except Exception as _e:
+            print(f"[eng] empty-step retirement skipped: {str(_e)[:120]}", flush=True)
         # 09-16: the second recovery rule - a yellow whose OWN fix(step <sid>)
         # commit exists is finished work too. Doing this from an external script
         # does NOT stick (the engine writes its in-memory yellow back), and it
@@ -1810,6 +1840,43 @@ def _load_plan_files() -> dict:
 
 PLAN_TITLES = {}
 PLAN_FILES = _load_plan_files()
+def _load_plan_step_text() -> dict:
+    """sid -> the step's own guidance text, straight from the plan on disk.
+
+    09-17: the engine composes a task as
+      STEP <sid>: <title> / STATE: <finding> / FIX GUIDANCE: <fix> / MECHANISM: <mechanism>
+    and on this plan 1,142 steps carry NOTHING in any of those fields - the title is literally
+    "Fix P1B0R0F0: " with nothing after the colon. A lane handed that can only answer
+    cannot-fix, which is what its verdicts say word for word. Used to retire them honestly
+    instead of burning a lane call each.
+    """
+    out = {}
+    try:
+        for cand in (os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  "..", "..", "audits_plans",
+                                  "oculus_cross_eval_plan_9_4_fixed.json"),):
+            if not os.path.exists(cand):
+                continue
+            data = json.load(open(cand))
+            steps = data.get("steps") if isinstance(data, dict) else data
+            if isinstance(steps, dict):
+                steps = list(steps.values())
+            for stp in steps or []:
+                if not isinstance(stp, dict):
+                    continue
+                sid = stp.get("finding_id") or stp.get("sid") or stp.get("id")
+                if not sid:
+                    continue
+                out[str(sid)] = " ".join(
+                    str(stp.get(f) or "") for f in
+                    ("finding", "fix", "mechanism", "impact", "reason", "title"))
+    except Exception:
+        pass
+    return out
+
+
+PLAN_STEP_TEXT = _load_plan_step_text()
+
 
 MAX_YELLOW_REASON = int(os.environ.get("ORCH_MAX_YELLOW_REASON", "2000"))
 
