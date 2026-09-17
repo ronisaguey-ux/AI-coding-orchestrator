@@ -291,78 +291,6 @@ def default_lanes(cfg=None) -> list[Lane]:
           # draw behind it. The model itself handles 10 in parallel. So run several lanes
           # with the same model: each gets its own pool identity, its own cooldown and its
           # own in-flight call, which is exactly the throughput lever the pool is for.
-          Lane("unionalpha", "https://openrouter.ai/api/v1/chat/completions",
-               ["stealth/union-alpha"],
-               45, 120, prompt_cap=24000, auth=key, timeout=240),
-          Lane("unionalpha2", "https://openrouter.ai/api/v1/chat/completions",
-               ["stealth/union-alpha"],
-               45, 120, prompt_cap=24000, auth=key, timeout=240),
-          Lane("unionalpha3", "https://openrouter.ai/api/v1/chat/completions",
-               ["stealth/union-alpha"],
-               45, 120, prompt_cap=24000, auth=key, timeout=240),
-          Lane("unionalpha4", "https://openrouter.ai/api/v1/chat/completions",
-               ["stealth/union-alpha"],
-               45, 120, prompt_cap=24000, auth=key, timeout=240),
-          Lane("unionalpha5", "https://openrouter.ai/api/v1/chat/completions",
-               ["stealth/union-alpha"],
-               45, 120, prompt_cap=24000, auth=key, timeout=240),
-          Lane("unionalpha6", "https://openrouter.ai/api/v1/chat/completions",
-               ["stealth/union-alpha"],
-               45, 120, prompt_cap=24000, auth=key, timeout=240),
-          Lane("unionalpha7", "https://openrouter.ai/api/v1/chat/completions",
-               ["stealth/union-alpha"],
-               45, 120, prompt_cap=24000, auth=key, timeout=240),
-          Lane("unionalpha8", "https://openrouter.ai/api/v1/chat/completions",
-               ["stealth/union-alpha"],
-               45, 120, prompt_cap=24000, auth=key, timeout=240),
-          Lane("unionalpha9", "https://openrouter.ai/api/v1/chat/completions",
-               ["stealth/union-alpha"],
-               45, 120, prompt_cap=24000, auth=key, timeout=240),
-          Lane("unionalpha10", "https://openrouter.ai/api/v1/chat/completions",
-               ["stealth/union-alpha"],
-               45, 120, prompt_cap=24000, auth=key, timeout=240),
-          Lane("unionalpha11", "https://openrouter.ai/api/v1/chat/completions",
-               ["stealth/union-alpha"],
-               45, 120, prompt_cap=24000, auth=key, timeout=240),
-          Lane("unionalpha12", "https://openrouter.ai/api/v1/chat/completions",
-               ["stealth/union-alpha"],
-               45, 120, prompt_cap=24000, auth=key, timeout=240),
-          Lane("unionalpha13", "https://openrouter.ai/api/v1/chat/completions",
-               ["stealth/union-alpha"],
-               45, 120, prompt_cap=24000, auth=key, timeout=240),
-          Lane("unionalpha14", "https://openrouter.ai/api/v1/chat/completions",
-               ["stealth/union-alpha"],
-               45, 120, prompt_cap=24000, auth=key, timeout=240),
-          Lane("unionalpha15", "https://openrouter.ai/api/v1/chat/completions",
-               ["stealth/union-alpha"],
-               45, 120, prompt_cap=24000, auth=key, timeout=240),
-          Lane("unionalpha16", "https://openrouter.ai/api/v1/chat/completions",
-               ["stealth/union-alpha"],
-               45, 120, prompt_cap=24000, auth=key, timeout=240),
-          Lane("unionalpha17", "https://openrouter.ai/api/v1/chat/completions",
-               ["stealth/union-alpha"],
-               45, 120, prompt_cap=24000, auth=key, timeout=240),
-          Lane("unionalpha18", "https://openrouter.ai/api/v1/chat/completions",
-               ["stealth/union-alpha"],
-               45, 120, prompt_cap=24000, auth=key, timeout=240),
-          Lane("unionalpha19", "https://openrouter.ai/api/v1/chat/completions",
-               ["stealth/union-alpha"],
-               45, 120, prompt_cap=24000, auth=key, timeout=240),
-          Lane("unionalpha20", "https://openrouter.ai/api/v1/chat/completions",
-               ["stealth/union-alpha"],
-               45, 120, prompt_cap=24000, auth=key, timeout=240),
-          Lane("unionalpha21", "https://openrouter.ai/api/v1/chat/completions",
-               ["stealth/union-alpha"],
-               45, 120, prompt_cap=24000, auth=key, timeout=240),
-          Lane("unionalpha22", "https://openrouter.ai/api/v1/chat/completions",
-               ["stealth/union-alpha"],
-               45, 120, prompt_cap=24000, auth=key, timeout=240),
-          Lane("unionalpha23", "https://openrouter.ai/api/v1/chat/completions",
-               ["stealth/union-alpha"],
-               45, 120, prompt_cap=24000, auth=key, timeout=240),
-          Lane("unionalpha24", "https://openrouter.ai/api/v1/chat/completions",
-               ["stealth/union-alpha"],
-               45, 120, prompt_cap=24000, auth=key, timeout=240),
         # 09-16: PARKED - both accounts are under DeepSeek's "Messages too frequent"
         # throttle, verified by reading the PAGE over CDP (:9229 and :9225 both report
         # tooFrequent=true while :9227 reads false), and neither produces a reply at
@@ -376,7 +304,7 @@ def default_lanes(cfg=None) -> list[Lane]:
         # live send (:8080 -> COOL-8080-225, :8081 -> COOL-8081-25675), so the
         # throttle had lifted. Pool 4 -> 6, which is the throughput lever on the ETA.
         Lane("deepseek", "http://127.0.0.1:8080/v1/chat/completions",
-             ["anymodel"], 90, 270, prompt_cap=20000, timeout=1500),
+             ["anymodel"], 90, 270, prompt_cap=20000, timeout=600),
         # 09-12 (owner): two more signed-in deepseek webchats, each on its own
         # profile, as separate lanes. All three share the gateway's 30s send
         # spacing (MIN_SEND_INTERVAL_MS + /tmp/deepseek_last_send), so they can
@@ -389,9 +317,9 @@ def default_lanes(cfg=None) -> list[Lane]:
         # openrouter: the small prompts (557-1104 chars) answered in 3-6s.
         # 09-16: PARKED with deepseek above - same throttle, same zero responses.
         Lane("deepseek2", "http://127.0.0.1:8081/v1/chat/completions",
-             ["anymodel"], 90, 270, prompt_cap=20000, timeout=1500),
+             ["anymodel"], 90, 270, prompt_cap=20000, timeout=600),
         Lane("deepseek4", "http://127.0.0.1:8083/v1/chat/completions",
-             ["anymodel"], 90, 270, prompt_cap=20000, timeout=1500),
+             ["anymodel"], 90, 270, prompt_cap=20000, timeout=600),
         # PULLED 09-13: every auto/* combo now 402/401 on an oc/* model
         # Lane("omniroute", "http://127.0.0.1:20128/v1/chat/completions",
              # 09-12 LATER: the auto/* combos load-balance and now route onto
@@ -1629,3 +1557,12 @@ async def _selftest() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(asyncio.run(_selftest()))
+
+
+# 09-17 19:40 - stealth/union-alpha WAS WITHDRAWN after ~3 hours, not the week Bob expected.
+# Verified live: POST /v1/chat/completions -> HTTP 404
+#   {"error":{"message":"Thank you for participating in the Stealth Union Alpha testing
+#    period. This model was Unbiased's Pareto...","code":404}}
+# and the id no longer appears in GET /models (445 models, zero union/alpha).
+# All 24 unionalpha lanes were removed as a group. Re-adding a stealth id requires probing
+# the endpoint FIRST - a dead id 404s on every lane and the pool collapses onto the survivors.
