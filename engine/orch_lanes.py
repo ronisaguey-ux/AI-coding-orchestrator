@@ -960,6 +960,18 @@ _WEBCHAT_TRANSIENT = (
 )
 
 
+
+def _lane_is_webchat(lane) -> bool:
+    """True when this lane is driven through a local browser gateway, not an API.
+
+    Webchat lanes point at 127.0.0.1:<port> (their conversation lives in the tab);
+    API lanes point at a remote host. Used to decide whether cross-step history
+    must be injected into the request - it must NOT be for a webchat.
+    """
+    url = str(getattr(lane, "url", "") or "")
+    return "127.0.0.1" in url or "localhost" in url
+
+
 def _is_webchat_transient(body: str) -> bool:
     low = (body or "").lower()
     return any(sig in low for sig, _ in _WEBCHAT_TRANSIENT)
@@ -1266,7 +1278,13 @@ class LanePool:
             # 09-17 (BOB): the lane's OWN cross-step memory first, then this task's
             # retries on top - the task's turns are newer and must survive truncation
             # before the staler cross-step ones.
-            _all_hist = list(getattr(lane, "history", None) or []) + list(history or [])
+            # 09-17 (BOB): history is injected for API lanes ONLY. A webchat lane's
+            # conversation already lives in its tab, so re-sending past turns is
+            # redundant there and eats the prompt budget the task actually needs;
+            # a webchat's history is cleared by opening a NEW CHAT instead.
+            _is_webchat = _lane_is_webchat(lane)
+            _all_hist = ([] if _is_webchat
+                         else list(getattr(lane, "history", None) or []) + list(history or []))
             if _all_hist:
                 # prior assistant/user turns so a lane remembers why the previous
                 # attempt failed instead of re-trying blind.
