@@ -57,6 +57,14 @@ _TRANSPORT_MARKERS = (
     # exactly that string — a lane that never answered is not a verdict about the
     # code, so those must retry, never terminate.
     "timeout after", "timed out",
+    # 09-17: a lane that REFUSES a draw because its tab is still generating is the
+    # same class - the lane could not be reached, so it says nothing about the code.
+    # Measured on chatgpt: 5 sends / 0 responses / 4 refusals, every one reading
+    # "webchat tab still generating from a previous request - retry after it finishes".
+    # That tab needs ~360s per generation, so at the engine's draw rate most attempts
+    # collide with an in-flight one. Burning a step's round on a collision retires work
+    # a working lane simply had not finished talking about yet.
+    "still generating from a previous request", "still generating",
     # 09-16: a provider-side 401 "model not supported" is the same class as the 429
     # above - the LANE could not be reached, so it says nothing about the code.
     # Measured: 11 yellow steps sat at rounds=3 whose ONLY lane error was
