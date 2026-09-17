@@ -487,6 +487,45 @@ def load_state() -> dict:
                       f"for a region beyond the {24000}-char window", flush=True)
         except Exception as _e:
             print(f"[eng] big-file re-queue skipped: {str(_e)[:120]}", flush=True)
+        # 09-17: the same blind-context class, caught by its CAUSE instead of by the lane's
+        # wording. Measured: 90 yellows whose PLAN TARGET FILE is bigger than the 24000-char
+        # window - the lane was shown numbered head/tail windows, never the region it was
+        # asked to edit, so cannot-fix was the only answer available to it. My earlier check
+        # said "0 of 4" because it read `last_apply.edits[].file`, and a cannot-fix HAS NO
+        # EDITS; the right field is the step's own plan file list. see_next_chunk (ce662fe)
+        # exists for exactly this, so these get one clean attempt with the tool built for it.
+        try:
+            _c = 0
+            for _k, _r in (st.get("steps") or {}).items():
+                if not isinstance(_r, dict) or _r.get("status") != "yellow":
+                    continue
+                _fs = _r.get("files") or PLAN_FILES.get(_k) or []
+                if isinstance(_fs, str):
+                    _fs = [_fs]
+                for _f in _fs:
+                    _rp = _resolve_plan_path(str(_f))
+                    _p = os.path.join(REPO, _rp.lstrip("/"))
+                    try:
+                        _sz = os.path.getsize(_p)
+                    except OSError:
+                        continue
+                    if _sz <= 24000:
+                        continue
+                    _r["status"] = "pending"
+                    _r["rounds"] = 0
+                    _r["requeued_reason"] = (
+                        "%s is %d chars, past the %d-char window the lane was shown, so it "
+                        "never saw the region it was asked to edit and could only answer "
+                        "cannot-fix. see_next_chunk now exists, so it gets one clean attempt "
+                        "with the tool built for it." % (_rp, _sz, 24000))
+                    _c += 1
+                    break
+            if _c:
+                print(f"[eng] re-queued {_c} yellow step(s) whose PLAN TARGET file is "
+                      f"larger than the {24000}-char window - they were working blind",
+                      flush=True)
+        except Exception as _e:
+            print(f"[eng] blind-context re-queue skipped: {str(_e)[:120]}", flush=True)
         # 09-17: catch-all so "unreviewed" is always a number anyone can check, never a
         # promise. Every one of the rules above stamps a verdict when it acts; a yellow
         # that matched none of them was reaching the watch with no verdict at all
