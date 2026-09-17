@@ -278,7 +278,26 @@ def default_lanes(cfg=None) -> list[Lane]:
           # actually MEASURED - lanes that earn greens sit at 24000-32000).
           # A stealth id can be withdrawn without notice: if it starts 404ing or
           # returning empty, probe it and pull it rather than cooling it forever.
+          # 09-17 (BOB): "see at what extent its rate limited, maybe even add multiple
+          # lanes with union alpha". Measured before acting:
+          #   10 sequential, no gap      -> 10/10 HTTP 200, median 3.5s, 0 errors
+          #   conc=4 / conc=8            -> 4/4 and 8/8 HTTP 200, no errors
+          #   sustained conc=10, 60 call -> 60/60 HTTP 200 in 88s = 40.7 calls/min, 0 errors
+          #   no-gap burst to 50 calls   -> still 49/50 200, BUT one call STALLED to the
+          #     120s curl ceiling. That stall - not a 429 - is what the engine hit on a
+          #     live step, and it is why one lane can look flaky while the model is fine.
+          # CONCLUSION: the constraint is CONCURRENCY-PER-LANE, not total volume and not an
+          # account quota. A single lane serialises, so one slow upstream call blocks every
+          # draw behind it. The model itself handles 10 in parallel. So run several lanes
+          # with the same model: each gets its own pool identity, its own cooldown and its
+          # own in-flight call, which is exactly the throughput lever the pool is for.
           Lane("unionalpha", "https://openrouter.ai/api/v1/chat/completions",
+               ["stealth/union-alpha"],
+               45, 120, prompt_cap=24000, auth=key, timeout=120),
+          Lane("unionalpha2", "https://openrouter.ai/api/v1/chat/completions",
+               ["stealth/union-alpha"],
+               45, 120, prompt_cap=24000, auth=key, timeout=120),
+          Lane("unionalpha3", "https://openrouter.ai/api/v1/chat/completions",
                ["stealth/union-alpha"],
                45, 120, prompt_cap=24000, auth=key, timeout=120),
         # 09-16: PARKED - both accounts are under DeepSeek's "Messages too frequent"
