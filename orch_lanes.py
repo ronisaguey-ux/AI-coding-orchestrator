@@ -300,6 +300,21 @@ def default_lanes(cfg=None) -> list[Lane]:
           Lane("unionalpha3", "https://openrouter.ai/api/v1/chat/completions",
                ["stealth/union-alpha"],
                45, 120, prompt_cap=24000, auth=key, timeout=120),
+          Lane("unionalpha4", "https://openrouter.ai/api/v1/chat/completions",
+               ["stealth/union-alpha"],
+               45, 120, prompt_cap=24000, auth=key, timeout=120),
+          Lane("unionalpha5", "https://openrouter.ai/api/v1/chat/completions",
+               ["stealth/union-alpha"],
+               45, 120, prompt_cap=24000, auth=key, timeout=120),
+          Lane("unionalpha6", "https://openrouter.ai/api/v1/chat/completions",
+               ["stealth/union-alpha"],
+               45, 120, prompt_cap=24000, auth=key, timeout=120),
+          Lane("unionalpha7", "https://openrouter.ai/api/v1/chat/completions",
+               ["stealth/union-alpha"],
+               45, 120, prompt_cap=24000, auth=key, timeout=120),
+          Lane("unionalpha8", "https://openrouter.ai/api/v1/chat/completions",
+               ["stealth/union-alpha"],
+               45, 120, prompt_cap=24000, auth=key, timeout=120),
         # 09-16: PARKED - both accounts are under DeepSeek's "Messages too frequent"
         # throttle, verified by reading the PAGE over CDP (:9229 and :9225 both report
         # tooFrequent=true while :9227 reads false), and neither produces a reply at
