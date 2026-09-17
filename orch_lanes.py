@@ -293,28 +293,28 @@ def default_lanes(cfg=None) -> list[Lane]:
           # own in-flight call, which is exactly the throughput lever the pool is for.
           Lane("unionalpha", "https://openrouter.ai/api/v1/chat/completions",
                ["stealth/union-alpha"],
-               45, 120, prompt_cap=24000, auth=key, timeout=120),
+               45, 120, prompt_cap=24000, auth=key, timeout=240),
           Lane("unionalpha2", "https://openrouter.ai/api/v1/chat/completions",
                ["stealth/union-alpha"],
-               45, 120, prompt_cap=24000, auth=key, timeout=120),
+               45, 120, prompt_cap=24000, auth=key, timeout=240),
           Lane("unionalpha3", "https://openrouter.ai/api/v1/chat/completions",
                ["stealth/union-alpha"],
-               45, 120, prompt_cap=24000, auth=key, timeout=120),
+               45, 120, prompt_cap=24000, auth=key, timeout=240),
           Lane("unionalpha4", "https://openrouter.ai/api/v1/chat/completions",
                ["stealth/union-alpha"],
-               45, 120, prompt_cap=24000, auth=key, timeout=120),
+               45, 120, prompt_cap=24000, auth=key, timeout=240),
           Lane("unionalpha5", "https://openrouter.ai/api/v1/chat/completions",
                ["stealth/union-alpha"],
-               45, 120, prompt_cap=24000, auth=key, timeout=120),
+               45, 120, prompt_cap=24000, auth=key, timeout=240),
           Lane("unionalpha6", "https://openrouter.ai/api/v1/chat/completions",
                ["stealth/union-alpha"],
-               45, 120, prompt_cap=24000, auth=key, timeout=120),
+               45, 120, prompt_cap=24000, auth=key, timeout=240),
           Lane("unionalpha7", "https://openrouter.ai/api/v1/chat/completions",
                ["stealth/union-alpha"],
-               45, 120, prompt_cap=24000, auth=key, timeout=120),
+               45, 120, prompt_cap=24000, auth=key, timeout=240),
           Lane("unionalpha8", "https://openrouter.ai/api/v1/chat/completions",
                ["stealth/union-alpha"],
-               45, 120, prompt_cap=24000, auth=key, timeout=120),
+               45, 120, prompt_cap=24000, auth=key, timeout=240),
         # 09-16: PARKED - both accounts are under DeepSeek's "Messages too frequent"
         # throttle, verified by reading the PAGE over CDP (:9229 and :9225 both report
         # tooFrequent=true while :9227 reads false), and neither produces a reply at
@@ -1226,6 +1226,7 @@ class LanePool:
             if lane is None:
                 break
             tried.add(lane.name)
+            t_lane = time.time()
             res = await self._call_lane(session, lane, system, user, history=history)
             res.elapsed = time.time() - started
             # An HTTP 200 with empty content is NOT a usable answer for an edit
@@ -1261,7 +1262,13 @@ class LanePool:
             if res.ok:
                 self.log(f"[lanes] {lane.name} empty/no-edits answer ({len(res.content)}B) — hopping")
             else:
-                self.log(f"[lanes] {lane.name} failed ({res.error[:120]}) — hopping")
+                # 09-17: the per-lane budget is a BACKSTOP and nothing logged how close a
+                # lane came to it, so a 120s timeout could not be told apart from a stall
+                # or from a genuinely slow call. Record the real per-call latency (and the
+                # prompt size) so a budget claim rests on a number.
+                self.log(f"[lanes] {lane.name} failed "
+                         f"(prompt={len(system) + len(user)} chars, "
+                         f"elapsed={time.time() - t_lane:.1f}s) ({res.error[:120]}) — hopping")
             last = res
 
         last.elapsed = time.time() - started
