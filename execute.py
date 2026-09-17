@@ -1441,6 +1441,22 @@ def _resolve_plan_path(rel: str) -> str:
         dunder = os.path.join(head, "__" + stem + "__" + ext)
         if os.path.exists(os.path.join(root, dunder)):
             return dunder
+    # 09-17: the third variant of the same failure - the plan drops the src PREFIX.
+    # `python/momentum/stochastics.rs` is onlyreal at
+    # `rust/indicators/src/python/momentum/stochastics.rs`, so the step was handed no
+    # content and retired as if it could not be fixed. Tried ONLY when the literal
+    # path is missing, and ONLY when exactly ONE candidate root holds the file -
+    # measured on the live state, 18 unresolved read-fail paths and exactly 1 with a
+    # single unambiguous root. Anything ambiguous stays missing; it is never invented.
+    for _pre in ("rust/indicators/src", "rust/execution/src", "rust"):
+        _cand = os.path.join(_pre, r)
+        if not os.path.exists(os.path.join(root, _cand)):
+            continue
+        _others = [os.path.join(p, r) for p in ("rust/indicators/src", "rust/execution/src", "rust")
+                   if p != _pre and os.path.exists(os.path.join(root, p, r))]
+        if _others:
+            break
+        return _cand
     return r
 
 
