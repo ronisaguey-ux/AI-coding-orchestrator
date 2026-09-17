@@ -1728,9 +1728,15 @@ def apply_edits(edits: list) -> tuple:
     # the work away, and refuse an empty target path with a clear message.
     _aliases = {
         "file": ("file", "filePath", "file_path", "path", "filename"),
-        "old_string": ("old_string", "oldStr", "old_str", "old", "oldText"),
+        "old_string": ("old_string", "oldStr", "old_str", "old", "oldText",
+                       # 09-17: measured on P1B5R0F4#218 - the lane returned
+                       # {"find": "...", "replace": "..."}, which IS our semantics
+                       # (search and replace this text) under a different name. The
+                       # engine called it "the edit names no target file" because the
+                       # pair was unrecognised. Accept the find/replace spelling too.
+                       "find", "search"),
         "new_string": ("new_string", "newStr", "new_str", "new", "newText",
-                       "content", "text"),
+                       "content", "text", "replace", "replacement"),
     }
 
     def _pick(e: dict, key: str) -> str:
