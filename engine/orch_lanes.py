@@ -113,6 +113,14 @@ class Lane:
     dead_until: float = 0.0
     model_dead: dict[str, float] = field(default_factory=dict)
     model_fails: dict[str, int] = field(default_factory=dict)
+    # 09-17 (BOB): "its suppoded to store history every 5 steps and reset just like the
+    # webchays, no wonder its not doing well, it has amnisia". The pool already accepted
+    # a `history=[...]` argument, but every caller started it EMPTY per task
+    # (execute.py:1348), so a lane remembered only its own retries inside one step and
+    # nothing across steps - it re-solved the same table blind every time. This is the
+    # cross-step memory; reset_context() clears it every N completed steps exactly like
+    # a webchat tab is reset. Capped in _call_lane.
+    history: list[dict] = field(default_factory=list)
     last_call: float = 0.0
     calls: int = 0
     failures: int = 0
@@ -1255,14 +1263,18 @@ class LanePool:
             _sys = system[:min(60000, _cap)]
             msgs: list[dict] = [{"role": "system", "content": _sys}]
             _budget = max(0, _cap - len(_sys))
-            if history:
-                # prior assistant/user turns (same task) so an API lane remembers
-                # why the previous attempt failed instead of re-trying blind.
+            # 09-17 (BOB): the lane's OWN cross-step memory first, then this task's
+            # retries on top - the task's turns are newer and must survive truncation
+            # before the staler cross-step ones.
+            _all_hist = list(getattr(lane, "history", None) or []) + list(history or [])
+            if _all_hist:
+                # prior assistant/user turns so a lane remembers why the previous
+                # attempt failed instead of re-trying blind.
                 # History is the FIRST thing sacrificed when the budget is tight:
                 # it is context, the current user turn is the actual task.
                 _hist_budget = _budget // 3
                 _turns = []
-                for turn in reversed(history[-6:]):   # newest first
+                for turn in reversed(_all_hist[-8:]):   # newest first
                     r = str(turn.get("role") or "")
                     c = str(turn.get("content") or "")
                     if r not in ("assistant", "user") or not c:
@@ -1328,6 +1340,19 @@ class LanePool:
                                                   error="empty 200 answer (dead lane)")
                             lane.model_fails[model] = 0
                             lane.model_dead.pop(model, None)  # 09-06: success resets ladder
+                            # 09-17 (BOB): carry this exchange to the lane's NEXT step.
+                            # reset_context() clears it every N completed steps - the same
+                            # cadence a webchat tab is reset on. Capped so the prompt cannot
+                            # creep: the request truncates to the newest 8 turns.
+                            try:
+                                _h = getattr(lane, "history", None)
+                                if _h is not None:
+                                    _h.append({"role": "user", "content": user[:4000]})
+                                    _h.append({"role": "assistant", "content": content[:4000]})
+                                    if len(_h) > 8:
+                                        del _h[:-8]
+                            except Exception:
+                                pass
                             return LaneResult(ok=True, content=content,
                                               lane=lane.name, model=model,
                                               status=200, attempts=attempt)
@@ -1407,7 +1432,14 @@ class LanePool:
         forces API lanes to forget and lets the engine drive the cadence.
         """
         for lane in self.lanes:
-            lane.failures = max(0, lane.failures)  # keep failures, just clear msgs
+            lane.failures = max(0, lane.failures)  # keep failures, clear msgs
+            # 09-17 (BOB): this is what the docstring always claimed and the code never
+            # did - the per-lane cross-step history is dropped HERE, on the same
+            # every-N-completed-steps cadence a webchat tab is reset on.
+            try:
+                lane.history.clear()
+            except Exception:
+                lane.history = []
         self.log("[lanes] pool context reset (every-N-completed-steps)")
 
     async def probe(self, session, timeout: int = 12) -> dict[str, bool]:
