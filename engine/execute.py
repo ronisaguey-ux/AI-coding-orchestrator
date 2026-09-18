@@ -128,7 +128,27 @@ _ALREADY_VERB = re.compile(
     r"\balready\s+(?:fully\s+|completely\s+|already\s+)?(?:imports?|implements?|uses?|exists?|validates?|escalates?|"
     r"forwards?|lists?|starts?|contains?|declares?|defines?|carries|populated|"
     r"complete|fixed|resolved|removed|replaced|absent|present|"
-    r"been\s+(?:applied|implemented|fixed|added|updated|removed|changed|replaced))\b",
+    # 09-18: the forms lanes ACTUALLY used on verdicts I then verified against the
+    # files by hand. Measured on 51 fresh yellows, 8 were finished work the detector
+    # missed because the verb was not in the list: "already satisfies the declarative
+    # re-export manifest requirements", "already show the canonical implementation",
+    # "already documents _sharpe_from_equity as diagnostic-only", "already a facade
+    # re-exporting RiskPolicy", "already a proper deprecation notice", "already
+    # hard-deleted". Each was checked against the target file before being added.
+    # Deliberately still NOT a bare `already \w+`: "already spent", "already tried",
+    # "already burned", "already claimed", "already cooled", "already at MAX_ROUNDS"
+    # describe the ENGINE's attempts, not the state of the code.
+    r"satisf(?:y|ies|ied)|shows?|documents?|hard-?deleted|"
+    r"a\s+(?:facade|proper|thin|deprecation\s+notice|re-export\s+manifest)|"
+
+    # a cannot-fix that says the target was retired/deleted is finished work: the step
+    # is moot. Verified by hand on P1B6R0F1#56 / P1B6R0F2#64 - the target is a 158-byte
+    # "Compatibility shim for the retired GAController module", with no step() to remove.
+    r"(?:has|have|had)\s+been\s+(?:entirely\s+|fully\s+|completely\s+)?(?:removed|deleted|retired|dropped)|"
+    r"been\s+(?:applied|implemented|fixed|added|updated|removed|changed|replaced))\b"
+    # standalone: a cannot-fix saying the target is gone means the step is moot, and
+    # these verdicts do NOT carry "already" ("The step() method no longer exists.").
+    r"|\bno\s+longer\s+exists?\b",
     re.I)
 
 
@@ -820,7 +840,28 @@ def load_state() -> dict:
                 if not isinstance(_r, dict) or _r.get("status") != "yellow":
                     continue
                 _said = str((_r.get("last_apply") or {}).get("lane_said") or "")
+                if not _said:
+                    # fall back to the lane's OWN words inside the rebuilt reason, and
+                    # ONLY that segment: the surrounding sentence carries the engine's
+                    # own "round budget already spent", which would false-match the
+                    # detector (documented: it manufactures ~148 fake hits).
+                    _j = str(_r.get("yellow_justification") or "")
+                    _m = re.search(r"in its own words:\s*(.+)$", _j, re.S)
+                    if _m:
+                        _said = _m.group(1)
+                # A verdict that says the lane could NOT SEE its material is not a
+                # statement about the code. Measured on the first run of this fallback:
+                # 7 of 37 recoveries were blind-window/missing-file verdicts
+                # ("README.md contents were not supplied", "the supplied window ... ends
+                # mid-token at line 235", "no plan content provided"). Greening those
+                # claims finished work on evidence the lane never had; the blind-window
+                # re-queue pass above already handles that class properly.
+                _blind = ("not supplied", "were not provided", "not provided",
+                          "was not supplied", "cannot be anchored", "contents were not",
+                          "ends mid-token", "no plan content", "not established")
                 if not _said or not is_already_satisfied(_said):
+                    continue
+                if any(_p in _said.lower() for _p in _blind):
                     continue
                 _r["status"] = "green"
                 _r["resolved_by"] = (
