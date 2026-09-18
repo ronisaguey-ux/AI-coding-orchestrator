@@ -1331,6 +1331,7 @@ class LanePool:
         last_status = 0
         refreshed_key = False   # 09-14: at most ONE key mint per lane call
 
+        _timed_out = False
         for model in models:
             # 09-14 (worker, B5): `prompt_cap` is a promise about what this lane
             # can swallow, but it was applied to the USER turn ONLY. The system
@@ -1496,7 +1497,18 @@ class LanePool:
                     last_err = (f"timeout after {lane_budget}s"
                                 f"{'' if lane.timeout is None else ' (per-lane budget)'}")
                     self._cool_model(lane, model, escalated=True)
-                    break  # a hanging gateway must not be retried in place
+                    # 09-18: break out of the MODEL loop too, not just the attempt loop.
+                    # A lane iterates its own `models` list, so a timeout that only broke
+                    # the attempt loop moved straight on to the NEXT model and spent
+                    # another full budget on the same hung upstream - the lane budget was
+                    # multiplied by the model count. Measured on openrouter (5 models,
+                    # budget 120s): engine logs read `elapsed=363-485s` against
+                    # `timeout after 120s`, i.e. up to 4 budgets burned on ONE step.
+                    # The same doctrine as the line above: a hanging upstream must not be
+                    # walked back into. Fast failures (429/502) still rotate models, so
+                    # this only stops the multiplication on TIMEOUTS.
+                    _timed_out = True
+                    break
                 except Exception as exc:  # aiohttp connection errors
                     lane.failures += 1
                     last_err = f"{type(exc).__name__}: {str(exc)[:140]}"
@@ -1504,6 +1516,8 @@ class LanePool:
                         self._cool_model(lane, model)
                     else:
                         await asyncio.sleep(3 * attempt)
+            if _timed_out:
+                break  # one hung upstream must not be walked back into model by model
 
         # gemini is never cooled (Bob rule: cooldowns are omniroute-only).
         if lane.name != "gemini" and not lane.available_models(time.time()):
