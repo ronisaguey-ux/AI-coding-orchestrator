@@ -384,11 +384,20 @@ def default_lanes(cfg=None) -> list[Lane]:
         # tencent/hy3-free, z-ai/glm-5.3-flash-free all returned 200. This is an
         # API lane: no browser tab, no per-account mutex, no anti-ban gap — it can
         # take many concurrent calls, so it is the real throughput lever.
-#         Lane("orcarouter", "https://api.orcarouter.ai/v1/chat/completions",
-#              ["deepseek/deepseek-v4-flash-free", "orcarouter/free",
-#               "tencent/hy3-free", "z-ai/glm-5.3-flash-free"],
-#              45, 120, prompt_cap=24000, timeout=120,
-#              auth="sk-orca-KNVShgXMQpSKanLRM8BFK6ZKyVCFoN3IhIdnZxubslG"),
+        # 09-17: ORCAROUTER RE-ENABLED. It was pulled 09-15 as dead weight (429
+        # free_rate_limited on every call). A pull reason EXPIRES - re-measured before
+        # wiring, and ALL FOUR models answered the engine's OWN edits contract 4/4:
+        #   deepseek/deepseek-v4-flash-free  4/4  median 2.9s
+        #   orcarouter/free                  4/4  median 2.2s
+        #   tencent/hy3-free                 4/4  median 2.9s
+        #   z-ai/glm-5.3-flash-free          4/4  median 3.5s
+        # Like bitdeer this is an API lane: no tab, no per-account mutex, no anti-ban gap, so
+        # it can take concurrent calls - the throughput lever now the stealth model is gone.
+        Lane("orcarouter", "https://api.orcarouter.ai/v1/chat/completions",
+             ["deepseek/deepseek-v4-flash-free", "orcarouter/free",
+              "tencent/hy3-free", "z-ai/glm-5.3-flash-free"],
+             45, 120, prompt_cap=24000, timeout=120,
+             auth="sk-orca-KNVShgXMQpSKanLRM8BFK6ZKyVCFoN3IhIdnZxubslG"),
 
         # 09-15 (data-driven pull): orcarouter is DEAD WEIGHT. Over 3 hours it
         # made 86 claims, failed 33 times, was ladder-cooled 44 times and
