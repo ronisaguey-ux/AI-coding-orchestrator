@@ -148,7 +148,17 @@ _ALREADY_VERB = re.compile(
     r"been\s+(?:applied|implemented|fixed|added|updated|removed|changed|replaced))\b"
     # standalone: a cannot-fix saying the target is gone means the step is moot, and
     # these verdicts do NOT carry "already" ("The step() method no longer exists.").
-    r"|\bno\s+longer\s+exists?\b",
+    r"|\bno\s+longer\s+exists?\b"
+    # 09-18 (yellow review round 2): the STALE-PLAN class - the plan is a 09-04
+    # snapshot and the code has moved on, so a lane that READ the file reports the
+    # described defect is no longer there. Top-level alternatives, NOT nested after
+    # "already" (nesting them there required the literal "already already excludes").
+    r"|\balready\s+(?:excludes?|builds?|correct|complete|well-formed|derives?|creates?|"
+    r"refactored|consolidated|unified|thin\s+launcher)\b"
+    r"|\b(?:step\s+)?premise\s+is\s+stale\b|\bstale\s+plan\s+snapshot\b"
+    r"|\bno\s+longer\s+matches\s+the\s+stale\b"
+    r"|\bdoes\s+not\s+(?:contain|define|have)\s+the\s+described\b"
+    r"|\bis\s+not\s+the\s+described\b",
     re.I)
 
 
@@ -858,7 +868,8 @@ def load_state() -> dict:
                 # re-queue pass above already handles that class properly.
                 _blind = ("not supplied", "were not provided", "not provided",
                           "was not supplied", "cannot be anchored", "contents were not",
-                          "ends mid-token", "no plan content", "not established")
+                          "ends mid-token", "no plan content", "not established",
+                          "not given", "not shown", "only the test file", "truncated")
                 if not _said or not is_already_satisfied(_said):
                     continue
                 if any(_p in _said.lower() for _p in _blind):
