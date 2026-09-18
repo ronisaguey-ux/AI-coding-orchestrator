@@ -1322,6 +1322,13 @@ class LanePool:
         # 4x down). The 3-minute rule is TIME TO FIRST CONTENT, and it belongs to the
         # gateway that can actually see the first token.
         lane_budget = int(lane.timeout or self.cfg.lane_timeout)
+        # 09-18: `total=lane_budget` was applied PER ATTEMPT, so a lane's real worst case
+        # was models x retries x budget. Measured over 26h: 28 of 281 timeouts read
+        # `elapsed > 1.2x budget` (openrouter 604.5s against 120s, deepseek4 1176.4s
+        # against 600s, deepseek 752.0s against 480s) - a worker parked far past its
+        # own budget, which is the same class as the model-rotation bug above. The
+        # budget is a promise about the LANE CALL, so spend it from ONE deadline.
+        _lane_deadline = time.time() + lane_budget
         timeout = aiohttp.ClientTimeout(
             total=lane_budget,
             connect=int(self.cfg.lane_connect_timeout))
@@ -1402,6 +1409,17 @@ class LanePool:
             for attempt in range(1, retries + 1):
                 lane.calls += 1
                 lane.last_call = time.time()
+                # each attempt gets only what is LEFT of the one lane budget
+                _remain = _lane_deadline - time.time()
+                if _remain <= 1:
+                    lane.failures += 1
+                    last_err = (f"timeout after {lane_budget}s"
+                                f"{'' if lane.timeout is None else ' (per-lane budget)'}")
+                    _timed_out = True
+                    break
+                timeout = aiohttp.ClientTimeout(
+                    total=min(lane_budget, _remain),
+                    connect=int(self.cfg.lane_connect_timeout))
                 try:
                     async with session.post(lane.url, json=payload,
                                             headers=headers,
