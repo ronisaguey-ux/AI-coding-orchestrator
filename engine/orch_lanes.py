@@ -562,7 +562,17 @@ def default_lanes(cfg=None) -> list[Lane]:
                 auth=_dahl_key(),
                 key_refresh=_dahl_mint_key,
                 headers={"User-Agent": _BROWSER_UA})]
-          if _dahl_key() else []),
+          # 09-18 DAHL PULLED: every model on this host now 502s. Probed 4 calls each,
+          # directly against the API with the lane's own key:
+          #   MiniMaxAI/MiniMax-M2.7             0/4  ("502 error code: 502")
+          #   deepseek-ai/DeepSeek-V4-Flash-0731 0/4
+          #   zai-org/GLM-5.3-Flash              0/4
+          # /v1/models still LISTS all three, so the catalogue is fine and the INFERENCE
+          # path is down. Measured: 51 dahl 502s in ONE hour - the lane kept claiming
+          # draws and returning nothing, the "worse than an absent lane" class.
+          # RE-ENABLE BAR: a real edits-contract completion returns. A /v1/models 200 is
+          # NOT the bar (it already returns 200).
+          if False else []),
 # 09-16: GEMINI PULLED. It cannot commit a send on its tab. Evidence:
 #   - 3h window: 23 step-claims, 1 green, 11 'timeout after 720s', and the
 #     gateway logged 18 sends / 0 responses.
