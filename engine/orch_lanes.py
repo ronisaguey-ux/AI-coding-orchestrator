@@ -243,7 +243,19 @@ def default_lanes(cfg=None) -> list[Lane]:
                # upstream most of the time and a 429 costs a whole draw. Do NOT re-add
                # it on a single 200 - measure 4 calls first.
                ["nvidia/nemotron-3-ultra-550b-a55b:free",
-                            "nex-agi/nex-n2.5-pro:free"],
+                            "nex-agi/nex-n2.5-pro:free",
+                            # 09-17: added after the union-alpha withdrawal, to restore
+                            # capacity on the lane that still has free ids. Each was probed
+                            # with the engine's OWN edits contract (2 calls to screen, then 4
+                            # to confirm) because these fail INTERMITTENTLY - one 200 proves
+                            # nothing. Measured: nemotron-3.5-lightning 4/4 (median 31.3s),
+                            # nex-n2.5-mini 4/4 (median 1.3s), dots-3-note-preview 4/4
+                            # (median 3.5s). NOT added: nemotron-3-nano-omni 2/4 (2x 502),
+                            # qwen3.8-27b + gemma-4-31b/26b (429 at 0.3s), laguna-xs 1/2,
+                            # ling-3.0-flash-svl (not a valid id).
+                            "nvidia/nemotron-3.5-lightning:free",
+                            "nex-agi/nex-n2.5-mini:free",
+                            "dots-studio/dots-3-note-preview:free"],
              # 09-16: REVERTED to 120s. Raising this budget to 300s on the theory that
              # the median success took 309s made the lane measurably WORSE, so the
              # theory was wrong and the number goes back:
