@@ -562,7 +562,7 @@ def default_lanes(cfg=None) -> list[Lane]:
                 auth=_dahl_key(),
                 key_refresh=_dahl_mint_key,
                 headers={"User-Agent": _BROWSER_UA})]
-          # 09-18 DAHL PULLED: every model on this host now 502s. Probed 4 calls each,
+          # 09-18 DAHL PULLED: every model on this host 502s. Probed 4 calls each,
           # directly against the API with the lane's own key:
           #   MiniMaxAI/MiniMax-M2.7             0/4  ("502 error code: 502")
           #   deepseek-ai/DeepSeek-V4-Flash-0731 0/4
@@ -572,7 +572,18 @@ def default_lanes(cfg=None) -> list[Lane]:
           # draws and returning nothing, the "worse than an absent lane" class.
           # RE-ENABLE BAR: a real edits-contract completion returns. A /v1/models 200 is
           # NOT the bar (it already returns 200).
-          if False else []),
+          #
+          # 09-18 LATER: THE BAR IS MET, SO THE LANE IS BACK. The 502s were time-boxed.
+          # Re-probed 4 calls each, judging the FINAL answer after any </think> block
+          # (a raw `'"edits"' in content` check is a FALSE POSITIVE on a reasoning model
+          # - it matches the echoed prompt inside <think>):
+          #   MiniMaxAI/MiniMax-M2.7             4/4 valid edits, median 0.2s, finish=stop
+          #   zai-org/GLM-5.3-Flash              1/4  (3x HTTP 429 model_concurrency)
+          #   deepseek-ai/DeepSeek-V4-Flash-0731 0/4  (HTTP 429 model_concurrency)
+          # Only the model that ANSWERS the contract earns a slot; the two 429-capped
+          # ids would just burn draws on concurrency errors.
+          # KILL SWITCH: ORCH_DAHL_ENABLED=0 pulls it again without an edit.
+          if os.environ.get("ORCH_DAHL_ENABLED", "1") == "1" else []),
 # 09-16: GEMINI PULLED. It cannot commit a send on its tab. Evidence:
 #   - 3h window: 23 step-claims, 1 green, 11 'timeout after 720s', and the
 #     gateway logged 18 sends / 0 responses.
