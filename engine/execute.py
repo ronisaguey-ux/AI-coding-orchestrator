@@ -1395,11 +1395,28 @@ def file_text(rel: str, size_cap: int = 24000) -> str:
             starts.append(s)
             s += step
     out = [f"FILE: {rel} — {total} lines, shown as {len(starts)} chunk(s) with line numbers"]
+    # 09-18: the windowing above is by LINES, so a file with no newlines (minified
+    # JSON/JS, a lockfile, a data blob) passed through WHOLE whatever size_cap said -
+    # `total <= window` is true for a 1-line file and the line was emitted entire.
+    # Measured: rust/execution/test_data/databento_esh4_mbo.json is 325,860 bytes on
+    # ONE line, so file_text returned 326,044 chars even at size_cap=4000. That prompt
+    # (329,101 chars) then burned a full budget on EVERY lane that touched the step -
+    # bitdeer, openrouter and deepseek4 each timed out on it in one window.
+    # Bound each emitted line by characters too, with an explicit marker so the lane
+    # knows the line continues and can call see_next_chunk for the rest.
+    _line_cap = max(2000, size_cap)
     for s in starts:
         e = min(total, s + window - 1)
         if s > 1:
             out.append(f"--- lines {s - 1} and earlier omitted ---")
-        out.extend(f"{i:>5}\t{lines[i - 1]}" for i in range(s, e + 1))
+        for i in range(s, e + 1):
+            _ln = lines[i - 1]
+            if len(_ln) > _line_cap:
+                out.append(f"{i:>5}\t{_ln[:_line_cap]}")
+                out.append(f"      \t... [line {i} continues: {len(_ln)} chars total, "
+                           f"cut at {_line_cap} - call see_next_chunk for more] ...")
+            else:
+                out.append(f"{i:>5}\t{_ln}")
     out.append(f"--- end of {rel} ({total} lines) ---")
     return "\n".join(out)
 
