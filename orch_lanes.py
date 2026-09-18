@@ -411,10 +411,17 @@ def default_lanes(cfg=None) -> list[Lane]:
         #   and a bare 401 on /v1/models. Measured 3 failures in 12 min, each one
         #   burning a hop and a cooldown slot on a lane that cannot answer.
         #   Re-enable only after /v1/models returns 200 and one real completion does.
-#        Lane("bitdeer", "https://api-inference.bitdeer.ai/v1/chat/completions",
-#             ["deepseek-ai/DeepSeek-V4-Flash"],
-#             60, 180, prompt_cap=24000, timeout=120,
-#             auth="AIni2RlIlDeDOEclStU3"),
+        # 09-17: BITDEER RE-ENABLED. The pull note said "re-enable only after /v1/models
+        # returns 200 and one real completion does" - BOTH now hold, re-measured before
+        # wiring: /v1/models -> 200, and deepseek-ai/DeepSeek-V4-Flash answered the engine's
+        # OWN edits contract 4/4, median 1.9s (5.1 / 1.9 / 1.9 / 1.4). A fast API lane is the
+        # only lever that matters now the stealth model is gone. If it 502s again, re-check
+        # both signals rather than waiting - and only list a model that actually BILLS
+        # (V4.1-Flash returns insufficient balance; the $5 voucher is scope-limited).
+        Lane("bitdeer", "https://api-inference.bitdeer.ai/v1/chat/completions",
+             ["deepseek-ai/DeepSeek-V4-Flash"],
+             60, 180, prompt_cap=24000, timeout=120,
+             auth="AIni2RlIlDeDOEclStU3"),
         # 09-13 (owner): ChatGPT webchat lane (Free account, text chat only —
         # image analysis is capped but text is unlimited). Gateway :8087 on the
         # owner's CDP 9224 Chrome. Four harness bugs had to be fixed first
