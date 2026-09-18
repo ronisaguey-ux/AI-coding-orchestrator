@@ -1268,10 +1268,45 @@ def _trigger_lane_reset() -> None:
         import asyncio
         # fire-and-forget; each gateway logs its own progress (we're inside the loop)
         for u in urls:
-            asyncio.ensure_future(_post(u))
+            asyncio.ensure_future(_post_if_idle(u))
         print(f"[ctx] opened a fresh chat on {len(urls)} webchat gateway(s)", flush=True)
     except Exception as e:
         print(f"[ctx] lane reset (/v1/newchat) failed: {e}", flush=True)
+
+
+async def _post_if_idle(newchat_url: str) -> None:
+    """POST /newchat only when the gateway has no send in flight.
+
+    MEASURED 09-18 on oculus-ds-gw (:8080). Its journal shows a CDP stale-session
+    refresh plus `🆕 /newchat` every few minutes, and the engine's sends against it
+    failed with elapsed=518-660s on prompts as SMALL as 3,177 chars while the same
+    three gateways answered 63 of 70 sends overall. :8080 sat at outstandingMs
+    699869 (11.7 min) - far past its own 400s cap. A /newchat navigates the tab, so
+    a reset that lands while a send is in flight destroys that send's page context
+    and the call can never return; the engine then burns its whole per-lane budget
+    (45.8 worker-minutes on ONE lane in a 12-min window).
+
+    A reset is housekeeping, so it yields to real work: if the gateway reports a
+    send in flight, skip it this cycle. The counter keeps ticking, so the next
+    reset lands as soon as the gateway is quiet.
+    """
+    import aiohttp
+    base = newchat_url[: -len('/newchat')] if newchat_url.endswith('/newchat') else newchat_url
+    try:
+        timeout = aiohttp.ClientTimeout(total=5)
+        async with aiohttp.ClientSession(timeout=timeout) as s:
+            async with s.get(base + '/health') as r:
+                if r.status == 200:
+                    h = await r.json()
+                    out = h.get('outstandingMs') or 0
+                    if out > 15000:
+                        print(f"[ctx] {base} has a send in flight "
+                              f"(outstandingMs={out}) - skipping the reset this cycle",
+                              flush=True)
+                        return
+    except Exception:
+        pass  # health unreachable: fall through and post, as before
+    await _post(newchat_url)
 
 
 async def _post(url: str) -> None:
