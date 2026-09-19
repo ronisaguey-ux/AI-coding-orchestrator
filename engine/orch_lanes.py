@@ -507,9 +507,17 @@ def default_lanes(cfg=None) -> list[Lane]:
         # keeps one worker per lane, so it goes back in.
         # Budget MUST be the larger side: gateway TIMEOUT=650000 / HARD_CAP_MS=620000,
         # so 720s here keeps the engine listening past the gateway's own cap.
-        Lane("chatgpt", "http://127.0.0.1:8087/v1/chat/completions",
-        ["chatgpt webchat"], 120, 420,
-        prompt_cap=32000, timeout=720),
+        # 09-18 LATER: PULLED AGAIN - the tab wedged. It earned 2 greens from 7 draws
+        # earlier, then the tab held an EMPTY assistant row with aria-busy=true forever:
+        # `webchat tab still generating from a previous request` on 5 of 7 draws, the
+        # gateway at 2 sends / 0 responses, and a CDP reload + composer clear did NOT
+        # recover it (a fresh short prompt still produced nothing after 300s). A lane that
+        # takes draws and returns nothing is worse than an absent lane - it holds worker
+        # slots. RE-ENABLE when the tab can complete a send again; the measured latency is
+        # fine (6.9s short / 170.2s at 25K), the BUSY handling is what needs fixing.
+        # Lane("chatgpt", "http://127.0.0.1:8087/v1/chat/completions",
+        # ["chatgpt webchat"], 120, 420,
+        # prompt_cap=32000, timeout=720),
 #              # functioning correctly"): engine budget 300s against a gateway HARD_CAP
              # of 310s left a 10s margin, so on any thinking-heavy reply the ENGINE
              # timed out first ("chatgpt failed (timeout after 300s)") and the pool
