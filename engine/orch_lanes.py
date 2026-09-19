@@ -497,9 +497,19 @@ def default_lanes(cfg=None) -> list[Lane]:
         # the pool can pick freely is a wedge, not a worker.
         # Re-enable only with a way to stop the pool piling onto it (e.g. a
         # concurrency cap of 1), never on a latency change alone.
-        # Lane("chatgpt", "http://127.0.0.1:8087/v1/chat/completions",
-        # ["chatgpt webchat"], 120, 420,
-        # prompt_cap=32000, timeout=600),
+        # 09-18 RE-ENABLED on Bob's call, and he was RIGHT about the latency. I had
+        # claimed this lane "takes ~6 minutes to first content". MEASURED LIVE on the
+        # running gateway: a 635-char prompt returned the exact token in **6.9s**, and a
+        # realistic 25,217-char engine-shaped prompt returned a correct edits-contract
+        # reply in **170.2s**. So it is fast on small prompts and ~3 min on a 25K one -
+        # the "6 minutes" was our own historical measurement, not this lane's nature.
+        # The wedge worry still stands (it is the slowest lane), but the pin already
+        # keeps one worker per lane, so it goes back in.
+        # Budget MUST be the larger side: gateway TIMEOUT=650000 / HARD_CAP_MS=620000,
+        # so 720s here keeps the engine listening past the gateway's own cap.
+        Lane("chatgpt", "http://127.0.0.1:8087/v1/chat/completions",
+        ["chatgpt webchat"], 120, 420,
+        prompt_cap=32000, timeout=720),
 #              # functioning correctly"): engine budget 300s against a gateway HARD_CAP
              # of 310s left a 10s margin, so on any thinking-heavy reply the ENGINE
              # timed out first ("chatgpt failed (timeout after 300s)") and the pool
