@@ -36,10 +36,28 @@ API_BASE = os.environ.get("DEEPSEEK_API_BASE", "http://localhost:20128/api/v1")
 SEMAPHORE_LIMIT = 4          # concurrent batch pipelines
 AGENT_SEMAPHORE = None
 REQUEST_DELAY = 1.5          # seconds between request starts
-NUM_PASSES = 5               # total cross-examination passes
+# Cross-examination passes. Each pass re-audits every batch with the findings carried
+# forward, so cost is linear in this number. Overridable: pass 1 answers "what is
+# wrong"; the repeat passes only raise confidence in it.
+NUM_PASSES = int(os.environ.get("AUDIT_NUM_PASSES", "5"))
 BATCH_SIZE = 5               # files per LLM call
 MAX_MODEL_ATTEMPTS = 15      # how many models to try per call before giving up
-CHAT_TIMEOUT_SECONDS = 60    # per-model timeout; long enough for real work, short enough to fail fast
+# Per-model timeout. 60s is right for an API lane and WRONG for a webchat lane:
+# measured on this deployment the gemini tab answers in 5-60s and the deepseek tab
+# after a 20-80s anti-ban gap plus its own generation, so a 60s cap banned every
+# webchat lane on its first call (48 cooldown events, zero findings, run stalled).
+# The engine already has per-lane cooldowns and a ladder, so the correct value is
+# "longer than a slow webchat turn", not "as short as possible".
+CHAT_TIMEOUT_SECONDS = int(os.environ.get("AUDIT_CHAT_TIMEOUT", "300"))
+# Room for a full findings document. Measured: with the cap unset, free lanes
+# returned 151-char replies that ended mid-object and lost every finding in them.
+CHAT_MAX_TOKENS = int(os.environ.get("AUDIT_CHAT_MAX_TOKENS", "8000"))
+# Refuse to treat "every file came back empty" as proof the code is clean — see
+# _is_empty_findings_doc. Off makes the audit faster and less trustworthy.
+REQUIRE_SUBSTANTIVE = os.environ.get("AUDIT_REQUIRE_SUBSTANTIVE", "1") != "0"
+# How many OTHER models to try before believing "every file is clean". Cost is bounded
+# on purpose: this is a credibility check, not a search.
+MAX_EMPTY_ROTATIONS = int(os.environ.get("AUDIT_MAX_EMPTY_ROTATIONS", "2"))
 MAX_BACKOFF_SECONDS = 12     # cap exponential backoff between model swaps
 MAX_MODEL_HEALTH = 5         # models with health >= this are skipped (dead for this run)
 # Cooldown durations are now per-failure-type (see mark_model_failed)
@@ -55,14 +73,30 @@ SOT_TRUNCATE = 8000          # Source of Truth context
 README_TRUNCATE = 5000       # README context
 COMPACTED_FINDINGS_MAX = 6000
 
-OCULUS_DIR = "/home/roni/Roni_workspace/oculus"
-ALT_SCRIPTS_DIR = "/home/roni/Roni_workspace/alt_important_scripts"
-WEBCHAT_API_DIR = "/home/roni/Roni_workspace/webchat-api"
-TASK_FILE = "/home/roni/Roni_workspace/promptsfr/audit_prompt.md"
-README_FILE = "/home/roni/Roni_workspace/oculus/OCULUS_IMPORTANT/oculus_readme.md"
-SOT_FILE = "/home/roni/Roni_workspace/oculus/OCULUS_IMPORTANT/OCULUS_SOURCE_OF_TRUTH_7_23.md"
-GRAPH_FILE = "/home/roni/Roni_workspace/oculus/graphify-out/graph.json"
-OUTPUT_BASE = "/home/roni/Roni_workspace/audits_plans"
+# ── Audit target ─────────────────────────────────────────────────────────────
+# These were absolute paths into a single hardcoded repo (oculus), which made the
+# engine usable on exactly one codebase. Every one is now env-overridable with the
+# original value as the fallback, so a deployment can point the same audit at a
+# different repo (or several, via separate runs with separate OUTPUT_BASE) without
+# editing code. AUDIT_TARGET_DIR is the primary root the file walk starts from.
+OCULUS_DIR = os.environ.get("AUDIT_TARGET_DIR", "/home/roni/Roni_workspace/oculus")
+ALT_SCRIPTS_DIR = os.environ.get("AUDIT_ALT_SCRIPTS_DIR", "/home/roni/Roni_workspace/alt_important_scripts")
+WEBCHAT_API_DIR = os.environ.get("AUDIT_WEBCHAT_API_DIR", "/home/roni/Roni_workspace/webchat-api")
+TASK_FILE = os.environ.get("AUDIT_TASK_FILE", "/home/roni/Roni_workspace/promptsfr/audit_prompt.md")
+README_FILE = os.environ.get("AUDIT_README_FILE", "/home/roni/Roni_workspace/oculus/OCULUS_IMPORTANT/oculus_readme.md")
+SOT_FILE = os.environ.get("AUDIT_SOT_FILE", "/home/roni/Roni_workspace/oculus/OCULUS_IMPORTANT/OCULUS_SOURCE_OF_TRUTH_7_23.md")
+GRAPH_FILE = os.environ.get("AUDIT_GRAPH_FILE", "/home/roni/Roni_workspace/oculus/graphify-out/graph.json")
+OUTPUT_BASE = os.environ.get("AUDIT_OUTPUT_DIR", "/home/roni/Roni_workspace/audits_plans")
+# Optional extra roots walked for files (comma-separated). Lets one audit cover
+# several repositories without a synthetic parent directory.
+EXTRA_ROOTS = [d for d in os.environ.get("AUDIT_EXTRA_ROOTS", "").split(",") if d.strip()]
+# Explicit file list (absolute paths, comma or newline separated). When set, this IS
+# the audit scope and the directory walk is skipped — see get_file_list.
+INCLUDE_FILES = [f for f in os.environ.get("AUDIT_INCLUDE_FILES", "").replace("\n", ",").split(",") if f.strip()]
+# What the audit calls the thing it is reading. The prompt said "the Oculus trading
+# system" for every deployment, so a batch of helpotron extension files was described
+# to the model as trading-system code — wrong context produces wrong findings.
+TARGET_LABEL = os.environ.get("AUDIT_TARGET_LABEL", "target")
 # 2026-08-14 (user HARD RULE): label artifacts by the CURRENT date, never a
 # stale constant. The orchestrator passes the web-verified date via
 # AUDIT_VERSION; direct invocations fall back to today.
@@ -687,9 +721,30 @@ def get_agent_model_score(agent_name: str) -> float:
 
 
 # ─── FILE DISCOVERY ──────────────────────────────────────────────────────
-EXCLUDE_DIRS = {"archive", "__pycache__", ".git", "node_modules", "build",
-                ".dart_tool", "ios", "android", "macos", "web", "windows", "linux",
-                "graphify-out", "backups", "oculus_env", ".venv", "venv", "target"}
+# Directories never worth auditing. The original set was tuned for a Flutter app
+# ("ios", "android", "macos", "windows", "linux" are Flutter platform folders, and
+# "web" is Flutter's web target) and is WRONG for a web/Python repo, where "web" is
+# the entire frontend.
+#
+# Measured on this deployment: the walk returned 4297 files of which 3387 were
+# .json — generated artifacts and lockfiles that add no audit value — which
+# multiplied the run into 860 batches. A scope that is 79% machine-generated noise
+# is not a thorough audit, it is an expensive one.
+EXCLUDE_DIRS = {
+    "archive", "__pycache__", ".git", "node_modules", "build", "dist", "coverage",
+    ".next", ".nuxt", ".cache", ".turbo", ".pytest_cache", ".mypy_cache",
+    ".dart_tool", "graphify-out", "backups", "vendor", "third_party",
+    "oculus_env", ".venv", "venv", "env", "target", "uploads", "logs", ".orch",
+    "sandbox", "data", "tmp",
+}
+
+# Generated or manifest files, matched by exact basename. Skipped by name because
+# they are not reliably inside a directory of their own.
+EXCLUDE_FILES = {
+    "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "poetry.lock", "uv.lock",
+    "Cargo.lock", "composer.lock", "graph.json", "tsconfig.json", "jsconfig.json",
+    ".eslintcache",
+}
 
 
 def extract_files_from_readme(readme_text: str) -> list[str]:
@@ -735,7 +790,11 @@ def get_file_list() -> list[str]:
         if 'archive' in root.split(os.sep):
             continue
         for fn in files:
-            if not fn.endswith(('.py', '.dart', '.yaml', '.jinja2', '.html', '.json', '.ini', '.md', '.sh', '.rs')):
+            if fn in EXCLUDE_FILES:
+                continue
+            if not fn.endswith(('.py', '.dart', '.yaml', '.yml', '.jinja2', '.html', '.js',
+                                '.jsx', '.ts', '.tsx', '.json', '.ini', '.md', '.sh', '.rs',
+                                '.toml', '.cfg', '.sql')):
                 continue
             rel = os.path.relpath(os.path.join(root, fn), OCULUS_DIR)
             if 'legacy' in rel:
@@ -743,6 +802,60 @@ def get_file_list() -> list[str]:
             if rel not in seen:
                 seen.add(rel)
                 result.append(rel)
+    # AUDIT_INCLUDE_FILES: an explicit, ordered file list. When set it IS the scope
+    # — the walk is skipped entirely.
+    #
+    # This exists because breadth is the wrong axis for these lanes. Measured: the
+    # full walk produced 231 batches at 5 files each, and the webchat lanes answer
+    # in 60-300s with a 20-80s anti-ban gap between sends, so a complete sweep is
+    # days of wall-clock. An audit is only useful if it finishes: a focused list of
+    # the files where defects actually live beats a nominal sweep that never ends.
+    # Paths are absolute; the label is the repo-relative form used in the report.
+    # AUDIT_INCLUDE_FILES entries are (label, absolute_path): the label is what the
+    # report shows, the path is what can actually be opened. read_file_content
+    # resolves relative to OCULUS_DIR, so an absolute path must be passed through
+    # unchanged rather than joined onto it.
+    if INCLUDE_FILES:
+        out = []
+        for entry in INCLUDE_FILES:
+            path = entry.strip()
+            if not path:
+                continue
+            if os.path.isfile(path):
+                # The label must be the REPO-RELATIVE path, not the basename: the graph
+                # keys its nodes as "extension/action_stream_executor.js", so a bare
+                # "action_stream_executor.js" matches nothing and every agent reports
+                # "no graph data available" as a CRITICAL finding. That produced 25 of
+                # 99 findings in the first pass — meta-findings about the audit's own
+                # missing context, crowding out findings about the code.
+                rel = os.path.relpath(path, OCULUS_DIR)
+                if rel.startswith(".."):
+                    rel = path
+                out.append((rel, path))
+        return out
+
+    # Extra roots (AUDIT_EXTRA_ROOTS) — lets one run cover several repositories
+    # without a synthetic parent directory. Files are prefixed with the root's
+    # basename so two repos with a src/main.py cannot collide.
+    for extra_root in EXTRA_ROOTS:
+        extra_root = extra_root.strip()
+        if not os.path.isdir(extra_root):
+            continue
+        prefix = os.path.basename(os.path.normpath(extra_root))
+        for root, dirs, files in os.walk(extra_root):
+            dirs[:] = [d for d in dirs if d not in EXCLUDE_DIRS and not d.startswith('.')]
+            for fn in files:
+                if not fn.endswith(('.py', '.js', '.jsx', '.ts', '.tsx', '.dart', '.yaml', '.yml',
+                                    '.jinja2', '.html', '.css', '.json', '.ini', '.md', '.sh', '.rs',
+                                    '.toml', '.cfg', '.env', '.sql')):
+                    continue
+                full = os.path.join(root, fn)
+                rel = os.path.relpath(full, extra_root)
+                prefixed = f"../{prefix}/{rel}"
+                if prefixed not in seen:
+                    seen.add(prefixed)
+                    result.append(prefixed)
+
     # Also scan orchestrator / alt_important_scripts
     if os.path.isdir(ALT_SCRIPTS_DIR):
         for root, dirs, files in os.walk(ALT_SCRIPTS_DIR):
@@ -879,11 +992,12 @@ def load_readme() -> str:
     return "[README NOT FOUND]"
 
 
-def _batch_files(files: list[str], batch_size: int) -> list[list[tuple[str, str]]]:
+def _batch_files(files, batch_size: int) -> list[list[tuple[str, str]]]:
     batches = []
     current = []
-    for rel_path in files:
-        current.append((rel_path, read_file_content(rel_path)))
+    for entry in files:
+        label, path = _as_label_path(entry)
+        current.append((label, read_file_content(path)))
         if len(current) >= batch_size:
             batches.append(current)
             current = []
@@ -1111,6 +1225,9 @@ async def call_llm(session: aiohttp.ClientSession,
     Rotates to fallback candidate models if primary model times out or errors.
     """
     last_error = ""
+    empty_fallback = None
+    empty_rotations = 0
+    prose_rotations = 0
     # Let models recover as their cooldowns elapse — otherwise a long run
     # accumulates permanent dead-health and every later pass finds nothing.
     _decay_model_health()
@@ -1155,6 +1272,12 @@ async def call_llm(session: aiohttp.ClientSession,
         payload = {
             "model": target_model,
             "stream": False,
+            # Without this the free lanes answer with a fraction of their findings:
+            # a 151-char reply ending mid-object ("popup.js": ) has no repairable
+            # close, so _try_loads returns None and the whole round's findings are
+            # dropped. The tolerant repair only handles trailing JUNK, never a
+            # truncated document.
+            "max_tokens": CHAT_MAX_TOKENS,
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
@@ -1176,6 +1299,42 @@ async def call_llm(session: aiohttp.ClientSession,
                         await record_model_usage(agent_name, actual_model)
                     if not quiet:
                         print(f"      [call_llm] success via {target_model} -> {actual_model} ({len(content)} chars)", flush=True)
+                    # A reply that parses as NO findings doc at all is the other half of
+                    # the same problem, and it is the bigger one in practice: measured on
+                    # the t2b sweep, 18 of 35 rounds were UNPARSED because the model
+                    # returned 30 KB of reasoning prose instead of the JSON document.
+                    # Rotating costs one call and can rescue the round; marking it
+                    # UNPARSED and moving on throws the work away.
+                    if (REQUIRE_SUBSTANTIVE and _looks_like_prose_reply(content)
+                            and prose_rotations < MAX_EMPTY_ROTATIONS):
+                        prose_rotations += 1
+                        last_error = "reply had no findings document"
+                        if not quiet:
+                            print(f"      [call_llm] {actual_model} replied without a findings "
+                                  f"document ({len(content)}c of prose) — rotating", flush=True)
+                        continue
+                    if REQUIRE_SUBSTANTIVE and _is_empty_findings_doc(content):
+                        # A findings doc with every file empty is BOTH a legitimate
+                        # answer for a clean batch AND what a model returns when it did
+                        # not read the file. From one reply the two are indistinguishable,
+                        # and treating the second as the first is how an audit reports a
+                        # false clean. Rotate to another model and keep the empty answer
+                        # only if none does better, so "no findings" comes to mean "no
+                        # model found anything" rather than "the first one said nothing".
+                        if empty_fallback is None:
+                            empty_fallback = (content, actual_model, actual_score)
+                        empty_rotations += 1
+                        last_error = "empty findings doc"
+                        if empty_rotations >= MAX_EMPTY_ROTATIONS:
+                            # Bounded: a genuinely clean batch must not cost one call per
+                            # model. Past the cap the empty answer is accepted, but it is
+                            # now backed by MAX_EMPTY_ROTATIONS independent models.
+                            if not quiet:
+                                print(f"      [call_llm] {actual_model} empty; rotation cap reached, accepting it", flush=True)
+                            return empty_fallback
+                        if not quiet:
+                            print(f"      [call_llm] {actual_model} returned an empty findings doc — rotating", flush=True)
+                        continue
                     return content, actual_model, actual_score
                 else:
                     last_error = f"HTTP {resp.status}"
@@ -1200,6 +1359,13 @@ async def call_llm(session: aiohttp.ClientSession,
                 print(f"      [call_llm] {target_model} exception: {e}", flush=True)
             continue
 
+    # Every model answered with an empty document. That is a real answer for a batch
+    # of clean files, so return it rather than an error — but it is now a claim backed
+    # by every model we tried rather than by whichever one happened to answer first.
+    if empty_fallback is not None:
+        if not quiet:
+            print("      [call_llm] every model returned an empty findings doc; using the first", flush=True)
+        return empty_fallback
     global _api_exhaustions
     _api_exhaustions += 1
     return f"ERROR: Exhausted retries. Last error: {last_error}", PRIMARY_MODEL, get_model_score(PRIMARY_MODEL)
@@ -1422,7 +1588,7 @@ def build_base_system_prompt(task_prompt: str, source_of_truth: str, readme: str
         else "## SOURCE OF TRUTH\n[Not provided — audit for code-level correctness, "
              "READ MME alignment, and runtime safety only; SoT conformance is the SOT Specialist's lane.]\n\n"
     )
-    return f"""You are an expert code auditor analyzing the Oculus trading system.
+    return f"""You are an expert code auditor analyzing the {TARGET_LABEL} codebase.
 
 ## TASK / AUDIT PROTOCOL
 {task_prompt[:TASK_TRUNCATE]}
@@ -1769,32 +1935,13 @@ def parse_findings(content: str, batch_files: list[tuple[str, str]],
                 "raw": content if idx == 0 else "",
             })
 
-    # If no structured findings but content is not an error, add a fallback finding
-    if not results and content and not content.startswith("ERROR"):
-        results.append({
-            "finding_id": f"P{pass_num}B{0}R{round_num}F0",
-            "agent": agent["name"],
-            "agent_weight": agent["weight"],
-            "pass": pass_num,
-            "round": round_num,
-            "model_id": model_id,
-            "model_score": model_score,
-            "file": file_paths[0],
-            "category": "GENERAL",
-            "severity": "INFO",
-            "finding": "Raw analysis output (JSON parse failed)",
-            "mechanism": content[:500],
-            "impact": "",
-            "line_range": "N/A",
-            "source_of_truth_violation": "UNKNOWN",
-            "readme_mismatch": "UNKNOWN",
-            "is_legacy": "UNKNOWN",
-            "recommended_fix": "N/A",
-            "priority_rank": 99,
-            "confidence": "LOW",
-            "raw": content,
-        })
-
+    # A reply that carries NO findings document is a PARSE FAILURE, not a finding.
+    # The old code appended a synthetic "Raw analysis output (JSON parse failed)" row
+    # here, which put a fabricated entry into the results list and made the round print
+    # "OK (1 findings)" — so a model that answered nothing looked like a model that
+    # answered. That is the same class as the harness's phantom pass: the count is the
+    # thing a reader trusts, and it was counting the failure. Return nothing and let the
+    # caller record an explicit failure.
     return results
 
 
@@ -1844,7 +1991,15 @@ async def run_batch_pipeline(sem: asyncio.Semaphore,
             content, model_id, model_score = await call_llm(session, user_msg, system_msg, agent["name"])
             latency = time.time() - t0
             findings = parse_findings(content, batch_files, agent, pass_num, round_num, model_id, model_score)
-            status = "OK" if not content.startswith("ERROR") else "FAIL"
+            # OK means we got a findings document back. A reply with no document is a
+            # failure however polite its prose was; counting it as OK is how an audit
+            # reports progress it did not make.
+            if content.startswith("ERROR"):
+                status = "FAIL"
+            elif not findings and not _is_empty_findings_doc(content):
+                status = "UNPARSED"
+            else:
+                status = "OK"
             print(f"    Round {round_num} {agent['name'][:20]:20} -> {status} ({latency:.1f}s, {len(findings)} findings, {model_id})", flush=True)
             return round_num, findings
 
@@ -1877,7 +2032,13 @@ async def run_batch_pipeline(sem: asyncio.Semaphore,
 
         votes = parse_votes(content)
 
-        status = "OK" if not content.startswith("ERROR") else "FAIL"
+        # Same rule as the specialists: no parsed votes is not a successful round.
+        if content.startswith("ERROR"):
+            status = "FAIL"
+        elif not votes:
+            status = "UNPARSED"
+        else:
+            status = "OK"
         print(f"    Round 8 {confirm_agent['name'][:20]:20} -> {status} ({latency:.1f}s, {len(votes)} votes, {model_id})")
 
         total_latency = time.time() - start_total
@@ -2438,26 +2599,40 @@ async def generate_final_report(all_results: list[list[dict]]) -> str:
 
 
 # ─── MAIN ─────────────────────────────────────────────────────────────────
-def _batch_files_with_graph(files: list[str], batch_size: int, graphify) -> list[list[tuple[str, str]]]:
+def _as_label_path(entry) -> tuple[str, str]:
+    """Normalise one scope entry to (label, path-for-reading).
+
+    get_file_list returns plain repo-relative strings from a directory walk, but an
+    explicit AUDIT_INCLUDE_FILES scope returns (label, absolute_path) pairs because
+    those files live in different repositories. Normalising here keeps every
+    consumer working with one shape instead of teaching each one about both.
+    """
+    if isinstance(entry, (tuple, list)) and len(entry) == 2:
+        return str(entry[0]), str(entry[1])
+    return str(entry), str(entry)
+
+
+def _batch_files_with_graph(files, batch_size: int, graphify) -> list[list[tuple[str, str]]]:
     """Batch files by graph community if graphify is available."""
+    files = [_as_label_path(f) for f in files]
     if not graphify or not graphify.has_data():
         return _batch_files(files, batch_size)
     # Group files by community
     from collections import defaultdict
     comm_map = defaultdict(list)
-    for f in files:
-        nodes = graphify.get_file_nodes(f)
+    for label, path in files:
+        nodes = graphify.get_file_nodes(label)
         if nodes:
             comm = nodes[0].get("community")
-            comm_map.setdefault(comm, []).append(f)
+            comm_map.setdefault(comm, []).append((label, path))
         else:
-            comm_map.setdefault(None, []).append(f)
+            comm_map.setdefault(None, []).append((label, path))
     # Flatten communities into batches
     batches = []
     current = []
     for comm, flist in sorted(comm_map.items(), key=lambda x: (x[0] is None, x[0] if x[0] is not None else 0)):
-        for f in flist:
-            current.append((f, read_file_content(f)))
+        for label, path in flist:
+            current.append((label, read_file_content(path)))
             if len(current) >= batch_size:
                 batches.append(current)
                 current = []
@@ -2481,9 +2656,12 @@ async def main():
     args = parser.parse_args()
 
     # If only --limit is given (no other action), just print and exit
-    if args.limit is not None and not (args.smoke or args.list_models or args.dry_run or args.resume):
-        print(f"Limit set to {args.limit} (dry run, no audit executed)")
-        return
+    # `--limit N` means "audit with N concurrent agent calls". The old guard exited
+    # whenever --limit was passed alone, so the documented way to tune concurrency
+    # printed a message and did nothing — a silent no-op that reads like success.
+    # --limit remains an optional concurrency setting; only an explicit --dry-run
+    # (or --list-models for a bounded operation) stops before doing work.
+    _ = args
     if args.dry_run:
         print("Dry run: would process files with graph batching")
         return
@@ -2631,8 +2809,46 @@ async def main():
     print(f"Pass outputs: {OUTPUT_BASE}/pass_*/")
 
 
+def _looks_like_prose_reply(text: str) -> bool:
+    """True when a reply carries no findings document at all.
+
+    The counterpart to _is_empty_findings_doc: that one catches a valid document with
+    nothing in it, this one catches a reply that never produced a document. Measured on
+    the t2b sweep: 18 of 35 rounds were UNPARSED because the model returned ~30 KB of
+    reasoning prose ("We are given a batch of files ...") instead of the JSON. Rotating
+    is cheap and rescues the round; discarding it does not.
+
+    An engine ERROR string is not prose, so it is left to the FAIL path.
+    """
+    if not text or text.startswith("ERROR"):
+        return False
+    for cand in _json_candidates(text):
+        if _is_findings_doc(cand):
+            return False
+    return True
+
+
+def _is_empty_findings_doc(text: str) -> bool:
+    """True when a reply is a findings document carrying no findings at all.
+
+    Deliberately narrow: the text must PARSE as a findings document first, so prose,
+    an error string, or a malformed reply is never mistaken for an empty one. Only a
+    structurally valid document that lists files and reports nothing qualifies.
+    """
+    for cand in _json_candidates(text):
+        if not isinstance(cand, dict):
+            continue
+        if "findings_by_file" not in cand and "findings" not in cand:
+            continue
+        fbf = cand.get("findings_by_file")
+        if isinstance(fbf, dict) and any(isinstance(v, list) and v for v in fbf.values()):
+            return False
+        lst = cand.get("findings")
+        if isinstance(lst, list) and any(isinstance(f, dict) for f in lst):
+            return False
+        return True
+    return False
+
+
 if __name__ == "__main__":
     asyncio.run(main())
-
-
-
