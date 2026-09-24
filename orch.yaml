@@ -1,0 +1,38 @@
+# orch.yaml — deployment config for the 4-lane audit/execute run.
+# Precedence: code defaults < this file < environment < CLI.
+
+repo_dir: /home/roni/Roni_workspace/helpotron
+base_dir: /home/roni/Roni_workspace/audits_plans/.orch
+
+plan_json: /home/roni/Roni_workspace/audits_plans/.orch/plan.json
+exec_state: /home/roni/Roni_workspace/audits_plans/.orch/exec_state.json
+escalation_queue: /home/roni/Roni_workspace/audits_plans/.orch/escalation_queue.json
+
+# Execution tuning
+group_cap: 5
+parallel: 3
+max_rounds: 3
+swarm_cap: 4
+
+# Lane behaviour — webchat lanes are slow, so keep the per-request timeout generous
+lane_timeout: 300
+lane_connect_timeout: 20
+lane_retries: 2
+lane_max_hops: 4
+lane_health_probe: true
+file_ctx_cap: 24000
+files_per_step: 2
+max_prompt_chars: 80000
+
+# Memory guard for this laptop
+min_avail_mb: 1200
+ram_pct_cap: 90
+
+# Escalation
+escalation_policy: auto-fix
+escalation_rounds: 3
+escalation_batch: 5
+escalation_allow_plan_edit: true
+escalation_allow_verify_edit: true
+
+log_dir: /tmp/opencode/orch-logs
