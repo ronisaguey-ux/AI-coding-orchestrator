@@ -51,6 +51,10 @@ PROBES = [
 ROUTES = [
     ("sql",       ("sql", "injection", "parameteriz", "query string")),
     ("sympify",   ("sympify", "sympy")),
+    # "rce" as a bare substring matches "source", "resource", "forced" — measured:
+    # it refuted a finding about Promise parallelism and one about httpx timeouts,
+    # neither of which mentions code execution. Word-bounded, and "eval(" is a
+    # literal so comparison is a separate branch.
     ("eval",      ("eval(", "arbitrary code", "code execution", "rce")),
     ("shell",     ("shell", "command injection", "subprocess", "os.system")),
     ("eventloop", ("event loop", "asyncio", "coroutine", "deprecat")),
@@ -126,10 +130,26 @@ def resolve(fp: str) -> str | None:
     return None
 
 
+# Short acronyms need word boundaries: "rce" inside "source"/"resource"/"forced", and
+# "xss" inside a word, produced false refutations. Every other key is a phrase or a
+# literal, where a substring test is correct.
+_WORD_BOUNDED = {"rce", "xss", "ssrf", "sql", "orm"}
+
+
+def _route_matches(low: str, keys) -> bool:
+    for k in keys:
+        if k in _WORD_BOUNDED:
+            if re.search(r"\b" + re.escape(k) + r"\b", low):
+                return True
+        elif k in low:
+            return True
+    return False
+
+
 def pick_probe(text: str):
     low = text.lower()
     for name, keys in ROUTES:
-        if any(k in low for k in keys):
+        if _route_matches(low, keys):
             return name
     return None
 
