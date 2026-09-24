@@ -238,6 +238,21 @@ def verify_one(f: dict) -> dict:
     }
     body_full = open(fp, errors="replace").read()
     seg_check = seg if "seg" in dir() else body_full
+    # Before judging a "no guard for X" claim, check that X EXISTS. Measured:
+    # "create_export_job() lacks an idempotency key" was marked SUPPORTED against
+    # server/export.py, which defines no such function at all — the file holds
+    # markdown_to_latex and a set of export_* formatters. A missing guard on a missing
+    # function is not a finding, it is an invention.
+    _m = re.search(r"\b([a-z_][a-z0-9_]{3,})\s*\(\s*\)", text)
+    if _m:
+        symbol = _m.group(1)
+        body_syms = open(fp, errors="replace").read()
+        if not re.search(r"\b(def|function|class|const|let|var)\s+" + re.escape(symbol) + r"\b",
+                         body_syms):
+            out["verified"] = "REFUTED"
+            out["verify_note"] = f"{symbol}() does not exist in this file"
+            return out
+
     # A guard claim is only meaningful for something that EXPOSES a surface. A CLI
     # script has no auth guard because it is not an endpoint — flagging that as a
     # supported security gap is a false positive of mine, and it was one: this probe
