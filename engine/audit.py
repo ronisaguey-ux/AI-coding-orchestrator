@@ -40,7 +40,11 @@ REQUEST_DELAY = 1.5          # seconds between request starts
 # forward, so cost is linear in this number. Overridable: pass 1 answers "what is
 # wrong"; the repeat passes only raise confidence in it.
 NUM_PASSES = int(os.environ.get("AUDIT_NUM_PASSES", "5"))
-BATCH_SIZE = 5               # files per LLM call
+# Files per LLM call. Env-overridable because lane capacity decides it: the ds webchat
+# lane answers a single-file, ~4.5 KB payload in ~62 s but TIMES OUT at 300 s on a 3-file
+# 23 KB one, so a batch the free lanes handled fine is too large for the lane that is
+# actually available. Shrinking the batch keeps the sweep running instead of idle.
+BATCH_SIZE = int(os.environ.get("AUDIT_BATCH_SIZE", "5"))
 MAX_MODEL_ATTEMPTS = 15      # how many models to try per call before giving up
 # Per-model timeout. 60s is right for an API lane and WRONG for a webchat lane:
 # measured on this deployment the gemini tab answers in 5-60s and the deepseek tab
