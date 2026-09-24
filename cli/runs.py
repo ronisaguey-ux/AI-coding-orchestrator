@@ -428,3 +428,350 @@ def aggregate_health() -> dict:
         return {"ok": True, "models": [m.get("id") for m in d.get("data", [])]}
     except Exception as e:
         return {"ok": False, "error": str(e)[:100], "url": url}
+
+
+_scan_cache: dict = {}
+
+# ── planning: what a target WOULD audit, before starting ──────────────────────
+# Knowing the scope before a run is the difference between "8 batches, ~40 minutes" and
+# discovering the walk picked up 4,000 files an hour in. This mirrors the engine's include
+# rule (an explicit file list beats the walk) so the number it reports is the number the
+# engine will use.
+# ★ MUST MIRROR engine/audit.py's EXCLUDE_DIRS / EXCLUDE_FILES.
+# A scan that disagrees with the engine is worse than no scan: it reported 4,109 files for a
+# repo the engine audits about a quarter of, which turned a usable estimate into an alarming
+# one (848 hours) and would have made a user think the scope was the whole tree. The lists are
+# duplicated rather than imported because importing the engine needs aiohttp; a test compares
+# them, so drift is caught instead of trusted.
+DEFAULT_EXCLUDES = {
+    "archive", "__pycache__", ".git", "node_modules", "build", "dist", "coverage",
+    ".next", ".nuxt", ".cache", ".turbo", ".pytest_cache", ".mypy_cache",
+    ".dart_tool", "graphify-out", "backups", "vendor", "third_party",
+    "oculus_env", ".venv", "venv", "env", "target", "uploads", "logs", ".orch",
+    "sandbox", "data", "tmp",
+}
+DEFAULT_EXCLUDE_FILES = {
+    "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "poetry.lock", "uv.lock",
+    "Cargo.lock", "composer.lock", "graph.json", "tsconfig.json", "jsconfig.json",
+    ".eslintcache",
+}
+CODE_EXT = {".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".dart", ".go", ".rs",
+            ".java", ".rb", ".php", ".cs", ".c", ".cc", ".cpp", ".h", ".hpp", ".swift",
+            ".kt", ".scala", ".sql", ".sh", ".yaml", ".yml", ".toml", ".json", ".html",
+            ".css", ".scss"}
+
+
+def scan_target(target: str | None = None, on_progress=None, use_cache: bool = False) -> dict:
+    """The files a run of this target would audit, and how they batch up.
+
+    `on_progress(n)` is called as files are found, so a caller can show movement instead of a
+    still frame: the walk takes seconds on a real repo and a user cannot tell a slow scan from
+    a hung one without it. `use_cache` reuses a result from the last 60 seconds, for a UI that
+    re-renders on every keypress.
+    """
+    tname = target or config.active_target()
+    t = config.target_get(tname) or {}
+    if use_cache:
+        c = _scan_cache.get(tname)
+        if c and (time.time() - c["at"]) < 60:
+            return c["result"]
+    inc = str(t.get("includeFiles") or "")
+    if inc:
+        files = [f.strip() for f in inc.replace("\n", ",").split(",") if f.strip()]
+        missing = [f for f in files if not Path(f).exists()]
+        return {"target": tname, "source": "explicit list", "files": len(files),
+                "missing": missing, "list": files}
+    root = Path(str(t.get("dir") or ""))
+    if not root.is_dir():
+        return {"target": tname, "source": "walk", "files": 0,
+                "error": f"repository root does not exist: {root}"}
+    extra = [Path(p.strip()) for p in str(t.get("extraRoots") or "").split(",") if p.strip()]
+    found: list[str] = []
+    for base in [root] + extra:
+        if not base.is_dir():
+            continue
+        for p in base.rglob("*"):
+            try:
+                if p.is_symlink() or not p.is_file():
+                    continue
+                rel = p.relative_to(base)
+                if any(part in DEFAULT_EXCLUDES for part in rel.parts[:-1]):
+                    continue
+                if p.name in DEFAULT_EXCLUDE_FILES:
+                    continue
+                if p.suffix.lower() not in CODE_EXT:
+                    continue
+                found.append(str(p))
+                if on_progress and len(found) % 100 == 0:
+                    on_progress(len(found))
+            except (OSError, ValueError):
+                continue
+    if on_progress:
+        on_progress(len(found))
+    result = {"target": tname, "source": "walk", "files": len(found),
+              "roots": [str(root)] + [str(x) for x in extra], "sample": found[:12]}
+    _scan_cache[tname] = {"at": time.time(), "result": result}
+    return result
+
+
+def estimate(target: str | None = None, overrides: dict | None = None) -> dict:
+    """A rough wall-clock estimate, built from MEASURED round times when a run exists.
+
+    Deliberately approximate and says so: it is a planning aid, not a promise. The number
+    that matters is which of its inputs is a guess.
+    """
+    o = overrides or {}
+    batch_size = int(o.get("batchSize") or config.resolve("batchSize")[0] or 5)
+    passes = int(o.get("passes") or config.resolve("passes")[0] or 2)
+    # Reuse the scan the caller just did: without this the screen walked the whole tree twice
+    # (measured 11.6s each), so opening Scope cost ~23s of a frozen screen for one number.
+    scan = scan_target(target, use_cache=True)
+    n = int(scan.get("files") or 0)
+    if not n:
+        return {"target": target or config.active_target(), "files": 0, "error": scan.get("error") or "no files found"}
+
+    per_batch_rounds = 8        # 8 specialists + the confirm pass
+    batches = max(1, (n + batch_size - 1) // batch_size)
+
+    # Prefer a measured average round time from the most recent run's log; fall back to a
+    # labelled assumption rather than presenting a guess as a measurement.
+    basis, avg_round_s = "assumed", 60.0
+    run = current_run()
+    if run:
+        rounds = [r["seconds"] for r in progress(run).get("rounds") or [] if r.get("seconds")]
+        if rounds:
+            avg_round_s = sum(rounds) / len(rounds)
+            basis = f"measured from run {run.get('id')} ({len(rounds)} rounds)"
+
+    total_s = batches * passes * per_batch_rounds * avg_round_s
+    return {
+        "target": target or config.active_target(),
+        "files": n, "batchSize": batch_size, "batches": batches, "passes": passes,
+        "roundsPerBatch": per_batch_rounds,
+        "totalRounds": batches * passes * per_batch_rounds,
+        "avgRoundSeconds": round(avg_round_s, 1),
+        "basis": basis,
+        "estimatedHours": round(total_s / 3600, 2),
+        "note": "an estimate, not a promise: it assumes every round succeeds at the average pace "
+                "and that no model times out",
+    }
+
+
+# ── process control ──────────────────────────────────────────────────────────
+
+def pause(run_id: str) -> dict:
+    """SIGSTOP a run: it keeps its place and its memory, and uses no CPU."""
+    rec = get(run_id) or current_run()
+    if not rec:
+        return {"ok": False, "reason": "no run"}
+    pid = int(rec.get("pid") or 0)
+    if not pid_alive(pid):
+        return {"ok": False, "reason": "the run is not alive"}
+    try:
+        os.killpg(os.getpgid(pid), signal.SIGSTOP)
+    except Exception as e:
+        return {"ok": False, "reason": f"could not pause pid {pid}: {e}"}
+    return {"ok": True, "paused": True, "run": rec["id"], "pid": pid}
+
+
+def resume(run_id: str) -> dict:
+    rec = get(run_id) or current_run()
+    if not rec:
+        return {"ok": False, "reason": "no run"}
+    pid = int(rec.get("pid") or 0)
+    if not pid_alive(pid):
+        return {"ok": False, "reason": "the run is not alive"}
+    try:
+        os.killpg(os.getpgid(pid), signal.SIGCONT)
+    except Exception as e:
+        return {"ok": False, "reason": f"could not resume pid {pid}: {e}"}
+    return {"ok": True, "resumed": True, "run": rec["id"], "pid": pid}
+
+
+# ── batch surgery ────────────────────────────────────────────────────────────
+
+def batch_files(run: dict | None = None) -> list[dict]:
+    run = run or current_run()
+    if not run:
+        return []
+    base = Path(run.get("outputDir") or "")
+    out = []
+    if not base.exists():
+        return out
+    for pf in sorted(base.glob("pass_*")):
+        for f in sorted(pf.glob("*.json")):
+            fbf = {}
+            try:
+                d = json.loads(f.read_text())
+                fbf = d.get("findings_by_file") or {}
+            except Exception:
+                pass
+            n = sum(len(v) for v in fbf.values() if isinstance(v, list)) if isinstance(fbf, dict) else 0
+            out.append({"pass": pf.name, "batch": f.stem, "path": str(f),
+                        "bytes": f.stat().st_size, "findings": n,
+                        "files": sorted(fbf.keys()) if isinstance(fbf, dict) else []})
+    return out
+
+
+def delete_batch(run: dict | None, pass_name: str, batch: str) -> dict:
+    """Delete one saved batch so the next --resume run re-audits it.
+
+    This is the documented way to force a re-run: the engine treats a saved batch as done
+    and never redoes it, so deleting the file is the only way to re-ask a question. The
+    file is MOVED to a .discarded sibling rather than removed, because the findings in it
+    are the only copy and the owner may still want them.
+    """
+    run = run or current_run()
+    if not run:
+        return {"ok": False, "reason": "no run to operate on"}
+    base = Path(run.get("outputDir") or "")
+    f = base / pass_name / f"{batch}.json"
+    if not f.exists():
+        return {"ok": False, "reason": f"no such batch: {pass_name}/{batch}.json"}
+    if not str(f.resolve()).startswith(str(base.resolve())):
+        return {"ok": False, "reason": "refusing to touch a path outside the run output"}
+    dest = f.with_suffix(".json.discarded")
+    try:
+        if dest.exists():
+            dest = f.with_suffix(f".json.discarded-{int(time.time())}")
+        f.rename(dest)
+    except Exception as e:
+        return {"ok": False, "reason": f"could not discard the batch: {e}"}
+    return {"ok": True, "discarded": str(dest), "reRun": "start the next run with resume on"}
+
+
+def rerun(target: str | None = None, overrides: dict | None = None) -> dict:
+    """Start a fresh run, stopping whatever is live first."""
+    cur = current_run()
+    stopped = None
+    if cur and cur.get("alive"):
+        stopped = stop(cur["id"])
+    return {**start(target, overrides), "stoppedPrevious": stopped}
+
+
+# ── results: the verified set and the report ─────────────────────────────────
+
+def verify_status(run: dict | None = None) -> dict:
+    """Read verified_findings.json if the verifier has been run for this output dir."""
+    run = run or current_run()
+    if not run:
+        return {"present": False}
+    base = Path(run.get("outputDir") or "")
+    for cand in (base / "verified_findings.json", base / "pass_1" / "verified_findings.json"):
+        if cand.exists():
+            try:
+                d = json.loads(cand.read_text())
+            except Exception as e:
+                return {"present": True, "path": str(cand), "error": f"unparseable: {e}"}
+            items = d if isinstance(d, list) else (d.get("findings") or d.get("verified") or [])
+            counts: dict[str, int] = {}
+            for x in items if isinstance(items, list) else []:
+                v = str((x or {}).get("verdict") or "?").upper()
+                counts[v] = counts.get(v, 0) + 1
+            return {"present": True, "path": str(cand), "total": len(items) if isinstance(items, list) else None,
+                    "byVerdict": counts}
+    return {"present": False, "lookedIn": str(base)}
+
+
+def report(run: dict | None = None, max_chars: int = 20000) -> dict:
+    """The engine's final report, once it has been written."""
+    run = run or current_run()
+    if not run:
+        return {"present": False}
+    base = Path(run.get("outputDir") or "")
+    cands = sorted(base.glob("code_audit_*.md")) + sorted(base.glob("multi_agent_oculus_audit_*.md"))
+    if not cands:
+        return {"present": False, "lookedIn": str(base),
+                "hint": "the report is written after the final pass completes"}
+    f = cands[-1]
+    try:
+        txt = f.read_text(errors="replace")
+    except Exception as e:
+        return {"present": True, "path": str(f), "error": str(e)}
+    return {"present": True, "path": str(f), "chars": len(txt), "truncated": len(txt) > max_chars,
+            "text": txt[:max_chars]}
+
+
+def findings_export(run: dict | None = None, fmt: str = "json") -> dict:
+    """Write the run's findings to one file in json, markdown or csv."""
+    run = run or current_run()
+    if not run:
+        return {"ok": False, "reason": "no run"}
+    fs = findings(run, limit=100000)
+    if not fs:
+        return {"ok": False, "reason": "no findings on disk yet (a batch saves only when all of its rounds finish)"}
+    base = Path(run.get("outputDir") or ".")
+    fmt = (fmt or "json").lower()
+    if fmt == "md":
+        lines = [f"# Findings — {run.get('target')}", f"_{len(fs)} findings_", ""]
+        for f in fs:
+            lines.append(f"## {f.get('severity') or f.get('criticality') or ''} {f.get('title') or f.get('issue') or '(untitled)'}")
+            for k in ("file", "line_range", "category", "confidence"):
+                if f.get(k):
+                    lines.append(f"- **{k}**: {f[k]}")
+            for k in ("description", "detail", "issue", "impact", "recommendation", "fix", "prove"):
+                if f.get(k):
+                    lines += ["", str(f[k]), ""]
+            lines.append("")
+        out = base / "findings.md"
+        out.write_text("\n".join(lines))
+    elif fmt == "csv":
+        import csv as _csv
+        cols = ["severity", "criticality", "title", "issue", "file", "line_range", "category", "confidence"]
+        out = base / "findings.csv"
+        with out.open("w", newline="") as fh:
+            w = _csv.DictWriter(fh, fieldnames=cols, extrasaction="ignore")
+            w.writeheader()
+            for f in fs:
+                w.writerow({k: str(f.get(k, "")).replace("\n", " ")[:2000] for k in cols})
+    else:
+        out = base / "findings.json"
+        out.write_text(json.dumps(fs, indent=2, default=str))
+    return {"ok": True, "path": str(out), "findings": len(fs), "format": fmt}
+
+
+# ── connectivity ─────────────────────────────────────────────────────────────
+
+def endpoint_probe(timeout: int = 60) -> dict:
+    """Time one tiny request through the configured endpoint.
+
+    This is the measurement that decides whether a "slow lane" is slow or broken: a lane
+    that answers a trivial prompt in seconds is working, and anything else is the caller's
+    problem — a timeout shorter than the work, or a payload too large for the lane.
+    """
+    import urllib.request
+
+    url = str(config.resolve("aggregateUrl")[0]).rstrip("/") + "/chat/completions"
+    key_name = str(config.resolve("apiKeyName")[0])
+    key = str(config.resolve("apiKeyValue")[0])
+    allow = config.resolve("modelAllowlist")[0]
+    model = (allow[0] if isinstance(allow, list) and allow else str(allow) or "ds").split(",")[0]
+    body = json.dumps({"model": model,
+                       "messages": [{"role": "user", "content": "Reply with exactly: OK"}],
+                       "max_tokens": 10}).encode()
+    req = urllib.request.Request(url, data=body, method="POST",
+                                 headers={"content-type": "application/json", key_name: key})
+    t0 = time.time()
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            d = json.loads(r.read().decode())
+        ms = int((time.time() - t0) * 1000)
+        content = (((d.get("choices") or [{}])[0].get("message") or {}).get("content") or "")
+        return {"ok": True, "model": model, "elapsedMs": ms, "reply": content[:80], "url": url}
+    except Exception as e:
+        return {"ok": False, "model": model, "elapsedMs": int((time.time() - t0) * 1000),
+                "error": str(e)[:200], "url": url}
+
+
+def logs_list() -> list[dict]:
+    d = runs_dir()
+    out = []
+    for f in sorted(d.glob("*.log")):
+        try:
+            st = f.stat()
+            out.append({"file": str(f), "name": f.name, "bytes": st.st_size,
+                        "modified": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(st.st_mtime))})
+        except OSError:
+            continue
+    out.sort(key=lambda x: x["modified"], reverse=True)
+    return out

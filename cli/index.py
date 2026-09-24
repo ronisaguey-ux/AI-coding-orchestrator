@@ -31,7 +31,16 @@ USAGE = """orch — audit orchestrator
   orch config set <id> <value>
   orch config reset <id>
   orch agents [target]      the personas that will run
+  orch prompt [agent]       the EXACT system prompt a persona receives
   orch models               endpoint and lane health
+  orch probe                time one request through the endpoint
+  orch scan [target]        what a run WOULD audit (file count, batching)
+  orch estimate [target]    rough wall-clock for a run
+  orch batches              batches saved on disk, with their findings
+  orch discard <pass> <b>   make the next resumed run re-audit one batch
+  orch pause / orch resume  stop and continue a run without losing its place
+  orch export [--format f]  write findings as json / md / csv
+  orch logs                 every log this orchestrator has written
   orch doctor               check the environment before a run
   orch mcp                  run the MCP server on stdio (for an agent to drive)
   orch help
@@ -280,6 +289,14 @@ def cmd_ui(argv: list[str]) -> int:
                     view = screens.screen_agents()
                 elif view == "mcp":
                     view = screens.screen_mcp()
+                elif view == "scope":
+                    view = screens.screen_scope()
+                elif view == "batches":
+                    view = screens.screen_batches()
+                elif view == "prompt":
+                    view = screens.screen_prompt()
+                elif view == "run_control":
+                    view = screens.screen_run_control()
                 else:
                     view = "main"
     except A.QuitError:
@@ -289,11 +306,129 @@ def cmd_ui(argv: list[str]) -> int:
     return 0
 
 
+
+def cmd_scan(argv: list[str]) -> int:
+    """What a run WOULD audit, before starting one."""
+    r = runs.scan_target(argv[0] if argv else None)
+    if r.get("error"):
+        print(A.red("  ✗ " + str(r["error"])))
+        return 1
+    print(f"  {A.b(str(r['files']))} files  ({r['source']})")
+    for m in r.get("missing", [])[:10]:
+        print(A.red(f"  ✗ listed file does not exist: {m}"))
+    for s in r.get("sample", [])[:8]:
+        print(A.dim("    " + s))
+    if r.get("roots"):
+        for x in r["roots"]:
+            print(A.dim("    root: " + x))
+    return 0
+
+
+def cmd_estimate(argv: list[str]) -> int:
+    r = runs.estimate(argv[0] if argv else None)
+    if r.get("error"):
+        print(A.red("  ✗ " + str(r["error"])))
+        return 1
+    print(f"  files        {A.b(str(r['files']))}")
+    print(f"  batches      {r['batches']}  ({r['batchSize']} files each)")
+    print(f"  passes       {r['passes']}")
+    print(f"  total rounds {r['totalRounds']}  ({r['roundsPerBatch']} per batch)")
+    print(f"  avg round    {r['avgRoundSeconds']}s  [{A.dim(r['basis'])}]")
+    print(f"  estimate     {A.b(str(r['estimatedHours']))} hours")
+    print(A.dim("  " + r["note"]))
+    return 0
+
+
+def cmd_pause(argv: list[str]) -> int:
+    r = runs.pause("")
+    print(A.green(f"✓ paused pid {r.get('pid')}") if r.get("ok") else A.red("✗ " + str(r.get("reason"))))
+    return 0 if r.get("ok") else 1
+
+
+def cmd_resume(argv: list[str]) -> int:
+    r = runs.resume("")
+    print(A.green(f"✓ resumed pid {r.get('pid')}") if r.get("ok") else A.red("✗ " + str(r.get("reason"))))
+    return 0 if r.get("ok") else 1
+
+
+def cmd_batches(argv: list[str]) -> int:
+    bs = runs.batch_files()
+    if not bs:
+        print(A.dim("  no batches saved yet (a batch saves only when all of its rounds finish)"))
+        return 1
+    for b in bs:
+        mark = A.green("✓") if b["findings"] else A.yellow("·")
+        print(f"  {mark} {b['pass']}/{b['batch']:<14} {b['findings']:>3} findings  {b['bytes']:>7}B")
+        for f in b["files"][:3]:
+            print(A.dim("      " + str(f)[:84]))
+    return 0
+
+
+def cmd_discard(argv: list[str]) -> int:
+    if len(argv) < 2:
+        print(A.red("usage: orch discard <pass_1> <batch_003>"), file=sys.stderr)
+        return 2
+    r = runs.delete_batch(None, argv[0], argv[1])
+    if r.get("ok"):
+        print(A.green(f"✓ discarded -> {r['discarded']}"))
+        print(A.dim("  the next resumed run will re-audit it"))
+        return 0
+    print(A.red("✗ " + str(r.get("reason"))))
+    return 1
+
+
+def cmd_export(argv: list[str]) -> int:
+    fmt = "json"
+    for i, a in enumerate(argv):
+        if a == "--format" and i + 1 < len(argv):
+            fmt = argv[i + 1]
+    r = runs.findings_export(fmt=fmt)
+    if r.get("ok"):
+        print(A.green(f"✓ {r['findings']} findings -> {r['path']}"))
+        return 0
+    print(A.red("✗ " + str(r.get("reason"))))
+    return 1
+
+
+def cmd_prompt(argv: list[str]) -> int:
+    """The exact system prompt a persona receives. The only way to see what an auditor
+    was actually told."""
+    from . import mcp_server as m
+    r = m._prompt_preview({"agent": argv[0] if argv else None})
+    if isinstance(r, dict) and r.get("isError"):
+        print(A.red(r["content"][0]["text"]))
+        return 1
+    print(A.b(f"{r['agent']}  (w{r['weight']}, {r['chars']} chars)"))
+    print(A.dim(f"  domain context included: {r['domainContextIncluded']}"))
+    print(A.hr() if hasattr(A, 'hr') else "-" * A.term_width())
+    print(r["prompt"][:6000])
+    return 0
+
+
+def cmd_logs(argv: list[str]) -> int:
+    for l in runs.logs_list():
+        print(f"  {l['modified']}  {l['bytes']:>9}B  {l['name']}")
+    return 0
+
+
+def cmd_probe(argv: list[str]) -> int:
+    r = runs.endpoint_probe()
+    if r.get("ok"):
+        print(A.green(f"✓ {r['model']} answered in {r['elapsedMs']}ms") + A.dim(f'  "{r["reply"]}"'))
+        return 0
+    print(A.red(f"✗ {r['model']} failed after {r['elapsedMs']}ms") + A.dim("  " + str(r.get("error"))))
+    return 1
+
+
 COMMANDS = {
     "run": cmd_run, "status": cmd_status, "watch": cmd_watch, "stop": cmd_stop,
     "targets": cmd_targets, "findings": cmd_findings, "config": cmd_config,
     "agents": cmd_agents, "models": cmd_models, "doctor": cmd_doctor,
     "mcp": cmd_mcp, "ui": cmd_ui,
+    # added: the operations the panel and MCP expose
+    "scan": cmd_scan, "estimate": cmd_estimate, "batches": cmd_batches,
+    "pause": cmd_pause, "resume": cmd_resume, "discard": cmd_discard,
+    "export": cmd_export, "prompt": cmd_prompt, "logs": cmd_logs, "probe": cmd_probe,
 }
 
 

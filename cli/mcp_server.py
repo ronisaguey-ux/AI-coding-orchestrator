@@ -492,3 +492,247 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LATE-BOUND TOOLS
+# These read the engine's own tables (loading it by AST, so no aiohttp needed) and are
+# defined after the handlers they use.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _load_engine_module():
+    """Load the engine's data tables AND its prompt builders without importing aiohttp."""
+    import ast as _ast
+
+    engine = Path(str(config.resolve("enginePy")[0]))
+    src = engine.read_text()
+    tree = _ast.parse(src)
+    want = {
+        "AGENTS", "DOMAIN_PROFILES", "DOMAIN_AGENTS", "active_agents", "domain_context",
+        "build_base_system_prompt", "build_specialist_system_prompt",
+        "TASK_TRUNCATE", "SOT_TRUNCATE", "README_TRUNCATE",
+    }
+    keep = []
+    for n in tree.body:
+        if isinstance(n, _ast.Assign) and isinstance(n.targets[0], _ast.Name):
+            name = n.targets[0].id
+        elif isinstance(n, _ast.FunctionDef):
+            name = n.name
+        else:
+            continue
+        if name in want:
+            keep.append(n)
+    ns: dict = {"os": os}
+    # The prompt builder calls the graph helpers; a preview has no graph, so stub them and
+    # record that the graph section is absent rather than pretending it was included.
+    ns["GraphifyDB"] = object
+    ns["get_graphify"] = lambda: None
+    ns["format_graph_insights"] = lambda g, f: "## GRAPH CONTEXT\n[not included in this preview]"
+    exec(compile(_ast.Module(body=keep, type_ignores=[]), "<engine>", "exec"), ns)
+    return ns
+
+
+def _engine_label(target: str | None) -> str:
+    tname = target or config.active_target()
+    return str((config.target_get(tname) or {}).get("label") or tname)
+
+
+def _prompt_preview(a):
+    agent_name = a.get("agent")
+    target = a.get("target")
+    try:
+        ns = _load_engine_module()
+    except Exception as e:
+        return _err(f"could not load the engine's personas: {e}")
+    label = _engine_label(target)
+    ns["TARGET_LABEL"] = label
+    agents = ns["active_agents"]()
+    if agent_name:
+        match = [x for x in agents if x["name"].lower() == str(agent_name).lower()]
+        if not match:
+            match = [x for x in agents if agent_name.lower() in x["name"].lower()]
+        if not match:
+            return _err(f'no persona matching "{agent_name}" for target {label}. '
+                        f'Available: ' + ", ".join(x["name"] for x in agents))
+        agent = match[0]
+    else:
+        agent = agents[0]
+
+    t = config.target_get(target or config.active_target()) or {}
+    task = ""
+    tf = t.get("task") or str(config.ROOT / "tools" / "audit_prompt.md")
+    if tf and Path(tf).exists():
+        try:
+            task = Path(tf).read_text()[:2000]
+        except Exception:
+            task = ""
+    sot = ""
+    if t.get("sot") and Path(t["sot"]).exists():
+        sot = Path(t["sot"]).read_text()[:2000]
+    readme = ""
+    if t.get("readme") and Path(t["readme"]).exists():
+        readme = Path(t["readme"]).read_text()[:2000]
+
+    try:
+        prompt = ns["build_specialist_system_prompt"](agent, task, sot, readme)
+    except Exception as e:
+        return _err(f"could not build the prompt: {e}")
+    return {"target": target or config.active_target(), "label": label,
+            "agent": agent["name"], "weight": agent["weight"],
+            "domainContextIncluded": bool(ns["domain_context"]()),
+            "chars": len(prompt), "prompt": prompt}
+
+
+TOOLS.extend([
+    _tool("orch_target_scan",
+          "What a run of this target WOULD audit: the file count and how it batches, without "
+          "starting anything. An explicit include-list beats the directory walk, and this says "
+          "which rule applies.",
+          {"target": S("Target name. Defaults to the active one.")}, None,
+          lambda a: runs.scan_target(a.get("target"))),
+
+    _tool("orch_run_estimate",
+          "A rough wall-clock estimate for a run: files, batches, total rounds, and hours — built "
+          "from MEASURED round times when a previous run exists, and labelled when it is an "
+          "assumption instead.",
+          {"target": S("Target name. Defaults to the active one."),
+           "passes": N("Override the pass count."),
+           "batch_size": N("Override files per batch.")}, None,
+          lambda a: runs.estimate(a.get("target"),
+                                  {"passes": a.get("passes"), "batchSize": a.get("batch_size")})),
+
+    _tool("orch_run_pause",
+          "Pause the current run (SIGSTOP): it keeps its place and memory and burns no CPU. "
+          "Resume with orch_run_resume.",
+          {"run_id": S("Run id. Defaults to the current run.")}, None,
+          lambda a: runs.pause(a.get("run_id") or "")),
+
+    _tool("orch_run_resume",
+          "Resume a paused run (SIGCONT).",
+          {"run_id": S("Run id. Defaults to the current run.")}, None,
+          lambda a: runs.resume(a.get("run_id") or "")),
+
+    _tool("orch_run_rerun",
+          "Start a fresh run, stopping the live one first if there is one. Same overrides as "
+          "orch_run_start.",
+          {"target": S("Target name. Defaults to the active one."),
+           "passes": N("Override the pass count."),
+           "batch_size": N("Override files per batch."),
+           "resume": B("Resume saved batches. Defaults to the configured value."),
+           "models": L("Override the model allowlist.")}, None,
+          lambda a: runs.rerun(a.get("target"), {
+              "passes": a.get("passes"), "batchSize": a.get("batch_size"),
+              "modelAllowlist": a.get("models")})),
+
+    _tool("orch_batches_list_detail",
+          "Every saved batch with its size, finding count and the files it covered. Use this to "
+          "see exactly what has been audited so far.",
+          {"run_id": S("Run id. Defaults to the current run.")}, None,
+          lambda a: runs.batch_files(runs.get(a["run_id"]) if a.get("run_id") else None)),
+
+    _tool("orch_batch_discard",
+          "Discard one saved batch so the next resumed run re-audits it. This is the only way to "
+          "re-ask a question, because the engine treats a saved batch as done and never redoes it. "
+          "The file is moved to .discarded, not deleted — its findings are the only copy.",
+          {"run_id": S("Run id. Defaults to the current run."),
+           "pass_name": S("Pass directory, e.g. pass_1."),
+           "batch": S("Batch file stem, e.g. batch_003.")}, ["pass_name", "batch"],
+          lambda a: runs.delete_batch(runs.get(a["run_id"]) if a.get("run_id") else None,
+                                      a["pass_name"], a["batch"])),
+
+    _tool("orch_findings_get",
+          "One finding in full, by its position in the flattened list (use orch_findings_list "
+          "first to find the index).",
+          {"index": N("Zero-based index."), "run_id": S("Run id. Defaults to the current run.")},
+          ["index"],
+          lambda a: (lambda fs: fs[int(a["index"])] if 0 <= int(a["index"]) < len(fs)
+                     else _err(f"index out of range (0..{len(fs)-1})"))(
+              runs.findings(runs.get(a["run_id"]) if a.get("run_id") else None, limit=100000))),
+
+    _tool("orch_findings_export",
+          "Write the run's findings to a file as json, md or csv, and return the path.",
+          {"format": S("json (default), md or csv."),
+           "run_id": S("Run id. Defaults to the current run.")}, None,
+          lambda a: runs.findings_export(runs.get(a["run_id"]) if a.get("run_id") else None,
+                                         a.get("format") or "json")),
+
+    _tool("orch_verify_status",
+          "Whether the verifier has been run for this output directory, and the tally of "
+          "SUPPORTED / REFUTED / UNVERIFIED. A model cannot be trusted on its own findings, so "
+          "this is the number that says how much of the audit is real.",
+          {"run_id": S("Run id. Defaults to the current run.")}, None,
+          lambda a: runs.verify_status(runs.get(a["run_id"]) if a.get("run_id") else None)),
+
+    _tool("orch_report",
+          "The engine's final report, once the last pass has written it. Reports that it is not "
+          "there yet rather than returning an empty string.",
+          {"run_id": S("Run id. Defaults to the current run."),
+           "max_chars": N("Cap the returned text. Default 20000.")}, None,
+          lambda a: runs.report(runs.get(a["run_id"]) if a.get("run_id") else None,
+                                int(a.get("max_chars") or 20000))),
+
+    _tool("orch_doctor",
+          "Environment check before a run: the interpreter can import the engine's dependencies, "
+          "the engine exists, the endpoint answers, each lane has a browser, and the active target "
+          "is runnable. Returns a pass/fail per check rather than a summary.",
+          None, None, lambda a: _doctor()),
+
+    _tool("orch_endpoint_probe",
+          "Send one trivial prompt through the configured endpoint and time it. This is the "
+          "measurement that separates a slow lane from a broken one — a lane that answers a "
+          "tiny prompt in seconds is working, and the fault is elsewhere (a timeout shorter than "
+          "the work, or a payload too big for the lane).",
+          {"timeout": N("Seconds. Default 60.")}, None,
+          lambda a: runs.endpoint_probe(int(a.get("timeout") or 60))),
+
+    _tool("orch_prompt_preview",
+          "The EXACT system prompt a given persona receives for a target, including the domain "
+          "context and that persona's focus. Use it to debug what an auditor was actually told — "
+          "a model auditing a system it was told is something else invents defects belonging to "
+          "that other system, and this is the only way to see that it happened.",
+          {"agent": S("Persona name (partial match is fine). Defaults to the first specialist."),
+           "target": S("Target name. Defaults to the active one.")}, None,
+          lambda a: _prompt_preview(a)),
+
+    _tool("orch_logs_list",
+          "Every log this orchestrator has written, newest first, with sizes.",
+          None, None, lambda a: runs.logs_list()),
+])
+
+# The tools above are appended AFTER TOOL_MAP was built for the first set, so it must be
+# rebuilt — otherwise tools/list advertises them and tools/call answers "unknown tool".
+TOOL_MAP = {t["name"]: t for t in TOOLS}
+
+
+def _doctor():
+    import subprocess as _sp
+
+    checks = []
+    py = runs.find_python()
+    can = False
+    try:
+        can = _sp.run([py, "-c", "import aiohttp"], capture_output=True, timeout=20).returncode == 0
+    except Exception:
+        pass
+    checks.append({"check": "python imports aiohttp", "ok": can, "detail": py})
+    eng = str(config.resolve("enginePy")[0])
+    checks.append({"check": "engine present", "ok": Path(eng).exists(), "detail": eng})
+    agg = runs.aggregate_health()
+    checks.append({"check": "endpoint reachable", "ok": agg["ok"],
+                   "detail": str(agg.get("error") or agg.get("url"))})
+    lanes = runs.lane_health()
+    checks.append({"check": "at least one lane up", "ok": any(l.get("ok") for l in lanes),
+                   "detail": ", ".join(l["lane"] for l in lanes if l.get("ok")) or "none"})
+    for l in lanes:
+        h = l.get("health") or {}
+        if l.get("ok"):
+            checks.append({"check": f"lane {l['lane']} browser attached",
+                           "ok": bool(h.get("browserAlive")), "detail": ""})
+    t = config.active_target()
+    problems = runs._validate(t)
+    checks.append({"check": f"target '{t}' runnable", "ok": not problems,
+                   "detail": problems[0] if problems else ""})
+    out = Path(str(config.resolve("outputDir")[0]))
+    writable = out.exists() or os.access(str(out.parent), os.W_OK)
+    checks.append({"check": "output dir writable", "ok": writable, "detail": str(out)})
+    return {"ok": all(c["ok"] for c in checks), "checks": checks}

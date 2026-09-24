@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import time
+import sys
 from pathlib import Path
 
 from . import ansi as A
@@ -129,10 +130,14 @@ def screen_main() -> str:
         items = [
             ("Dashboard", "live status of the current run", "dashboard"),
             ("Start a run", "pick a target, audit it", "run"),
+            ("Scope a run", "files, batching and a time estimate first", "scope"),
+            ("Run control", "pause / stop / rerun the live run", "run_control"),
+            ("Batches", "saved work — inspect or discard one", "batches"),
+            ("Findings", "what the last run produced", "findings"),
+            ("System prompt", "what an auditor is ACTUALLY told", "prompt"),
             ("Targets", "the repos this orchestrator audits", "targets"),
             ("Configuration", "every setting", "config"),
             ("Lanes & models", "which backends are alive", "models"),
-            ("Findings", "what the last run produced", "findings"),
             ("Agent personas", "who audits, and what each one looks for", "agents"),
             ("MCP server", "let an agent drive this orchestrator", "mcp"),
         ]
@@ -280,6 +285,210 @@ def screen_target(name: str) -> None:
         if not res["ok"]:
             print(A.red("  ✗ " + str(res.get("reason"))))
             wait_key()
+
+
+
+# ── scope: what a run would cover, before starting it ────────────────────────
+
+def screen_scope() -> str:
+    """Files, batching and a time estimate — the numbers to look at BEFORE a run."""
+    target = config.active_target()
+    print(A.clear(), end="")
+    print()
+    # A bare "scanning…" on a repo with hundreds of files is indistinguishable from a hang.
+    # Show the count climbing, on one line, so the user can see it is working.
+    def progress(n: int) -> None:
+        sys.stdout.write("\r  " + A.dim(f"scanning… {n} files found"))
+        sys.stdout.flush()
+    print("  " + A.dim("scanning…"))
+    scan = runs.scan_target(target, on_progress=progress)
+    sys.stdout.write("\r" + " " * 50 + "\r")
+    est = runs.estimate(target)
+    is_active = config.active_target() == target
+
+    body = []
+    if scan.get("error"):
+        body.append(A.red(str(scan["error"])))
+    else:
+        body.append(f"{A.dim('target'.ljust(12))} {A.b(target)}")
+        body.append(f"{A.dim('files'.ljust(12))} {A.b(str(scan.get('files')))}   {A.dim('(' + str(scan.get('source')) + ')')}")
+        body.append(f"{A.dim('batches'.ljust(12))} {est.get('batches')}   {A.dim(str(est.get('batchSize')) + ' files each')}")
+        body.append(f"{A.dim('rounds'.ljust(12))} {est.get('totalRounds')}   {A.dim('across ' + str(est.get('passes')) + ' pass(es)')}")
+        body.append(f"{A.dim('estimate'.ljust(12))} {A.b(str(est.get('estimatedHours')) + ' hours')}   "
+                    f"{A.dim(str(est.get('avgRoundSeconds')) + 's/round')}")
+        body.append(f"{A.dim('basis'.ljust(12))} {A.dim(str(est.get('basis'))[:60])}")
+        if scan.get("missing"):
+            body.append("")
+            body.append(A.red(f"{len(scan['missing'])} listed file(s) do not exist:"))
+            for m in scan["missing"][:5]:
+                body.append(A.red("  " + str(m)))
+    print(A.box("Scope of a run", body, W() - 4))
+
+    if not scan.get("error") and scan.get("sample"):
+        print()
+        print(A.box("First files", [A.dim(f[:W() - 8]) for f in scan["sample"][:10]], W() - 4, "blue"))
+
+    items = [("Edit the target's file list", "scope is set on the Targets screen", "targets"),
+             (A.cyan("Start this run now"), "", "run"),
+             (A.dim("← back"), "", BACK)]
+    print()
+    choice = menu("Next", items, subtitle="the estimate assumes every round succeeds at the average pace")
+    if choice == BACK:
+        return "main"
+    return choice
+
+
+# ── batches: inspect and discard saved work ──────────────────────────────────
+
+def screen_batches() -> str:
+    while True:
+        bs = runs.batch_files()
+        items = [(A.dim("← back"), "", BACK)]
+        if not bs:
+            print(A.clear(), end="")
+            print()
+            print(A.box("Batches", [A.dim("nothing saved yet"),
+                                    "",
+                                    A.dim("a batch is written only when ALL of its rounds finish")], W() - 4))
+            wait_key()
+            return "main"
+        for b in bs:
+            mark = A.green("✓") if b["findings"] else A.yellow("·")
+            items.append((f"{mark} {b['pass']}/{b['batch']}",
+                          f"{b['findings']} findings   {b['bytes']}B", b))
+        print(A.clear(), end="")
+        print()
+        print(A.box("Saved batches", [A.dim("select one to discard it, so the next resumed run re-audits it")], W() - 4))
+        print()
+        choice = menu("Batches", items)
+        if choice == BACK:
+            return "main"
+        show_batch(choice)
+
+
+def show_batch(b: dict) -> None:
+    print(A.clear(), end="")
+    print()
+    body = [f"{A.dim('pass'.ljust(10))} {b['pass']}",
+            f"{A.dim('batch'.ljust(10))} {b['batch']}",
+            f"{A.dim('findings'.ljust(10))} {b['findings']}",
+            f"{A.dim('size'.ljust(10))} {b['bytes']} bytes",
+            "", A.b("files covered")]
+    body += [A.dim("  " + str(f)[:W() - 12]) for f in b["files"]]
+    print(A.box("Batch", body, W() - 4))
+    print()
+    items = [(A.red("Discard this batch"), "the next resumed run re-audits it", "@del"),
+             (A.dim("← back"), "", BACK)]
+    choice = menu("Action", items)
+    if choice == "@del":
+        if A.confirm("  Discard it? The file is moved to .discarded, not deleted", default=True):
+            r = runs.delete_batch(None, b["pass"], b["batch"])
+            print(A.green("  ✓ discarded") if r.get("ok") else A.red("  ✗ " + str(r.get("reason"))))
+            wait_key()
+
+
+# ── prompt preview: what an auditor is actually told ─────────────────────────
+
+def screen_prompt() -> str:
+    """The exact system prompt a persona receives. A model auditing a system it was told is
+    something else invents defects belonging to that system, and this is how you see it."""
+    from . import mcp_server as m
+    try:
+        r = m._prompt_preview({"target": config.active_target()})
+    except Exception as e:
+        print(A.clear(), end="")
+        print("\n  " + A.red("could not build the prompt: " + str(e)))
+        wait_key()
+        return "main"
+    if isinstance(r, dict) and r.get("isError"):
+        print(A.clear(), end="")
+        print("\n  " + A.red(r["content"][0]["text"]))
+        wait_key()
+        return "main"
+
+    text = r["prompt"]
+    # page through it: a real prompt is several thousand characters
+    pos = 0
+    page = max(10, A.term_height() - 8)
+    while True:
+        print(A.clear(), end="")
+        print()
+        print(A.box(f"{r['agent']}  ·  {r['chars']} chars  ·  "
+                    f"domain context: {'yes' if r['domainContextIncluded'] else 'NO'}",
+                    [], W() - 4, "magenta"))
+        for line in text.splitlines()[pos:pos + page]:
+            print("  " + line[:W() - 4])
+        print()
+        pct = min(100, int(100 * (pos + page) / max(1, len(text.splitlines()))))
+        print("  " + A.dim(f"{pct}%   ↑/↓ scroll   space next page   esc back"))
+        k = A.read_key(None)
+        if k in ("escape", "q"):
+            return "main"
+        if k == "down":
+            pos = min(max(0, len(text.splitlines()) - 1), pos + 1)
+        elif k == "up":
+            pos = max(0, pos - 1)
+        elif k in ("space", "pagedown"):
+            pos = min(max(0, len(text.splitlines()) - 1), pos + page)
+        elif k in ("pageup",):
+            pos = max(0, pos - page)
+
+
+# ── run control: pause / resume / stop the live run ──────────────────────────
+
+def screen_run_control() -> str:
+    run = runs.current_run()
+    if not run:
+        print(A.clear(), end="")
+        print("\n  " + A.dim("no run to control"))
+        wait_key()
+        return "main"
+    while True:
+        p = runs.progress(run)
+        alive = p.get("running")
+        body = [f"{A.dim('target'.ljust(11))} {run.get('target')}",
+                f"{A.dim('pid'.ljust(11))} {run.get('pid')}   {A.green('alive') if alive else A.dim('stopped')}",
+                f"{A.dim('rounds'.ljust(11))} {p.get('roundsOk')}/{p.get('roundsTotal')}   "
+                f"{A.b(str(p.get('findings')))} findings",
+                f"{A.dim('started'.ljust(11))} {time.strftime('%H:%M:%S', time.localtime(run.get('startedAt') or 0))}"]
+        print(A.clear(), end="")
+        print()
+        print(A.box("Run control", body, W() - 4))
+        print()
+        if not alive:
+            print("  " + A.dim("this run has finished"))
+            wait_key()
+            return "main"
+        # "@" marks a LOCAL ACTION rather than a view to route to. Without a marker the two
+        # are indistinguishable in the data, and code (or a reader) cannot tell that "stop"
+        # is meant to run something here rather than navigate to a screen called stop.
+        items = [("@Pause", "SIGSTOP — keeps its place and memory, uses no CPU", "@pause"),
+                 ("@Stop", "terminates it; saved batches are kept", "@stop"),
+                 ("@Rerun", "stop this and start a fresh one", "@rerun"),
+                 (A.dim("← back"), "", BACK)]
+        choice = menu("Action", items)
+        if choice == BACK:
+            return "main"
+        if choice == "@pause":
+            r = runs.pause(run["id"])
+            print(A.green("  ✓ paused") if r.get("ok") else A.red("  ✗ " + str(r.get("reason"))))
+            wait_key()
+            # offer resume immediately, since a paused run looks identical to a dead one
+            if r.get("ok") and A.confirm("  Resume it now?", default=True):
+                runs.resume(run["id"])
+        elif choice == "@stop":
+            if A.confirm("  Stop the run?", default=True):
+                r = runs.stop(run["id"])
+                print(A.green("  ✓ stopped") if r.get("stopped") else A.dim("  " + str(r.get("reason"))))
+                wait_key()
+                return "main"
+        elif choice == "@rerun":
+            if A.confirm("  Stop and start fresh?", default=False):
+                r = runs.rerun(run.get("target"))
+                print(A.green("  ✓ started pid " + str(r["run"]["pid"])) if r.get("ok")
+                      else A.red("  ✗ " + str(r.get("reason"))))
+                wait_key()
+                return "dashboard"
 
 
 # ── config ───────────────────────────────────────────────────────────────────
