@@ -253,6 +253,50 @@ def verify_one(f: dict) -> dict:
             out["verify_note"] = f"{symbol}() does not exist in this file"
             return out
 
+    # "Inverted/unclear logic without justification" is checkable: the justification is
+    # either in the file or it is not. Measured: flagged of SANDBOX_LOG ("inverted logic
+    # without clear justification") in a repo where settings.js:613 carries a comment
+    # explaining the inversion AND sandbox.js:15 documents "default: true — log every
+    # denial" in its env-var block.
+    if any(k in low3 for k in ("inverted logic", "without clear justification",
+                               "without justification", "unclear justification",
+                               "unjustified", "no justification")):
+        body = open(fp, errors="replace").read()
+        # A nearby comment or doc line that mentions the same setting and a reason word.
+        sym = re.search(r"\bSANDBOX_[A-Z_]+\b|\b[A-Z][A-Z0-9_]{4,}\b", text)
+        if sym:
+            name = sym.group(0)
+            pat = (r"(?:#|//|/\*).*" + re.escape(name) + r".*(invert|default|because|so that|unless|intentional)")
+            if re.search(pat, body, re.I | re.M):
+                out["verified"] = "REFUTED"
+                out["verify_note"] = f"the {name} behaviour is explained in a comment here"
+                return out
+            # The justification is often in the file that IMPLEMENTS the setting rather
+            # than the one that tests it. Measured: "SANDBOX_LOG uses inverted logic
+            # without clear justification" cited harness_tests/cli_settings.test.js, while
+            # the explanation sits in cli/settings.js:613 and sandbox.js:15. Searching
+            # only the cited file produced a SUPPORTED verdict on a claim that is false.
+            for root, dirs, files in os.walk(ROOT):
+                dirs[:] = [d for d in dirs
+                           if d not in (".venv", "node_modules", ".git", "dist", "__pycache__")]
+                hit = False
+                for fn in files:
+                    if not fn.endswith((".py", ".js", ".jsx", ".ts", ".tsx")):
+                        continue
+                    fp2 = os.path.join(root, fn)
+                    try:
+                        other = open(fp2, errors="replace").read()
+                    except OSError:
+                        continue
+                    if re.search(pat, other, re.I | re.M):
+                        out["verified"] = "REFUTED"
+                        out["verify_note"] = (f"the {name} behaviour is explained in a "
+                                              f"comment in {os.path.basename(fp2)}")
+                        hit = True
+                        break
+                if hit:
+                    return out
+
     # A "no guard for SUBJECT" claim needs the SUBJECT to exist too. Measured: "DNS
     # record creation not idempotent" came back SUPPORTED against server/cf_computer.py,
     # which is a Cloudflare Computer-Use workspace client with ZERO matches for
