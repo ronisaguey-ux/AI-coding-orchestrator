@@ -253,6 +253,27 @@ def verify_one(f: dict) -> dict:
             out["verify_note"] = f"{symbol}() does not exist in this file"
             return out
 
+    # A "no guard for SUBJECT" claim needs the SUBJECT to exist too. Measured: "DNS
+    # record creation not idempotent" came back SUPPORTED against server/cf_computer.py,
+    # which is a Cloudflare Computer-Use workspace client with ZERO matches for
+    # dns/record/subdomain anywhere in the file. The subject was invented, so its
+    # missing guard is not a defect.
+    SUBJECTS = {
+        "dns": r"\bdns\b|zone_id|record_id|\bcname\b|\ba_record\b",
+        "email": r"smtp|sendgrid|mailgun|send_mail|smtplib",
+        "payment": r"stripe|checkout|invoice|payment_intent|webhook",
+        "upload": r"upload|multipart|File\(|UploadFile",
+        "cache": r"\bcache\b|redis|memcach",
+        "queue": r"queue|celery|task_id|enqueue",
+    }
+    for subj, pat in SUBJECTS.items():
+        if subj not in low3:
+            continue
+        if not re.search(pat, body_full, re.I):
+            out["verified"] = "REFUTED"
+            out["verify_note"] = f"file contains no {subj}-related code; subject does not exist here"
+            return out
+
     # A guard claim is only meaningful for something that EXPOSES a surface. A CLI
     # script has no auth guard because it is not an endpoint — flagging that as a
     # supported security gap is a false positive of mine, and it was one: this probe
