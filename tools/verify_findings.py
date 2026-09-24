@@ -417,11 +417,54 @@ def verify_one(f: dict) -> dict:
             if m:
                 literal = m
                 break
+        # An os.getenv("NAME", "fallback") carries its default as a CALL ARGUMENT, not an
+        # assignment, so the assignment regex above misses it — and the note then reads
+        # "no literal" when a literal plainly exists. Measured: server/config.py:25 is
+        # `secret_key: str = os.getenv("SECRET_KEY", "dev-insecure-...")`. The verdict was
+        # right (refuted) but for the wrong reason, which misleads the next reader.
+        if literal is None:
+            m2 = re.search(
+                r"\b([A-Za-z_]{0,20}(?:secret|password|key|token)[A-Za-z_]{0,20})\b\s*[:=]?[^\n]{0,40}?"
+                r"os\.getenv\([^,)]+,\s*[\"']([^\"']{8,})[\"']", body, re.I)
+            if m2:
+                literal = m2
         env_or_random = re.search(
             r"os\.getenv\(|os\.environ|secrets\.|token_urlsafe|getpass|input\(", body)
         if literal:
-            out["verified"] = "SUPPORTED"
-            out["verify_note"] = f"credential literal present: {literal.group(0)[:40]}"
+            # A literal default is only a finding if NOTHING rejects it. Measured:
+            # server/config.py:25 has a real `secret_key` literal, and server/security.py:44
+            # lists that exact string in KNOWN_INSECURE_SECRETS with a `raise RuntimeError`
+            # behind `config.production_mode` — the guard provably fires (reproduced by
+            # setting the env and importing), so the default can never reach production.
+            # Searching only the cited file would report this as SUPPORTED.
+            lits = re.findall(r"[\"']([^\"']{12,})[\"']", literal.group(0))
+            guarded = ""
+            for root, dirs, files in os.walk(ROOT):
+                dirs[:] = [d for d in dirs
+                           if d not in (".venv", "node_modules", ".git", "dist", "__pycache__")]
+                for fn in files:
+                    if not fn.endswith((".py", ".js", ".jsx", ".ts", ".tsx")):
+                        continue
+                    fp2 = os.path.join(root, fn)
+                    try:
+                        other = open(fp2, errors="replace").read()
+                    except OSError:
+                        continue
+                    if any(v in other for v in lits) and re.search(
+                            r"KNOWN_INSECURE|insecure_secret|insecure.{0,12}secret"
+                            r"|raise RuntimeError|reject.{0,20}default",
+                            other, re.I):
+                        guarded = os.path.basename(fp2)
+                        break
+                if guarded:
+                    break
+            if guarded:
+                out["verified"] = "REFUTED"
+                out["verify_note"] = (f"literal exists but {guarded} rejects it "
+                                      f"(fail-closed guard)")
+            else:
+                out["verified"] = "SUPPORTED"
+                out["verify_note"] = f"credential literal present: {literal.group(0)[:40]}"
         elif env_or_random:
             out["verified"] = "REFUTED"
             out["verify_note"] = "no literal; value comes from env or a random generator"
@@ -497,7 +540,17 @@ def verify_one(f: dict) -> dict:
             readme = open(os.path.join(ROOT, "README.md"), errors="replace").read()
         except OSError:
             readme = ""
+        # A README often names a file in a COMBINED form rather than literally.
+        # Measured: the layout line reads `popup.html / .js`, so `base in readme` was
+        # False and a claim of "popup.js is not named in README.md" came back SUPPORTED
+        # against a README that documents it on line 50. Matching the stem followed by a
+        # dot catches that form. The trade-off is deliberate: a README that mentions
+        # `config.json` will also excuse a claim about `config.py`, which is the safer
+        # error here — the alternative is filing documentation work that is already done.
+        stem = os.path.splitext(base)[0]
         named = base in readme
+        if not named and len(stem) > 3:
+            named = re.search(r"\b" + re.escape(stem) + r"\.", readme) is not None
         out["verified"] = "SUPPORTED" if not named else "REFUTED"
         out["verify_note"] = (f"{base} {'is' if named else 'is not'} named in README.md")
         return out
