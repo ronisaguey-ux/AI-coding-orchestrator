@@ -2101,8 +2101,28 @@ def load_existing_batch(pass_num: int, batch_idx: int) -> dict | None:
 
 
 def save_batch_result(pass_num: int, batch_idx: int, result: dict):
-    """Persist a single batch result to disk."""
+    """Persist a single batch result to disk — but never at the cost of a good one.
+
+    A rate-limited retry answers with nothing, and writing that over a batch that already
+    held findings is silent data loss. Measured 2026-09-24: two overlapping helpotron runs
+    were launched without --resume, so pass 1 was re-run and overwritten, and the corpus
+    fell from 838 findings to 348 with 21 of 32 batches left empty. An empty result is
+    only refused when it would REPLACE a non-empty one — so a genuinely clean batch still
+    saves, and a batch that is already empty is left alone and skipped on resume. That is
+    what makes this terminate instead of re-running the empty batch forever.
+    """
     path = batch_result_path(pass_num, batch_idx)
+    new_findings = result.get("findings") or []
+    if os.path.exists(path):
+        try:
+            with open(path) as f:
+                old_findings = (json.load(f) or {}).get("findings") or []
+        except Exception:
+            old_findings = []
+        if old_findings and not new_findings:
+            print(f"  [Pass {pass_num} Batch {batch_idx+1}] REFUSED to overwrite "
+                  f"{len(old_findings)} findings with an empty result")
+            return
     with open(path, 'w') as f:
         json.dump(result, f, indent=2, default=str)
 
