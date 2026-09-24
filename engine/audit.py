@@ -1,8 +1,16 @@
 #!/usr/bin/env python3
 """
-parallel_agents.py — Multi-agent Oculus code audit using OmniRoute API.
-v6 — Rotation-based cross-examination with 8 agents, 5 passes, and
+audit.py — Multi-agent code audit engine, driven through an OpenAI-compatible endpoint.
+
+v6 — Rotation-based cross-examination with 8 specialists + 1 confirm agent, N passes, and
      model-capability scoring with dynamic fallback chains.
+
+The engine is DOMAIN-NEUTRAL by default: the personas in AGENTS reason about correctness,
+security, architecture, performance, logic and simplification without assuming what kind of
+system they are reading. A target supplies its own context through DOMAIN_PROFILES and its own
+specialists through DOMAIN_AGENTS, keyed by AUDIT_TARGET_LABEL. See those tables for why the
+defaults must stay generic: a model told it is auditing a system it is not reading invents
+defects belonging to that other system.
 """
 
 import asyncio
@@ -84,6 +92,10 @@ COMPACTED_FINDINGS_MAX = 6000
 # different repo (or several, via separate runs with separate OUTPUT_BASE) without
 # editing code. AUDIT_TARGET_DIR is the primary root the file walk starts from.
 OCULUS_DIR = os.environ.get("AUDIT_TARGET_DIR", "/home/roni/Roni_workspace/oculus")
+# The name above is historical (this engine was written for one repo). TARGET_DIR is the
+# name that describes what it is; both point at the same value so an existing launcher keeps
+# working and a new one does not have to learn the old name.
+TARGET_DIR = OCULUS_DIR
 ALT_SCRIPTS_DIR = os.environ.get("AUDIT_ALT_SCRIPTS_DIR", "/home/roni/Roni_workspace/alt_important_scripts")
 WEBCHAT_API_DIR = os.environ.get("AUDIT_WEBCHAT_API_DIR", "/home/roni/Roni_workspace/webchat-api")
 TASK_FILE = os.environ.get("AUDIT_TASK_FILE", "/home/roni/Roni_workspace/promptsfr/audit_prompt.md")
@@ -105,7 +117,7 @@ TARGET_LABEL = os.environ.get("AUDIT_TARGET_LABEL", "target")
 # stale constant. The orchestrator passes the web-verified date via
 # AUDIT_VERSION; direct invocations fall back to today.
 AUDIT_VERSION = os.environ.get("AUDIT_VERSION", f"{datetime.now().month}_{datetime.now().day}")
-FINAL_REPORT = f"{OUTPUT_BASE}/multi_agent_oculus_audit_{AUDIT_VERSION}.md"
+FINAL_REPORT = f"{OUTPUT_BASE}/code_audit_{AUDIT_VERSION}.md"
 STATE_FILE = f"{OUTPUT_BASE}/audit_state.json"
 
 
@@ -286,10 +298,13 @@ MODEL_ALLOWLIST = frozenset(
 def _load_model_allowlist() -> frozenset:
     """Return the effective model allowlist.
 
-    Comma-separated OCULUS_MODEL_ALLOWLIST env override; a present-but-empty
-    value is deny-all (empty chain). Absent env -> the curated MODEL_ALLOWLIST.
+    Comma-separated AUDIT_MODEL_ALLOWLIST env override (OCULUS_MODEL_ALLOWLIST is honoured as
+    the historical name); a present-but-empty value is deny-all (empty chain). Absent env ->
+    the curated MODEL_ALLOWLIST.
     """
-    raw = os.environ.get("OCULUS_MODEL_ALLOWLIST")
+    raw = os.environ.get("AUDIT_MODEL_ALLOWLIST")
+    if raw is None:
+        raw = os.environ.get("OCULUS_MODEL_ALLOWLIST")
     if raw is None:
         return MODEL_ALLOWLIST
     ids = {p.strip() for p in raw.split(",") if p.strip()}
@@ -334,7 +349,12 @@ GRAPHIFY GUIDANCE:
         "name": "Performance Specialist",
         "weight": 1.3,
         "graph_focus": "hotspots",
-        "prompt_addition": """Your primary focus is performance: memory allocation, loop vectorization, JIT fallback, I/O blocking, database queries, caching inefficiencies, and multiprocessing bottlenecks. Quantify impact (latency, memory, throughput).
+        "prompt_addition": """Your primary focus is performance: algorithmic complexity, needless
+repeated work, allocation and copying, blocking I/O on a hot path, database query patterns
+(N+1, missing index, full scan), caching that misses or never invalidates, unbounded memory
+growth, and concurrency that serializes where it should not. Quantify impact in the terms the
+system actually cares about — latency, memory, throughput, cost per request — and say which
+of those you are estimating and from what evidence.
 
 GRAPHIFY GUIDANCE:
 - Use the provided hotspot report (highest-degree nodes) to find functions that are heavily called.
@@ -353,14 +373,24 @@ GRAPHIFY GUIDANCE:
 - If an orphan appears security-sensitive, investigate whether it is reachable through reflection, hooks, or dynamic imports."""
     },
     {
-        "name": "CIA Hacker",
+        "name": "Adversarial Security",
         "weight": 1.6,
         "graph_focus": "orphans_and_entrypoints",
-        "prompt_addition": """Your primary focus is adversarial security. Assume you are a senior CIA infiltrator trying to compromise Oculus. Check every vector: API auth, data exfiltration, code injection, privilege escalation, live trading safety, cryptographic flaws, supply chain risks. Attempt to find a way to break the system.
+        "prompt_addition": """Your primary focus is adversarial security. Assume you are a determined
+attacker whose only goal is to compromise this system. Check every vector that applies to it:
+authentication and session handling, authorization and privilege boundaries (including
+object-level access — can a user reach another user's data by changing an id?), injection
+(SQL, command, template, prompt), deserialization, path traversal, secret exposure, data
+exfiltration, race conditions in money or state transitions, dependency and supply-chain risk,
+and unsafe defaults. Attempt to find a way to break the system.
+
+Do NOT assume what the system is. Read the code and the domain context to decide which vectors
+are live here, and report the ones that are. A vector that cannot exist in this codebase is not
+a finding.
 
 GRAPHIFY GUIDANCE:
 - Use orphan and low-degree nodes to find rarely-scrutinized code paths that may hide backdoors or weak validation.
-- Use caller/callee chains to trace how user input reaches sensitive functions (live trading, auth, file I/O).
+- Use caller/callee chains to trace how untrusted input reaches a sensitive sink (a query, a shell, a file path, an outbound request, a credential read).
 - Identify high-centrality nodes: if compromised, these would give broad control over the system.
 - Look for missing links: security-sensitive functions that should be called by auth/logging but are not."""
     },
@@ -376,7 +406,7 @@ DEFINITION OF A LOGICAL GAP:
 - Backwards logic (doing the opposite of what's intended)
 - Approaches that work "on paper" but are horrible in practice
 
-EXAMPLE: a genetic algorithm that culls 98% of the population each generation and seeds the next from the 2% winners. It "works" technically but forces premature convergence and destroys genetic diversity — logically, a disaster.
+EXAMPLE: a retry loop that backs off, but recomputes the same expensive request each attempt and discards the previous result — so a transient failure costs N times the work and a permanent failure costs N times the work for nothing. It "works" technically and passes its tests, but the logic is wrong: the retry should reuse or cancel the in-flight work, not duplicate it.
 
 For each logical gap found, output:
 1. The gap (what doesn't make sense)
@@ -395,7 +425,7 @@ CROSS-EXAMINATION (later passes): review findings from other specialists and fla
 
 FALSE-POSITIVE HANDLING: some code may seem illogical but is actually complexly profound — do not assume complexity is a flaw. If ambiguous, flag as LOW with the note: "May be intentional — review manually". Only flag clear logical contradictions.
 
-EVOLUTION: reference past logic-gap findings to identify recurring patterns (e.g. "we keep confusing regime detection with signal generation") and flag their recurrence as a HIGH finding.
+EVOLUTION: reference past logic-gap findings to identify recurring patterns (e.g. the same concept computed two different ways in two places and allowed to drift) and flag their recurrence as a HIGH finding.
 
 You have no veto power — you flag, propose, and move on.
 
@@ -445,6 +475,283 @@ GRAPHIFY GUIDANCE:
         "prompt_addition": """You are the final arbiter. You will receive ALL findings from the 8 specialists for this batch. For each finding, vote YES (confirm) or NO (refute). Provide a brief reasoning. Consider the agent's specialty weight and the model score that produced the finding: high-score models/agents are more trustworthy; low-score ones require stronger corroboration. Output a structured vote."""
     },
 ]
+
+# ─── DOMAIN PROFILES ──────────────────────────────────────────────────────────
+# What the target ACTUALLY IS, in the prompt the model reads.
+#
+# Why this exists: the generic prompt tells every auditor it is reviewing "the Oculus
+# trading system" and asks about "live trading safety". Measured consequence - a batch of
+# helpotron extension files was described as trading-system code, and an audit of a
+# roofing lead bot asked about financial-market risk. Wrong context does not just lose
+# signal, it PRODUCES findings: a model told it is auditing a trading system invents
+# trading-system defects. That is a large part of the 62-74% hallucination rate.
+#
+# Each profile states the system, its real surface, and - deliberately - what is NOT a
+# risk here, because a model given no such list invents plausible ones for the wrong domain.
+DOMAIN_PROFILES = {
+    "helpotron": {
+        "what": (
+            "Helpotron is a STUDY-ASSISTANCE product for university students. A FastAPI "
+            "backend (server/), a React frontend (web/), and a Chrome extension "
+            "(extension/) that runs on the student's own LMS pages. Users buy task tokens "
+            "and spend them on AI work: assignments, study materials, and an agent that "
+            "can drive a browser."
+        ),
+        "surfaces": (
+            "JWT + session + API-key auth; a token economy that meters real LLM spend; a "
+            "Stripe billing path; an admin/impersonation surface; a data lake that stores "
+            "user submissions; an LLM router (OpenRouter); a local humanizer model; AI "
+            "detection; an agent that performs browser actions on third-party sites."
+        ),
+        "risks": (
+            "Academic-integrity and institutional-ToS exposure of the product's framing; "
+            "the extension operating on pages holding student data; metering correctness "
+            "(a task that costs more than it charges); the auth boundary between API key "
+            "and session; admin actions with no audit trail; user data in the data lake."
+        ),
+        "not_risks": (
+            "There is no trading, no order execution, no market data, no financial "
+            "positions, and no low-latency path. Do NOT report trading, pricing-engine or "
+            "HFT findings. Do NOT report Linux-kernel, driver or embedded concerns."
+        ),
+    },
+    "t2b": {
+        "what": (
+            "T2B is a LEAD-GENERATION and OUTREACH service for roofing contractors. A Flask "
+            "app (roofing-lead-bot/) with modular API blueprints, SQLite storage, Twilio for "
+            "SMS and voice, Stripe for subscription billing, and AI for lead filtering and "
+            "conversation. It finds businesses, qualifies them, and contacts them."
+        ),
+        "surfaces": (
+            "Lead intake and enrichment; credit-based unlocking; Twilio SMS/voice send; "
+            "Stripe subscription and checkout; AI lead filtering and reply handling; "
+            "consent capture; per-user rate limiting; a circuit breaker around outbound "
+            "providers."
+        ),
+        "risks": (
+            "TCPA / DNC exposure from outbound SMS and calls (the single largest legal "
+            "exposure in this product - every unwanted message is a statutory penalty); "
+            "unbounded Twilio spend; consent that is recorded but not enforced at send "
+            "time; lead PII handling; credit deductions that must be atomic and idempotent; "
+            "provider failure handling."
+        ),
+        "not_risks": (
+            "There is no trading, no order book, no market simulation, no RL agent and no "
+            "genetic algorithm here. Do NOT report trading, quant-finance or HFT findings. "
+            "Do NOT report GPU, driver or kernel concerns."
+        ),
+    },
+    "webchat-to-api-harness": {
+        "what": (
+            "The webchat-to-api-harness turns a logged-in webchat tab into an OpenAI- and "
+            "Anthropic-compatible API. A Node service (server.js + src/) drives a real "
+            "Chrome over CDP, and exposes tools the webchat model may call (read/write "
+            "files, run_bash) inside a sandbox. Several lanes can run at once, each with its "
+            "own Chrome profile and gateway."
+        ),
+        "surfaces": (
+            "CDP browser driving; a tool loop that executes model-authored commands; a path "
+            "sandbox; per-lane gateways and Chrome profiles; a per-account send lock; an "
+            "in-process memory store; a CLI; an MCP server."
+        ),
+        "risks": (
+            "The model emits the commands: any tool that runs them is a trust boundary, so "
+            "path-fence escapes and command-injection via tool arguments matter most. Also "
+            "state that lives longer than one request — a shared browser or lock across lanes, "
+            "a tab that can wedge, a health flag that lies — and writes that can destroy a "
+            "user's tree."
+        ),
+        "not_risks": (
+            "There is no trading and no financial engine. Do NOT report trading, market or "
+            "quant findings."
+        ),
+    },
+}
+
+# ─── DOMAIN SPECIALISTS ───────────────────────────────────────────────────────
+# Personas that only make sense for one target. They REPLACE the least-relevant generic
+# specialists rather than adding rounds, so the loop shape (8 specialists + 1 confirm)
+# and the per-batch cost are unchanged.
+DOMAIN_AGENTS = {
+    "helpotron": [
+        {
+            "name": "Academic Integrity & Extension Surface",
+            "weight": 1.5,
+            "graph_focus": "orphans_and_entrypoints",
+            "prompt_addition": """Your focus is the product's HIGHEST-RISK surface: the Chrome
+extension that operates on a student's LMS page, and the academic-integrity framing of the
+product itself.
+
+Examine:
+- What the extension reads from, writes to, and executes on third-party LMS pages, and
+  whether anything user-identifying leaves the browser.
+- Whether the extension can act without a valid server-issued credential, and whether a
+  revoked credential actually stops it.
+- Copy, naming and claims that describe evading detection or doing assessed work for the
+  student: this is a legal and institutional-ToS exposure, not a style question.
+- The consent/assistance boundary: does the product do work the student is assessed on?
+
+Be concrete. Name the file and the line. Do NOT invent trading or financial findings.""",
+        },
+        {
+            "name": "Token Economy & Metering Auditor",
+            "weight": 1.4,
+            "graph_focus": "clusters",
+            "prompt_addition": """Your focus is whether the token economy is CORRECT and
+CONSISTENT: every path that spends real upstream money must charge the user, and every path
+that charges must have actually done the work.
+
+Look for:
+- Work performed with no charge, or a charge with no work (an asymmetry in either direction).
+- Flat prices standing in for measured cost where the real cost is unbounded.
+- Charge paths that are not atomic or not idempotent under retry and concurrency.
+- Refund paths that can mint balance, and gates that read a different balance field than the
+  one spending writes.
+- Admin or operator exemptions that apply more broadly than intended.
+
+State the exact field names and the functions that read/write them. Do NOT report trading
+findings.""",
+        },
+    ],
+    "t2b": [
+        {
+            "name": "Outreach Compliance (TCPA/DNC)",
+            "weight": 1.6,
+            "graph_focus": "orphans_and_entrypoints",
+            "prompt_addition": """Your focus is the single largest legal exposure in a
+cold-outreach product: whether every outbound SMS and voice call is LAWFUL.
+
+For every send path, establish and state:
+- Is consent recorded, and is it CHECKED AT SEND TIME (not merely stored earlier)?
+- Can a send proceed with no consent record, or with one that was later revoked?
+- Is there any do-not-contact / opt-out suppression, and does it apply to every channel
+  (SMS, voice, AI conversation) rather than one?
+- Is there any time-of-day or frequency limit, and is it enforced per recipient?
+- What stops a misconfigured or retried job from messaging the same person repeatedly?
+
+Treat "consent is captured somewhere" as insufficient - the question is whether the send path
+consults it. Quote the function that sends and the check (or its absence). Do NOT report
+trading, market or quant findings.""",
+        },
+        {
+            "name": "Outbound Spend & Provider Failure",
+            "weight": 1.4,
+            "graph_focus": "clusters",
+            "prompt_addition": """Your focus is unbounded outbound spend and what happens when a
+third-party provider (Twilio, Stripe, the LLM) fails or is slow.
+
+Look for:
+- Any path that can send an unbounded number of billable messages/calls per user action, per
+  retry, or per unit of time, with no ceiling.
+- Retry loops that multiply cost instead of respecting a budget.
+- Credit deduction that is not atomic or idempotent (double-charge, or charge with no send).
+- Provider calls that block the request thread, or that have no timeout.
+- Circuit-breaker state that can stay open (dead product) or stay closed when it should open.
+
+Quote the counter or budget that exists, or state plainly that none does. Do NOT report
+trading findings.""",
+        },
+    ],
+    "webchat-to-api-harness": [
+        {
+            "name": "Tool-Execution Trust Boundary",
+            "weight": 1.6,
+            "graph_focus": "orphans_and_entrypoints",
+            "prompt_addition": """This system's defining property is that A LANGUAGE MODEL WRITES THE
+COMMANDS IT THEN EXECUTES. That makes every tool that runs model-authored input a trust boundary,
+and it is where the real risk lives.
+
+For each tool the model can call (read_file, write_file, edit_file, run_bash, list_dir, …) and
+for the MCP surface:
+- What can the model ask for that the sandbox does NOT catch? Check the fence itself: are the
+  allowed roots resolved and compared AFTER symlink and `..` normalisation, or is a raw prefix
+  test used that a crafted path walks through?
+- Is every path parameter validated on EVERY entry point, or only on the channel that was
+  tested? A guard on one path and not its sibling is the normal shape of a real escape.
+- For command execution: is the argument passed as argv, or interpolated into a shell string?
+  Enumerate the deny-list and state what it does NOT cover.
+- Can a crafted tool argument reach a secret the sandbox is meant to protect — a key file, a
+  parent process's environment, another lane's Chrome profile holding a live session?
+- Does an error path leak the fence's own internals back to the model, so it can probe iteratively?
+
+Quote the exact function that enforces the boundary and the input that defeats it, or state that
+you found none. Do not report generic "input validation" advice.""",
+        },
+        {
+            "name": "Session Lifetime & Lane Integrity",
+            "weight": 1.4,
+            "graph_focus": "cycles_and_communities",
+            "prompt_addition": """This system keeps long-lived, stateful resources: a real Chrome per
+lane, a CDP session, a pinned tab, a per-account send lock, and a tool loop that can run for
+minutes. Your focus is the failure modes of that lifetime.
+
+Look for:
+- Shared mutable state between lanes: a lock key or probe derived from something common (a fixed
+  port list, the host, a module-level singleton) when it must be per-lane. One lane then
+  serialises or blocks another, or two lanes silently share one browser and answer as each other.
+- A resource acquired but not released on every exit path (including throws), and any
+  re-entrancy in an initialiser that can run twice concurrently.
+- A health signal that can report healthy while the thing it reports on is dead — a flag set
+  true and never cleared by the failure path, or a liveness check that reads the wrong field.
+- A retry or reconnect path that assumes the previous attempt released what it held.
+- Anything that can wedge indefinitely with no timeout, and anything whose timeout is SHORTER
+  than the work it guards.
+
+Name the field, the function and the interleaving. Do not report trading, market or quant
+findings.""",
+        },
+    ],
+}
+
+
+def domain_context() -> str:
+    """The DOMAIN CONTEXT block for the current target, or '' if it has no profile.
+
+    Injected into every persona's prompt. Returning '' for an unknown target is correct: a
+    made-up profile is worse than none.
+    """
+    prof = DOMAIN_PROFILES.get(TARGET_LABEL)
+    if not prof:
+        return ""
+    return (
+        f"## DOMAIN CONTEXT - what you are actually auditing\n"
+        f"**{TARGET_LABEL}**: {prof['what']}\n\n"
+        f"**Its real surface:** {prof['surfaces']}\n\n"
+        f"**Where its real risk lives:** {prof['risks']}\n\n"
+        f"**{prof['not_risks']}**\n\n"
+        f"Ground every finding in the above. A finding that would only make sense in a "
+        f"different kind of system is a FALSE POSITIVE and must not be reported."
+    )
+
+
+def active_agents():
+    """The 8 specialists + confirm agent for THIS target.
+
+    Always returns exactly 9 with the confirm agent LAST, so every index in the run loop
+    keeps its meaning. Domain specialists REPLACE the weakest generic ones, so the batch
+    cost is identical to a generic run.
+
+    ⚠️ The replaced ones are chosen by WEIGHT, not by position. Taking `specialists[:keep]`
+    looked like it dropped "the least relevant", but the list is not ordered by relevance:
+    it removed Logic Gap Analyst (weight 1.30) while keeping Docs/Legacy Specialist (1.10),
+    so a lower-signal agent survived a higher-signal one - the opposite of the intent, and a
+    silent quality loss rather than an error. Rank by weight, drop the bottom of that ranking,
+    and keep the survivors in their original order so the loop's shape is unchanged.
+    """
+    domain = DOMAIN_AGENTS.get(TARGET_LABEL, [])
+    if not domain:
+        return AGENTS
+    confirm = AGENTS[-1]
+    specialists = list(AGENTS[:-1])
+    keep = max(0, 8 - len(domain))
+    # Sorted by (-weight, original index): highest signal first, ties broken by the existing
+    # order so the result is deterministic across runs. Everything past `keep` is dropped.
+    ranked = sorted(specialists, key=lambda a: (-a["weight"], specialists.index(a)))
+    dropped = {id(a) for a in ranked[keep:]}
+    kept = [a for a in specialists if id(a) not in dropped]
+    merged = kept + list(domain[:8])
+    return (merged + [confirm])[:9]
+
 
 MAX_AGENT_WEIGHT = max(a["weight"] for a in AGENTS)
 CONFIDENCE_MULTIPLIER = {"HIGH": 1.0, "MEDIUM": 0.7, "LOW": 0.4, "": 0.5}
@@ -1592,9 +1899,14 @@ def build_base_system_prompt(task_prompt: str, source_of_truth: str, readme: str
         else "## SOURCE OF TRUTH\n[Not provided — audit for code-level correctness, "
              "READ MME alignment, and runtime safety only; SoT conformance is the SOT Specialist's lane.]\n\n"
     )
+    # DOMAIN CONTEXT goes FIRST, immediately after the role line, because it is the frame
+    # every other instruction is read through. A model that believes it is auditing a
+    # trading system will produce trading-system findings no matter what the rest of the
+    # prompt says — so the correction has to precede the analysis dimensions, not follow them.
+    domain = domain_context()
     return f"""You are an expert code auditor analyzing the {TARGET_LABEL} codebase.
 
-## TASK / AUDIT PROTOCOL
+{domain + chr(10) + chr(10) if domain else ''}## TASK / AUDIT PROTOCOL
 {task_prompt[:TASK_TRUNCATE]}
 
 {sot_block}
@@ -1725,7 +2037,7 @@ For each finding below:
 - Vote **YES** if the issue is real, relevant, and worth fixing.
 - Vote **NO** if it is a false positive, already mitigated, unclear, or not actionable.
 - Use the agent's specialty weight and the model capability score as trust bias:
-  * Findings from high-weight agents (CIA Hacker 1.6, SOT Specialist 1.5) and high-score models (90+) should be trusted more.
+  * Findings from high-weight agents (Adversarial Security 1.6, SOT Specialist 1.5) and high-score models (90+) should be trusted more.
   * Findings from low-weight agents or low-score models (below 70) require stronger corroboration.
 - Provide concise reasoning.
 
@@ -2012,7 +2324,7 @@ async def run_batch_pipeline(sem: asyncio.Semaphore,
 
             specialist_results = await asyncio.gather(*[
             run_specialist(round_num, agent)
-            for round_num, agent in enumerate(AGENTS[:8], 1)
+            for round_num, agent in enumerate(active_agents()[:8], 1)
 
 
             ])
@@ -2026,7 +2338,7 @@ async def run_batch_pipeline(sem: asyncio.Semaphore,
 
 
         # Round 8: General Confirm Agent votes on this pass's findings
-        confirm_agent = AGENTS[8]
+        confirm_agent = active_agents()[-1]
         confirm_system = build_confirm_system_prompt(confirm_agent, task_prompt, source_of_truth, readme, graphify)
         confirm_user = build_confirm_user_prompt(batch_files, pass_findings, pass_num, confirm_agent, graphify)
 
@@ -2424,7 +2736,7 @@ async def generate_final_report(all_results: list[list[dict]]) -> str:
 
     # Agent model usage
     report.append("## Agent Model Usage\n")
-    for agent in AGENTS:
+    for agent in active_agents():
         score = get_agent_model_score(agent["name"])
         usage = _agent_model_usage.get(agent["name"], {})
         total = sum(usage.values())
