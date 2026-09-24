@@ -2089,16 +2089,30 @@ def batch_result_path(pass_num: int, batch_idx: int) -> str:
     return os.path.join(pass_dir, f"batch_{batch_idx:03d}.json")
 
 
-def load_existing_batch(pass_num: int, batch_idx: int) -> dict | None:
-    """Load a previously completed batch result if it exists and is valid."""
+def load_existing_batch(pass_num: int, batch_idx: int,
+                        expect_files: list | None = None) -> dict | None:
+    """Load a previously completed batch result if it exists and is valid.
+
+    The file list is checked, not just the index. BATCH_SIZE is env-overridable, and a
+    saved batch is only a result for THIS batch if it audited the same files — batch_000
+    at BATCH_SIZE=5 holds five files and at BATCH_SIZE=1 holds one. Resuming without this
+    check would map findings onto the wrong files and report a clean batch as audited.
+    A mismatch returns None, so the batch is re-run rather than silently mis-attributed.
+    """
     path = batch_result_path(pass_num, batch_idx)
     if not os.path.exists(path):
         return None
     try:
         with open(path) as f:
             data = json.load(f)
-        if data.get("pass") == pass_num and data.get("batch_idx") == batch_idx:
-            return data
+        if data.get("pass") != pass_num or data.get("batch_idx") != batch_idx:
+            return None
+        if expect_files is not None:
+            saved = data.get("files") or []
+            if [os.path.basename(x) for x in saved] != \
+               [os.path.basename(x) for x in expect_files]:
+                return None
+        return data
     except Exception:
         pass
     return None
@@ -2177,7 +2191,7 @@ async def run_pass(session: aiohttp.ClientSession,
     results: list[dict | None] = [None] * total_batches
     pending_batches = []
     for batch_idx, batch in enumerate(batches):
-        existing = load_existing_batch(pass_num, batch_idx)
+        existing = load_existing_batch(pass_num, batch_idx, expect_files=batch)
         if existing and resume:
             results[batch_idx] = existing
             batch_histories[batch_idx].extend(existing.get("findings", []))
