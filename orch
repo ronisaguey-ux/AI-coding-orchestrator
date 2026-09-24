@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# orch — the audit orchestrator's control panel and command line.
+#
+# A thin shim so the whole CLI is reachable as one word. It locates its own repository
+# rather than assuming a fixed path (so a clone works anywhere), and prefers a venv that
+# can import the engine's dependencies.
+set -euo pipefail
+
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+REPO="$(cd "$(dirname "$SELF")" && pwd)"
+
+pick_python() {
+  for c in "${ORCH_PYTHON:-}" "$REPO/.venv/bin/python" \
+           "$HOME/Roni_workspace/helpotron/.venv/bin/python" "$(command -v python3)"; do
+    [ -n "$c" ] && [ -x "$c" ] || continue
+    "$c" -c "import aiohttp" 2>/dev/null && { echo "$c"; return 0; }
+  done
+  command -v python3
+}
+
+PY="$(pick_python)"
+exec env PYTHONPATH="$REPO${PYTHONPATH:+:$PYTHONPATH}" "$PY" -m cli.index "$@"

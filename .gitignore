@@ -19,3 +19,6 @@ claude_*_outbox.json
 
 # VibeDoctor scan artifacts
 .vibedoctor/
+
+# The orchestrator's local settings: paths and a key value are machine-specific.
+orch_config.json
