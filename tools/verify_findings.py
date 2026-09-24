@@ -265,6 +265,11 @@ def verify_one(f: dict) -> dict:
         "upload": r"upload|multipart|File\(|UploadFile",
         "cache": r"\bcache\b|redis|memcach",
         "queue": r"queue|celery|task_id|enqueue",
+        # Measured: "OAuth state parameter not validated in callback" twice against
+        # server/canvas_sync.py, which is a REST sync engine (RFC 5988 pagination,
+        # bearer-token fetches) with ZERO matches for oauth/callback/authorize/
+        # redirect_uri/pkce. There is no OAuth flow in the file to have a flaw.
+        "oauth": r"\boauth\b|authorize|redirect_uri|\bpkce\b|code_verifier|client_id",
     }
     for subj, pat in SUBJECTS.items():
         if subj not in low3:
