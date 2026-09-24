@@ -183,9 +183,14 @@ def verify_one(f: dict) -> dict:
         out["verify_note"] = f"unreadable: {e}"
         return out
 
-    # Clamp: a range past EOF means the auditor invented the location.
-    if a > len(lines):
-        out["verify_note"] = f"line {a} past EOF ({len(lines)} lines)"
+    # A range past EOF means the auditor invented the location, so the claim is false
+    # rather than merely unchecked. Measured: a CRITICAL found "arbitrary code execution
+    # via browser console" at cf_computer.py:180-220 in a 155-line file, and returned
+    # UNVERIFIED — which puts an invented location in the human-review queue instead of
+    # the refuted pile. A location that does not exist cannot hold the defect.
+    if a > len(lines) or b > len(lines) + 20:
+        out["verified"] = "REFUTED"
+        out["verify_note"] = f"cites lines {a}-{b}; file has {len(lines)} lines"
         return out
     seg = "\n".join(lines[a - 1:b])
 
