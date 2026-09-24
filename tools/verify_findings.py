@@ -189,6 +189,55 @@ def verify_one(f: dict) -> dict:
         return out
     seg = "\n".join(lines[a - 1:b])
 
+    # "Lacks authentication / no authz / no rate limiting / no validation / no audit log"
+    # is refutable by finding the guard. These are the most common SECURITY claims and
+    # they are mechanically checkable: the guard is a named call, or it is not there.
+    # Measured: claimed "admin endpoint lacks authentication" of admin_advanced.py, which
+    # calls require_admin on every route.
+    GUARDS = {
+        "authn": (("lacks authentication", "no authentication", "without authentication",
+                   "unauthenticated", "no auth"), r"require_admin|get_current_user|"
+                   r"Depends\(|authenticate|require_session_auth|verify_jwt"),
+        "authz": (("no authorization", "lacks authorization", "no access control",
+                   "missing ownership", "no permission"), r"require_admin|user_id\s*==|"
+                   r"is_admin|ownership|\.filter\(.*user_id"),
+        "ratelimit": (("no rate limit", "without rate limit", "no throttl"),
+                      r"limiter|ratelimit|rate_limit|throttl"),
+        "validation": (("no validation", "without validation", "unvalidated",
+                        "no input validation", "arbitrary input"),
+                       r"validate|pydantic|BaseModel|Field\(|re\.match|check_|sanitiz"),
+        "auditlog": (("no audit", "without audit", "no logging", "not logged"),
+                     r"AdminAction|_audit|audit_|logger\.|log\.(info|warning)|record\("),
+        "sandbox": (("no sandbox", "without sandbox", "unsandboxed", "arbitrary code"),
+                    r"sandbox|_is_safe|whitelist|allowlist|DISALLOWED|rlimit|seccomp|ast\."),
+    }
+    body_full = open(fp, errors="replace").read()
+    seg_check = seg if "seg" in dir() else body_full
+    # A guard claim is only meaningful for something that EXPOSES a surface. A CLI
+    # script has no auth guard because it is not an endpoint — flagging that as a
+    # supported security gap is a false positive of mine, and it was one: this probe
+    # called server/admin_advanced.py "lacks authentication", but that file is a
+    # service CLASS with zero routes, and every route in the module that serves it
+    # (routes_admin_advanced.py) calls require_admin. Same for the repro_*/probe_*
+    # scripts, which are only ever run by hand.
+    EXPOSES = re.compile(r"@(?:router|app)\.(?:get|post|put|patch|delete)|"
+                         r"APIRouter\(|add_api_route|@app\.(get|post)|@router\.websocket")
+    for name, (phrases, pat) in GUARDS.items():
+        if not any(k in low3 for k in phrases):
+            continue
+        if not EXPOSES.search(body_full):
+            out["verified"] = "UNVERIFIED"
+            out["verify_note"] = ("not an endpoint surface (no route decorators); "
+                                  f"a {name} guard is not applicable here")
+            return out
+        # Look in the cited lines first; fall back to the file, because a guard often
+        # sits on a decorator or a signature just outside the cited range.
+        found = re.search(pat, seg_check, re.M) or re.search(pat, body_full, re.M)
+        out["verified"] = "REFUTED" if found else "SUPPORTED"
+        out["verify_note"] = (f"{name} guard present" if found
+                              else f"no {name} guard found in a file that exposes routes")
+        return out
+
     # "Dead file / backup artifact / stale / legacy, should be deleted" is refutable by
     # asking whether the live code imports it. Measured: claimed of server/database.py —
     # "backup artifact, stale SQLAlchemy models from August 2026" — which is the module
