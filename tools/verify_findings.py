@@ -253,6 +253,24 @@ def verify_one(f: dict) -> dict:
             out["verify_note"] = f"{symbol}() does not exist in this file"
             return out
 
+    # "Syntactically incomplete / cuts off mid-statement / truncated file" is decidable by
+    # PARSING the file. Measured: a CRITICAL said ai_filter.py:150-158 "is syntactically
+    # incomplete — cuts off mid-statement", and ast.parse succeeds on the whole file.
+    if any(k in low3 for k in ("syntactically incomplete", "syntax error", "cut off",
+                               "cuts off", "truncated", "malformed file",
+                               "incomplete statement", "unclosed")):
+        if fp.endswith(".py"):
+            import ast
+            try:
+                ast.parse(open(fp, errors="replace").read())
+                out["verified"] = "REFUTED"
+                out["verify_note"] = "the file parses cleanly (ast.parse succeeds)"
+                return out
+            except SyntaxError as e:
+                out["verified"] = "SUPPORTED"
+                out["verify_note"] = f"genuine SyntaxError at line {e.lineno}: {e.msg}"
+                return out
+
     # "Inverted/unclear logic without justification" is checkable: the justification is
     # either in the file or it is not. Measured: flagged of SANDBOX_LOG ("inverted logic
     # without clear justification") in a repo where settings.js:613 carries a comment
