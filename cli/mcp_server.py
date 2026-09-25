@@ -682,8 +682,8 @@ TOOLS.extend([
           "measurement that separates a slow lane from a broken one — a lane that answers a "
           "tiny prompt in seconds is working, and the fault is elsewhere (a timeout shorter than "
           "the work, or a payload too big for the lane).",
-          {"timeout": N("Seconds. Default 60.")}, None,
-          lambda a: runs.endpoint_probe(int(a.get("timeout") or 60))),
+          {"timeout": N("Seconds. Default 240 - the gateway deliberately waits 20-80s before every send.")}, None,
+          lambda a: runs.endpoint_probe(int(a.get("timeout") or 240))),
 
     _tool("orch_prompt_preview",
           "The EXACT system prompt a given persona receives for a target, including the domain "

@@ -275,8 +275,38 @@ def _name(k: str) -> str:
     }.get(k, k)
 
 
+def _tty_available() -> bool:
+    """Can we put this terminal into raw mode?
+
+    A prompt that assumes a terminal CRASHES with `termios.error: Inappropriate ioctl for
+    device` the moment stdin is a pipe — measured on `orch config repair` fed a line from
+    printf. That is a real defect: it makes every command that asks a question unusable in a
+    script, and it fails with a traceback rather than a usage message. Callers check this and
+    fall back to reading plain lines.
+    """
+    try:
+        return sys.stdin.isatty() and sys.stdout.isatty()
+    except Exception:
+        return False
+
+
 def prompt_line(label: str, default: str = "", secret: bool = False) -> str:
-    """Read a line of input with echo off during raw mode. Returns the entered text."""
+    """Read a line of input, disabling echo when a terminal is available.
+
+    With no terminal (a pipe, a cron job, a test) this reads a plain line from stdin, which is
+    what a caller piping an answer expects. Exhausted input returns the default rather than
+    looping forever.
+    """
+    if not _tty_available():
+        sys.stdout.write(f"{label} {default}: ")
+        sys.stdout.flush()
+        try:
+            line = sys.stdin.readline()
+        except Exception:
+            line = ""
+        ans = (line or "").strip()
+        sys.stdout.write(ans + "\n")
+        return ans or default
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
     shown = "(set)" if secret and default else default
@@ -320,6 +350,18 @@ def confirm(question: str, default: bool = False) -> bool:
     if not ans:
         return default
     return ans.strip().lower().startswith("y")
+
+
+def read_key_safe(timeout_ms=None) -> str:
+    """read_key() that does not crash without a terminal.
+
+    A keyboard read needs raw mode. When stdin is not a terminal — a pipe, a test, an ssh
+    command with no tty — it returns '' (no key) instead of raising, so a caller that cannot
+    actually be driven interactively fails in a defined way rather than with a traceback.
+    """
+    if not _tty_available():
+        return ""
+    return read_key(timeout_ms)
 
 
 # ── screen ───────────────────────────────────────────────────────────────────

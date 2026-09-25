@@ -169,6 +169,114 @@ def test_cli_help_and_subcommands():
     check("an unknown command exits non-zero", r2.returncode != 0, f"exit {r2.returncode}")
 
 
+def test_unreadable_config_is_reported_and_preserved():
+    """A typo in the config file must not be silent, and must not be destructive.
+
+    Measured before the fix: one bad character made every setting appear to revert (defaults
+    were substituted with no warning, exit 0), and the next `config set` replaced the whole
+    file with defaults — a custom value present before the save was gone after it.
+    """
+    import importlib
+    import tempfile
+    from cli import config
+    real = config.CONFIG_FILE
+    with tempfile.TemporaryDirectory() as td:
+        cf = Path(td) / "c.json"
+        os.environ["ORCH_CONFIG"] = str(cf)
+        importlib.reload(config)
+        # healthy first
+        config.save_raw({**config._defaults(), "passes": 3}, cf)
+        check("a readable config reports no problem", config.config_problem() is None, "")
+        # break it, keeping a value we can look for
+        cf.write_text('{"passes": 3,}')
+        prob = config.config_problem()
+        check("an unreadable config is reported", bool(prob) and "error" in (prob or {}),
+              f"got {prob}")
+        r = config.setting_save("passes", "4")
+        check("saving over an unreadable config warns", bool(r.get("warning")), f"got {r}")
+        bak = r.get("backedUp")
+        check("saving over an unreadable config backs the original up",
+              bool(bak) and Path(bak).exists(), f"backedUp={bak}")
+        if bak and Path(bak).exists():
+            check("the backup holds the original text",
+                  '"passes"' in Path(bak).read_text(), "backup is empty or wrong")
+        # repair restores a parseable file
+        import shutil
+        shutil.copy2(cf, Path(td) / "keep.json")
+        data, _ = config.load_raw()
+        config.save_raw(data, cf)
+        check("a repaired config parses again", config.config_problem() is None, "")
+    os.environ.pop("ORCH_CONFIG", None)
+    importlib.reload(config)
+
+
+def test_no_terminal_does_not_crash():
+    """Prompts and key reads must degrade, not raise, when stdin is not a terminal.
+
+    Measured before the fix: `orch config repair` fed from a pipe died with
+    `termios.error: Inappropriate ioctl for device`, which makes every prompting command
+    unusable in a script.
+    """
+    from cli import ansi
+    r = subprocess.run([sys.executable, "-c",
+                        "import sys; sys.path.insert(0, %r);"
+                        "from cli import ansi;"
+                        "print('key=' + repr(ansi.read_key_safe(10)));"
+                        "print('confirm=' + repr(ansi.confirm('q?', default=True)))" % str(ROOT)],
+                       capture_output=True, text=True, input="y\n", timeout=60)
+    check("read_key_safe returns without a terminal",
+          r.returncode == 0 and "key=" in r.stdout, f"exit {r.returncode} {r.stderr[-120:]}")
+    check("confirm reads a piped answer",
+          r.returncode == 0 and "confirm=True" in r.stdout, f"stdout={r.stdout[-120:]}")
+    # and the entry point explains itself instead of raising
+    r2 = subprocess.run([str(ROOT / "orch")], capture_output=True, text=True,
+                        stdin=subprocess.DEVNULL, timeout=60)
+    check("the panel refuses without a terminal, without a traceback",
+          "Traceback" not in r2.stderr and "needs a terminal" in (r2.stdout + r2.stderr),
+          f"exit {r2.returncode} err={r2.stderr[-120:]}")
+
+
+def test_empty_allowlist_is_explained():
+    """An empty allowlist is VALID and means deny-all. Saving it must say so."""
+    import importlib
+    import tempfile
+    from cli import config
+    with tempfile.TemporaryDirectory() as td:
+        os.environ["ORCH_CONFIG"] = str(Path(td) / "c.json")
+        importlib.reload(config)
+        r = config.setting_save("modelAllowlist", "")
+        check("an empty allowlist saves (it is a legal value)", r["ok"], f"got {r}")
+        check("an empty allowlist explains deny-all", bool(r.get("note")), f"got {r}")
+    os.environ.pop("ORCH_CONFIG", None)
+    importlib.reload(config)
+
+
+def test_probe_result_shape():
+    """A probe result must carry every key a caller reads, on EVERY path.
+
+    An early return with a shorter dict produced `KeyError: 'elapsedMs'` in the CLI, turning a
+    clear error message into a traceback.
+    """
+    from cli import runs
+    # force the no-model path by asking for a probe with an empty allowlist
+    import importlib
+    import tempfile
+    from cli import config
+    with tempfile.TemporaryDirectory() as td:
+        os.environ["ORCH_CONFIG"] = str(Path(td) / "c.json")
+        importlib.reload(config)
+        importlib.reload(runs)
+        config.setting_save("modelAllowlist", "")
+        r = runs.endpoint_probe(timeout=5)
+        for k in ("ok", "model", "elapsedMs", "error", "url"):
+            check(f"probe result carries '{k}'", k in r, f"keys={sorted(r)}")
+        check("the no-model path does not claim success", r["ok"] is False, str(r))
+        check("it names the cause", "allowlist" in str(r.get("error", "")), str(r.get("error"))[:80])
+    os.environ.pop("ORCH_CONFIG", None)
+    importlib.reload(config)
+    importlib.reload(runs)
+
+
 def main() -> int:
     print("orch tests\n")
     test_excludes_match_engine()
@@ -176,6 +284,10 @@ def main() -> int:
     test_settings_round_trip()
     test_panel_routes_exist()
     test_cli_help_and_subcommands()
+    test_unreadable_config_is_reported_and_preserved()
+    test_no_terminal_does_not_crash()
+    test_empty_allowlist_is_explained()
+    test_probe_result_shape()
     print(f"\n  {PASSES} passed, {len(FAILS)} failed")
     for f in FAILS:
         print("   ✗ " + f)

@@ -47,7 +47,12 @@ def menu(title: str, items: list[tuple], subtitle: str = "", extra: list[str] | 
                 print("    " + label + ("  " + A.dim(hint) if hint else ""))
         print()
         print("  " + A.dim("↑/↓ move   enter select   esc back   ctrl-c quit"))
-        k = A.read_key(None)
+        # read_key_safe, not read_key: a keyboard read needs raw mode, and without a terminal
+        # that raises instead of returning. It returns '' here, which ends the panel with the
+        # menu on screen rather than a traceback.
+        k = A.read_key_safe(None)
+        if k == "" and not A._tty_available():
+            return BACK
         if k == "up":
             sel = (sel - 1) % max(1, len(items))
         elif k == "down":

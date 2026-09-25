@@ -30,6 +30,7 @@ USAGE = """orch — audit orchestrator
   orch config get <id>
   orch config set <id> <value>
   orch config reset <id>
+  orch config repair        recover from a config file that will not parse
   orch agents [target]      the personas that will run
   orch prompt [agent]       the EXACT system prompt a persona receives
   orch models               endpoint and lane health
@@ -165,6 +166,16 @@ def cmd_findings(argv: list[str]) -> int:
 
 def cmd_config(argv: list[str]) -> int:
     if not argv:
+        problem = config.config_problem()
+        if problem:
+            # Nothing below this line is the user's configuration — it is the defaults standing
+            # in for a file that could not be read. Showing them without saying so is how a
+            # "my settings reverted" report becomes an hour of looking at the wrong thing.
+            print(A.red("  ⚠ the config file could not be read: " + problem["error"][:100]))
+            print(A.dim(f"    {problem['file']}"))
+            print(A.dim("    showing DEFAULTS, not your settings. Fix the file, or reset it:"))
+            print(A.dim("      orch config repair      (backs the broken file up, writes a clean one)"))
+            print()
         for r in config.resolved_all():
             val = "••••••" if r["kind"] == "secret" and r["value"] else (
                 json.dumps(r["value"]) if isinstance(r["value"], list) else str(r["value"]))
@@ -175,13 +186,25 @@ def cmd_config(argv: list[str]) -> int:
     if action == "get" and len(argv) > 1:
         _out({"id": argv[1], "value": config.resolve(argv[1])[0], "source": config.resolve(argv[1])[1]})
         return 0
+    if action in ("repair", "fix"):
+        return cmd_config_repair()
     if action == "set" and len(argv) > 2:
         res = config.setting_save(argv[1], " ".join(argv[2:]))
         print(A.green(f"✓ {res['value']}") if res["ok"] else A.red("✗ " + str(res.get("reason"))))
+        if res.get("note"):
+            # A value can be legal and still mean something the value does not show. Saying so
+            # at save time is the only moment the user is looking at that setting.
+            print(A.yellow("  ⚠ " + res["note"]))
+        if res.get("warning"):
+            print(A.yellow("  ⚠ " + res["warning"]))
+            print(A.dim("    the original is preserved at " + str(res.get("backedUp"))))
         return 0 if res["ok"] else 1
     if action == "reset" and len(argv) > 1:
         res = config.setting_reset(argv[1])
         print(A.green(f"✓ {argv[1]} -> {res.get('value')}") if res["ok"] else A.red("✗ " + str(res.get("reason"))))
+        if res.get("warning"):
+            print(A.yellow("  ⚠ " + res["warning"]))
+            print(A.dim("    the original is preserved at " + str(res.get("backedUp"))))
         return 0 if res["ok"] else 1
     print(USAGE)
     return 2
@@ -267,6 +290,12 @@ def cmd_mcp(argv: list[str]) -> int:
 
 def cmd_ui(argv: list[str]) -> int:
     from . import screens
+    if not A._tty_available():
+        # The panel owns the terminal (raw mode, alternate screen). Refusing with one clear
+        # line is far better than a termios traceback from inside the first draw.
+        print("orch: the control panel needs a terminal. Use a subcommand instead, e.g.")
+        print("      orch status | orch targets | orch config | orch findings")
+        return 2
     try:
         with A.Screen():
             view = "dashboard"
@@ -416,9 +445,47 @@ def cmd_probe(argv: list[str]) -> int:
     if r.get("ok"):
         print(A.green(f"✓ {r['model']} answered in {r['elapsedMs']}ms") + A.dim(f'  "{r["reply"]}"'))
         return 0
-    print(A.red(f"✗ {r['model']} failed after {r['elapsedMs']}ms") + A.dim("  " + str(r.get("error"))))
+    # .get() rather than [], so a caller can never be broken by a shortened probe result —
+    # that is exactly how this line produced a KeyError over a perfectly clear error message.
+    who = r.get("model") or "the endpoint"
+    ms = r.get("elapsedMs")
+    head = f"✗ {who} failed" + (f" after {ms}ms" if ms else "")
+    print(A.red(head) + A.dim("  " + str(r.get("error"))))
     return 1
 
+
+
+def cmd_config_repair() -> int:
+    """Recover from a config file that does not parse.
+
+    The broken file is backed up, never deleted: it is the user's own text and the only record
+    of the settings they had, so it must survive even if it is unusable.
+    """
+    problem = config.config_problem()
+    file = config.CONFIG_FILE
+    if not problem:
+        print(A.green("✓ the config file reads fine — nothing to repair"))
+        return 0
+    print(A.red("  cannot read " + str(file)))
+    print(A.dim("    " + problem["error"][:140]))
+    print()
+    if not A.confirm("  Back it up and write a clean default config in its place?", default=True):
+        return 1
+    import shutil
+    stamp = __import__("time").strftime("%Y%m%d-%H%M%S")
+    dest = file.with_name(file.name + f".bak-broken-{stamp}")
+    try:
+        if file.exists():
+            shutil.copy2(file, dest)
+    except Exception as e:
+        print(A.red("  ✗ could not back the file up: " + str(e)))
+        return 1
+    data, _ = config.load_raw()          # defaults, since the file is unreadable
+    config.save_raw(data, file)
+    print(A.green("✓ clean config written"))
+    print(A.dim("  your original is at " + str(dest)))
+    print(A.dim("  copy any setting you want back out of it and set it with `orch config set`"))
+    return 0
 
 COMMANDS = {
     "run": cmd_run, "status": cmd_status, "watch": cmd_watch, "stop": cmd_stop,
@@ -429,6 +496,7 @@ COMMANDS = {
     "scan": cmd_scan, "estimate": cmd_estimate, "batches": cmd_batches,
     "pause": cmd_pause, "resume": cmd_resume, "discard": cmd_discard,
     "export": cmd_export, "prompt": cmd_prompt, "logs": cmd_logs, "probe": cmd_probe,
+    "repair": cmd_config_repair,
 }
 
 

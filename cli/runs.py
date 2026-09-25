@@ -732,12 +732,19 @@ def findings_export(run: dict | None = None, fmt: str = "json") -> dict:
 
 # ── connectivity ─────────────────────────────────────────────────────────────
 
-def endpoint_probe(timeout: int = 60) -> dict:
+def endpoint_probe(timeout: int = 240) -> dict:
     """Time one tiny request through the configured endpoint.
 
     This is the measurement that decides whether a "slow lane" is slow or broken: a lane
-    that answers a trivial prompt in seconds is working, and anything else is the caller's
-    problem — a timeout shorter than the work, or a payload too large for the lane.
+    that answers a trivial prompt is working, and a timeout is the CALLER's problem, not the
+    lane's.
+
+    ⚠️ The default is 240s, not 60s, because the gateway injects a deliberate random 20-80s
+    wait before EVERY send (an anti-bot measure, `SEND_GAP_MIN_MS`/`MAX`), and generation is
+    on top of that. Measured: the same trivial prompt answered in 3.6s once and timed out at
+    60s the next time, because the 60s window ended inside the pacing gap. A probe that
+    reports "failed" over a lane that is merely inside its pacing window is worse than no
+    probe: it sends you hunting a fault that is not there.
     """
     import urllib.request
 
@@ -745,7 +752,21 @@ def endpoint_probe(timeout: int = 60) -> dict:
     key_name = str(config.resolve("apiKeyName")[0])
     key = str(config.resolve("apiKeyValue")[0])
     allow = config.resolve("modelAllowlist")[0]
-    model = (allow[0] if isinstance(allow, list) and allow else str(allow) or "ds").split(",")[0]
+    if isinstance(allow, list):
+        model = next((str(x).strip() for x in allow if str(x).strip()), "")
+    else:
+        model = next((x.strip() for x in str(allow or "").split(",") if x.strip()), "")
+    if not model:
+        # Say why rather than sending a request with an empty model and reporting whatever
+        # the endpoint says about it: an empty allowlist is deny-all by design, so a 404 here
+        # would send the reader looking at the endpoint instead of at the setting.
+        # Every key a caller reads must be present on this path too. Returning a shorter dict
+        # threw KeyError on elapsedMs in the CLI, so a clear message turned into a traceback —
+        # an early return is still part of the contract.
+        return {"ok": False, "model": "", "elapsedMs": 0,
+                "error": "no model is configured: the model allowlist is empty, which means "
+                         "deny-all. Set one with `orch config set modelAllowlist ds`.",
+                "url": url}
     body = json.dumps({"model": model,
                        "messages": [{"role": "user", "content": "Reply with exactly: OK"}],
                        "max_tokens": 10}).encode()

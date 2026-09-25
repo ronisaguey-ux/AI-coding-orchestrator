@@ -180,14 +180,66 @@ BY_ID = {s["id"]: s for s in SCHEMA}
 
 # ── read / write ─────────────────────────────────────────────────────────────
 
+# ── a corrupt config must never be silent, and must never be destroyed ────────
+# Two failures, both measured, both the same shape as the ones this project keeps finding:
+#
+#   1. SILENT FALLBACK. A config with a single typo parsed as an exception, the defaults
+#      were returned, and the CLI printed a normal settings list with exit 0. Every setting
+#      appeared to have reverted with no indication of why — "I changed it and nothing
+#      happened" pointed at the wrong thing entirely.
+#   2. DATA LOSS. `setting_save` writes back the dict it loaded, and the loaded dict was the
+#      DEFAULTS — so one `config set` replaced the user's entire config with defaults. Measured:
+#      a custom value present before the save was gone after it, with no backup taken.
+#
+# The fix is in two places, deliberately: the error is REMEMBERED so it can be reported, and
+# `save_raw` backs up any file it is about to overwrite that does not parse. The second holds
+# regardless of which caller does the writing, including a future one written without knowing
+# about this class of bug.
+_LAST_PARSE_ERROR: dict = {}
+
+
+def config_problem() -> dict | None:
+    """The parse error of the config file, if it has one. None when the file is fine.
+
+    Callers surface this: a settings read that silently substituted defaults is worse than an
+    error, because the user is shown a plausible configuration that is not theirs.
+
+    ⚠️ It must CHECK, not just report a remembered error. The first version read the flag that
+    load_raw() sets — but a caller that asks about the config before loading anything got None
+    and reported "nothing to repair" over a file that plainly does not parse. The check is
+    cheap (one read) and is the only thing that makes the answer correct at any call order.
+    """
+    if not CONFIG_FILE.exists():
+        _LAST_PARSE_ERROR.clear()
+        return None
+    try:
+        json.loads(CONFIG_FILE.read_text())
+        _LAST_PARSE_ERROR.clear()
+        return None
+    except Exception as e:
+        _LAST_PARSE_ERROR.update({
+            "file": str(CONFIG_FILE),
+            "error": f"{type(e).__name__}: {e}",
+            "bytes": CONFIG_FILE.stat().st_size,
+        })
+        return dict(_LAST_PARSE_ERROR)
+
+
 def load_raw() -> tuple[dict, Path]:
     """Raw config, plus the file it came from. Never raises on a missing file."""
+    _LAST_PARSE_ERROR.clear()
     if CONFIG_FILE.exists():
+        raw = CONFIG_FILE.read_text()
         try:
-            return json.loads(CONFIG_FILE.read_text()), CONFIG_FILE
-        except Exception:
-            # A corrupt config must not make the CLI unusable. Fall back to defaults and
-            # let the caller notice the file is unreadable.
+            return json.loads(raw), CONFIG_FILE
+        except Exception as e:
+            # Remember WHY, so the CLI/MCP/panel can say so rather than substituting defaults
+            # in silence.
+            _LAST_PARSE_ERROR.update({
+                "file": str(CONFIG_FILE),
+                "error": f"{type(e).__name__}: {e}",
+                "bytes": len(raw),
+            })
             return _defaults(), CONFIG_FILE
     return _defaults(), CONFIG_FILE
 
@@ -211,14 +263,31 @@ def set_path(obj: dict, dotted: str, value) -> None:
     cur[parts[-1]] = value
 
 
-def save_raw(data: dict, path: Path | None = None) -> None:
-    """Atomic write.
+def save_raw(data: dict, path: Path | None = None) -> dict:
+    """Atomic write. Returns {backedUp: <path>|None}.
 
     A partially written config silently reverts every setting the next time it is read, so
     the write goes to a temp file in the same directory and is renamed into place.
+
+    ★ If the file being REPLACED does not parse, it is copied aside first. The caller loaded
+    defaults in place of it (see load_raw), so writing would turn one typo into the total loss
+    of every setting the user had. The backup is unconditional and does not depend on the
+    caller knowing this can happen.
     """
     target = path or CONFIG_FILE
     target.parent.mkdir(parents=True, exist_ok=True)
+    backed_up = None
+    if target.exists():
+        try:
+            json.loads(target.read_text())
+        except Exception:
+            try:
+                stamp = time.strftime("%Y%m%d-%H%M%S")
+                backed_up = target.with_name(target.name + f".bak-unreadable-{stamp}")
+                import shutil as _sh
+                _sh.copy2(target, backed_up)
+            except Exception:
+                backed_up = None
     fd, tmp = tempfile.mkstemp(dir=str(target.parent), prefix=".orch_config.", suffix=".tmp")
     try:
         with os.fdopen(fd, "w") as fh:
@@ -231,6 +300,7 @@ def save_raw(data: dict, path: Path | None = None) -> None:
         except OSError:
             pass
         raise
+    return {"backedUp": str(backed_up) if backed_up else None}
 
 
 def coerce(spec: dict, raw):
@@ -295,6 +365,15 @@ def resolved_all() -> list[dict]:
     return out
 
 
+# Settings where a legal-looking value has a consequence the value does not show.
+_EMPTY_MEANS: dict = {
+    "modelAllowlist": (
+        "an empty allowlist means DENY-ALL: the engine will refuse every model and every run "
+        "will find nothing to call. Set at least one id (e.g. ds)."
+    ),
+}
+
+
 def setting_save(path: str, raw) -> dict:
     """Coerce and persist one setting. Returns a result describing what happened."""
     spec = BY_ID.get(path)
@@ -304,10 +383,27 @@ def setting_save(path: str, raw) -> dict:
         value = coerce(spec, raw)
     except ValueError as e:
         return {"ok": False, "reason": str(e)}
+    # A value can be within range and still mean something the value does not say. Saving it
+    # silently is how an empty allowlist looked identical to a configured one while every run
+    # found no models at all — the engine's empty chain is deny-all, by design.
+    note = None
+    if path in _EMPTY_MEANS and value in ([], "", None):
+        note = _EMPTY_MEANS[path]
     data, file = load_raw()
+    problem = config_problem()
     set_path(data, path, value)
-    save_raw(data, file)
-    return {"ok": True, "path": path, "value": value}
+    wr = save_raw(data, file)
+    out = {"ok": True, "path": path, "value": value}
+    if note:
+        out["note"] = note
+    if wr.get("backedUp"):
+        # Say it plainly: the previous file could not be read, every other setting in it has
+        # been replaced by its default, and the original is preserved at this path.
+        out["warning"] = ("the config file could not be read, so its other settings were "
+                          "replaced by their defaults on save")
+        out["backedUp"] = wr["backedUp"]
+        out["parseError"] = (problem or {}).get("error")
+    return out
 
 
 def setting_reset(path: str) -> dict:
@@ -323,7 +419,7 @@ def setting_reset(path: str) -> dict:
             break
     if isinstance(cur, dict):
         cur.pop(parts[-1], None)
-    save_raw(data, file)
+    wr = save_raw(data, file)
     env_name = {
         "outputDir": "AUDIT_OUTPUT_DIR", "passes": "AUDIT_NUM_PASSES",
         "batchSize": "AUDIT_BATCH_SIZE", "chatTimeout": "AUDIT_CHAT_TIMEOUT",
@@ -334,7 +430,12 @@ def setting_reset(path: str) -> dict:
         # would look like it did nothing.
         cleared_env = os.environ.pop(env_name) is not None
     value, _ = resolve(path)
-    return {"ok": True, "path": path, "value": value, "clearedEnv": cleared_env}
+    out = {"ok": True, "path": path, "value": value, "clearedEnv": cleared_env}
+    if wr.get("backedUp"):
+        out["warning"] = ("the config file could not be read, so its other settings were "
+                          "replaced by their defaults on save")
+        out["backedUp"] = wr["backedUp"]
+    return out
 
 
 # ── targets ──────────────────────────────────────────────────────────────────
