@@ -212,6 +212,11 @@ def cmd_config(argv: list[str]) -> int:
 
 def cmd_agents(argv: list[str]) -> int:
     from . import mcp_server as m
+    # Validate a NAMED target first. Without this, `orch agents nosuchtarget` printed nine
+    # personas labelled with a target that does not exist and exited 0 — the label was the
+    # only hint anything was wrong, and it read as success.
+    if argv:
+        runs.resolve_target(argv[0])
     res = m._agents_for(argv[0] if argv else None)
     if res.get("isError"):
         print(res["content"][0]["text"])
@@ -517,7 +522,13 @@ def main(argv: list[str] | None = None) -> int:
         print(A.red(f"unknown command: {cmd}"), file=sys.stderr)
         print(USAGE, file=sys.stderr)
         return 2
-    return fn(rest)
+    try:
+        return fn(rest)
+    except runs.UnknownTarget as e:
+        # A named target that does not exist is a user error, not a crash. Printing the known
+        # list turns a retry-by-guessing into one correction.
+        print(A.red(str(e)), file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

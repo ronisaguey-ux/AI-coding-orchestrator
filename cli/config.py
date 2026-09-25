@@ -74,6 +74,7 @@ def _defaults() -> dict:
         "concurrency": 8,          # engine --limit: concurrent agent LLM calls
         "resume": True,
         "chatTimeout": 300,
+        "probeTimeout": 240,
         "chatMaxTokens": 8000,
         "requireSubstantive": True,
         "maxEmptyRotations": 2,
@@ -148,11 +149,13 @@ SCHEMA: list[dict] = [
     {"id": "batchSize", "group": "Run", "label": "Batch size (files)", "kind": KIND_INT, "min": 1, "max": 20,
      "help": "Files per batch. A big payload makes a lane time out, so lower it for a slow lane."},
     {"id": "concurrency", "group": "Run", "label": "Concurrent agents", "kind": KIND_INT, "min": 1, "max": 32,
-     "help": "The engine's --limit: how many agent calls are in flight at once."},
+     "help": "The engine's --limit: how many agent calls are in flight at once. A WEBCHAT LANE IS SERIAL and injects a deliberate 20-80s wait before every send, so N concurrent calls make the Nth wait ~N x 50s before it is even sent. At 8 that is ~400s, which overran the 420s call timeout on every round (measured 2026-09-25). Use 1-2 for a webchat lane; higher suits an API lane."},
     {"id": "resume", "group": "Run", "label": "Resume finished batches", "kind": KIND_BOOL,
      "help": "Skip batches already saved on disk. OFF re-runs everything and OVERWRITES results - use with care."},
     {"id": "chatTimeout", "group": "Run", "label": "Per-call timeout (s)", "kind": KIND_INT, "min": 30, "max": 1800,
      "help": "A webchat lane needs minutes, not seconds; a short value bans every lane on its first call."},
+    {"id": "probeTimeout", "group": "Run", "label": "Startup probe timeout (s)", "kind": KIND_INT, "min": 10, "max": 900,
+     "help": "How long to wait for a model to answer the STARTUP probe. It must EXCEED the lane's send pacing: the webchat gateway injects a deliberate random 20-80s wait before every send, so a 45s budget reported a healthy lane as dead and then banned it for 5 minutes. Measured 2026-09-25: the probe passed at 32.7s."},
     {"id": "chatMaxTokens", "group": "Run", "label": "Max tokens per reply", "kind": KIND_INT, "min": 256, "max": 64000,
      "help": "A reply cut off mid-JSON loses the whole round's findings."},
     {"id": "requireSubstantive", "group": "Run", "label": "Require substantive findings", "kind": KIND_BOOL,
@@ -343,6 +346,7 @@ def resolve(path: str):
             "passes": "AUDIT_NUM_PASSES",
             "batchSize": "AUDIT_BATCH_SIZE",
             "chatTimeout": "AUDIT_CHAT_TIMEOUT",
+            "probeTimeout": "AUDIT_PROBE_TIMEOUT",
             "chatMaxTokens": "AUDIT_CHAT_MAX_TOKENS",
             "requireSubstantive": "AUDIT_REQUIRE_SUBSTANTIVE",
             "maxEmptyRotations": "AUDIT_MAX_EMPTY_ROTATIONS",
@@ -423,6 +427,7 @@ def setting_reset(path: str) -> dict:
     env_name = {
         "outputDir": "AUDIT_OUTPUT_DIR", "passes": "AUDIT_NUM_PASSES",
         "batchSize": "AUDIT_BATCH_SIZE", "chatTimeout": "AUDIT_CHAT_TIMEOUT",
+        "probeTimeout": "AUDIT_PROBE_TIMEOUT",
     }.get(path)
     cleared_env = False
     if env_name and env_name in os.environ:

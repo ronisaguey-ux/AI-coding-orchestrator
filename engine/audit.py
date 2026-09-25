@@ -78,7 +78,14 @@ COOLDOWN_RATELIMIT = 900      # 15 min — HTTP 429 (API is actively rejecting)
 COOLDOWN_SERVER_ERR = 600     # 10 min — HTTP 5xx (server-side issue)
 COOLDOWN_CLIENT_ERR = 3600    # 60 min — HTTP 4xx (auth/permanent — probably hopeless)
 COOLDOWN_UNKNOWN = 480        #  8 min — exception / unknown failure
-STARTUP_PROBE_TIMEOUT = 45   # health probe for top models (nuclear-fallback needs ~30-40s)
+# ★ 45s IS TOO SHORT FOR A WEBCHAT LANE. The gateway injects a DELIBERATE random 20-80s wait
+# before every send (an anti-bot measure, SEND_GAP_MIN_MS/MAX in the harness), so a 45s probe
+# window can expire inside the pacing gap and report a perfectly healthy lane as FAILED.
+# Measured 2026-09-25: ds answered a one-word prompt in 3.6s at one moment and failed the 45s
+# probe minutes later, with no change to the lane. A probe that reports a working lane as dead
+# is worse than no probe: it sends you fixing a fault that is not there.
+# 240s clears the gap plus generation. Overridable for a lane with different pacing.
+STARTUP_PROBE_TIMEOUT = int(os.environ.get("AUDIT_PROBE_TIMEOUT", "240"))
 TASK_TRUNCATE = 12000        # audit prompt context length
 FILE_TRUNCATE = 8000         # per-file content when batching
 SOT_TRUNCATE = 8000          # Source of Truth context
@@ -130,6 +137,20 @@ DEFAULT_MODEL_SCORE = 85
 
 
 MODEL_SCORES = {
+    # ★ The ids THIS deployment actually serves, with scores from MEASURED substance.
+    # The table previously carried similarly-named entries (`nemotron-3-ultra-free`) that never
+    # match the aggregate's ids (`or-nvidia/nemotron-3-ultra-550b-a55b:free`), so every model
+    # fell back to DEFAULT_MODEL_SCORE and the ordering was decided by the alphabet. Measured
+    # 2026-09-25: that put `or-nex-agi/nex-n2.5-pro:free` FIRST - a model that answers in
+    # seconds with an EMPTY findings document, which the engine scores as a successful round.
+    # Whichever model is first wins every round, so the whole audit would have run on stubs.
+    "or-nvidia/nemotron-3-ultra-550b-a55b:free": 95,   # does the real work: 7-20KB replies
+    "or-nvidia/nemotron-3-super-120b-a12b:free": 90,
+    "or-nvidia/nemotron-3.5-lightning:free": 88,
+    "or-poolside/laguna-s-2.1:free": 72,
+    "or-nex-agi/nex-n2.5-pro:free": 55,                # fast, but returns empty stubs
+    "or-nex-agi/nex-n2.5-mini:free": 50,
+
     # OmniRoute & Free Providers
     "nuclear-fallback": 90,
     "big-pickle": 90,
@@ -309,6 +330,32 @@ def _load_model_allowlist() -> frozenset:
         return MODEL_ALLOWLIST
     ids = {p.strip() for p in raw.split(",") if p.strip()}
     return frozenset(ids)
+
+
+def _load_model_allowlist_ordered() -> list:
+    """The allowlist AS THE OPERATOR WROTE IT, order included.
+
+    ★ ORDER IS A HUMAN DECISION AND IT WAS BEING THROWN AWAY. `_load_model_allowlist`
+    returns a frozenset, and the chain builder breaks equal scores with `sorted(..., key=mid)`
+    — alphabetical. Every model the operator lists earns the same default score, so the
+    alphabet decided which model ran: measured 2026-09-25, `or-nex-agi/nex-n2.5-pro:free`
+    sorted ahead of `or-nvidia/nemotron-3-ultra-550b`, and nex answers in seconds with an
+    EMPTY findings document. Whichever model is first wins every round, so the audit would
+    have run entirely on stubs — the engine scores that as success.
+
+    An explicit allowlist order is the operator saying which model does the work. Honour it.
+    """
+    raw = os.environ.get("AUDIT_MODEL_ALLOWLIST")
+    if raw is None:
+        raw = os.environ.get("OCULUS_MODEL_ALLOWLIST")
+    if raw is None:
+        return sorted(MODEL_ALLOWLIST)
+    out = []
+    for part in raw.split(","):
+        pid = part.strip()
+        if pid and pid not in out:
+            out.append(pid)
+    return out
 
 # ─── AGENTS ───────────────────────────────────────────────────────────────
 AGENTS = [
@@ -911,14 +958,21 @@ def build_fallback_chain(models: list[tuple[str, int]]) -> list[tuple[str, int]]
     if dropped:
         print(f"[allowlist] dropped {len(dropped)} non-approved model(s): {', '.join(sorted(dropped)[:10])}"
               + (" ..." if len(dropped) > 10 else ""), flush=True)
-    print(f"[allowlist] fallback chain ({len(filtered)}): "
-          + ", ".join(mid for mid, _ in filtered) or "(empty — deny-all)", flush=True)
 
     if not filtered:
+        print("[allowlist] fallback chain (0): (empty — deny-all)", flush=True)
         return []
 
-    # Stable sort by score descending
-    filtered.sort(key=lambda x: (-x[1], x[0]))
+    # Score descending, then THE OPERATOR'S ORDER. Falling back to `mid` let the alphabet
+    # choose which of several equally-scored models ran, which put a stub-answering model
+    # first and would have quietly made every round empty.
+    rank = {mid: i for i, mid in enumerate(_load_model_allowlist_ordered())}
+    filtered.sort(key=lambda x: (-x[1], rank.get(x[0], len(rank)), x[0]))
+
+    # Printed AFTER the sort, so the log states the order that will actually be used. The
+    # previous print ran before sorting and named a model that was not the one that ran.
+    print(f"[allowlist] fallback chain ({len(filtered)}): "
+          + ", ".join(mid for mid, _ in filtered), flush=True)
     return filtered
 
 
@@ -961,28 +1015,46 @@ async def probe_models(session: aiohttp.ClientSession,
     unresponsive = []
 
     print(f"[probe] Testing top {len(to_probe)} models for responsiveness...")
+    # ★ A LANE'S FIRST REQUEST IS NOT REPRESENTATIVE OF ITS HEALTH.
+    # Measured 2026-09-25 on a freshly restarted lane: attempt 1 returned HTTP 500 at 130.5s,
+    # attempt 2 answered 'OK' in 3.6s - same prompt, same lane, seconds apart. One failed probe
+    # therefore declares a WORKING lane dead, bans it for 5 minutes, and the run dies at the
+    # gate while the operator hunts a fault that is not there. A timeout means "not ready yet"
+    # at least as often as it means "broken", so it earns one more attempt.
+    PROBE_ATTEMPTS = max(1, int(os.environ.get("AUDIT_PROBE_ATTEMPTS", "2")))
     for mid, score in to_probe:
         payload = dict(probe_payload)
         payload["model"] = mid
-        try:
-            t0 = time.time()
-            async with session.post(
-                f"{API_BASE}/chat/completions",
-                json=payload,
-                timeout=aiohttp.ClientTimeout(total=STARTUP_PROBE_TIMEOUT)
-            ) as resp:
-                elapsed = time.time() - t0
-                if resp.status == 200:
-                    print(f"[probe]  OK {mid} (score {score}) in {elapsed:.1f}s")
-                    responsive.append((mid, score))
-                else:
-                    print(f"[probe] FAIL {mid} (score {score}) HTTP {resp.status} in {elapsed:.1f}s")
+        for _attempt in range(PROBE_ATTEMPTS):
+            try:
+                t0 = time.time()
+                async with session.post(
+                    f"{API_BASE}/chat/completions",
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=STARTUP_PROBE_TIMEOUT)
+                ) as resp:
+                    elapsed = time.time() - t0
+                    if resp.status == 200:
+                        print(f"[probe]  OK {mid} (score {score}) in {elapsed:.1f}s")
+                        responsive.append((mid, score))
+                    else:
+                        print(f"[probe] FAIL {mid} (score {score}) HTTP {resp.status} in {elapsed:.1f}s")
+                        _model_health[mid] = _model_health.get(mid, 0) + 5
+                        unresponsive.append((mid, score))
+            except Exception as e:
+                # Print HOW LONG it waited: without the elapsed figure a 240s timeout and a
+                # fast connection error produce the same line, so the failure cannot be
+                # diagnosed from the log.
+                print(f"[probe] FAIL {mid} (score {score}) {type(e).__name__} "
+                      f"after {time.time() - t0:.1f}s (budget {STARTUP_PROBE_TIMEOUT}s), "
+                      f"attempt {_attempt + 1}/{PROBE_ATTEMPTS}")
+                if _attempt + 1 >= PROBE_ATTEMPTS:
+                    # Only the LAST attempt marks the model unhealthy. A single transient
+                    # failure must not ban a working lane for 5 minutes.
                     _model_health[mid] = _model_health.get(mid, 0) + 5
                     unresponsive.append((mid, score))
-        except Exception as e:
-            print(f"[probe] FAIL {mid} (score {score}) {type(e).__name__}")
-            _model_health[mid] = _model_health.get(mid, 0) + 5
-            unresponsive.append((mid, score))
+            else:
+                break
 
     for mid, score in rest:
         _model_health[mid] = _model_health.get(mid, 0)
@@ -1524,6 +1596,40 @@ def get_graphify() -> GraphifyDB:
 
 
 # ─── OMNIROUTE API CALL WITH MODEL FALLBACK ───────────────────────────────
+def resolve_llm_candidates(probed_chain, allowlist, primary_model, health,
+                           max_health=None, health_cutoff=6):
+    """Ordered list of models a call may use, RESTRICTED TO THE APPROVED SET.
+
+    ★ THE ALLOWLIST MUST HOLD UNDER LOAD, and this function exists because it did not.
+    Measured 2026-09-25: the chain was correctly filtered down to the allowlist (`ds`
+    alone), `ds` answered two rounds, then one call timed out. A probe/call failure adds
+    +5 health and `MAX_MODEL_HEALTH` is 5, so every allowlisted model dropped out — and the
+    old `if not candidates: candidates = [PRIMARY_MODEL]` then substituted
+    `auto/best-reasoning`, an aggregate alias that is NOT allowlisted, for EVERY subsequent
+    round. 10 calls carrying audit prompts went to an unaudited provider, each burning
+    3x420s before failing.
+
+    The allowlist exists so a shadow provider cannot receive audit prompts. A control that
+    lapses precisely when the system is under stress is not a control, so `primary_model` is
+    now only ever used when there is no approved set to honour at all.
+    """
+    if max_health is None:
+        max_health = MAX_MODEL_HEALTH
+    approved = [mid for mid, _ in (probed_chain or [])]
+    if not approved:
+        approved = sorted(allowlist or ())
+    if not approved:
+        return [primary_model]
+    # Order by health so a recovered model is preferred — but never DROP one for being
+    # unhealthy. A dropped model means "use something else", and "something else" may be
+    # exactly what the allowlist forbids.
+    healthy = [m for m in approved if health.get(m, 0) < max_health]
+    if healthy:
+        return healthy
+    soft = [m for m in approved if health.get(m, 0) < health_cutoff]
+    return soft or approved
+
+
 async def call_llm(session: aiohttp.ClientSession,
                    user_prompt: str,
                    system_prompt: str,
@@ -1546,10 +1652,14 @@ async def call_llm(session: aiohttp.ClientSession,
     # 08-23 env-pin fix: when DEEPSEEK_MODEL_FLASH is set (free-lane pin from
     # phase_env), the webchat gateway ONLY accepts that token — the probed
     # chain lists paid-API names the gateway 400s. Pinned env wins outright.
-    if _probed_chain and not os.environ.get("DEEPSEEK_MODEL_FLASH"):
-        candidates = [mid for mid, _ in _probed_chain if _model_health.get(mid, 0) < MAX_MODEL_HEALTH]
-    if not candidates:
+    if os.environ.get("DEEPSEEK_MODEL_FLASH"):
+        # An explicit env pin wins outright: the webchat gateway only accepts that token and
+        # 400s every other name, so the probed chain is not usable here.
         candidates = [PRIMARY_MODEL]
+    else:
+        candidates = resolve_llm_candidates(
+            _probed_chain, _load_model_allowlist(), PRIMARY_MODEL, _model_health)
+
 
     # Skip models that are in cooldown (failed recently) or have failed too many times.
     _health_cutoff = 6
@@ -2105,7 +2215,21 @@ def build_file_batch_section(batch_files: list[tuple[str, str]],
         else:
             # Fallback to truncated source if graph is unavailable
             sections.append(f"### FILE: {rel_path}\n```python\n{content[:FILE_TRUNCATE]}\n```")
-    return "## FILE BATCH (Graphify context)\n\n" + "\n\n".join(sections)
+    # The transport in front of this engine requires a TOOL CALL, so a model that decides to
+    # "look something up" starts a gated agent round-trip: EVERY step waits a deliberate 20-80s
+    # before it is even sent. Measured 2026-09-25: one stray read_file consumed the entire 420s
+    # request budget and the round returned nothing, while the same prompt answered via
+    # submit_answer in 18s. State the contract where the model reads it, in the user message -
+    # the harness replaces the caller's SYSTEM prompt, so a system-side instruction is dropped.
+    return ("## FILE BATCH (Graphify context)\n\n" + "\n\n".join(sections) + """
+
+## HOW TO REPLY - READ THIS FIRST
+Every file you need is ALREADY INCLUDED ABOVE. Do not read files, list directories or run
+commands - reply in ONE call using the `submit_answer` tool, with the JSON object in its
+answer field. Any other tool call starts a gated round-trip (20-80s per step) that can
+consume the whole request budget and return NOTHING.
+
+Output ONLY the required JSON object.""")
 
 
 def build_specialist_user_prompt(batch_files: list[tuple[str, str]],

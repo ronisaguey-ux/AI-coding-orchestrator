@@ -105,6 +105,31 @@ def find_python() -> str:
 
 # ── env for a run ────────────────────────────────────────────────────────────
 
+class UnknownTarget(ValueError):
+    """Raised when a target is named but does not exist.
+
+    A separate type because `target_get()` returns None for an unknown name and `or {}`
+    hid it: the name fell through to root="" -> Path("") -> ".", so `orch scan nosuchtarget`
+    walked the ORCHESTRATOR's own source and reported it as the audited repo, and
+    `orch agents nosuchtarget` labelled the personas with a target that does not exist.
+    Both exited 0. A typo must be an error, not a different answer.
+    """
+
+
+def resolve_target(target: str | None = None):
+    """Return (name, record). Raise UnknownTarget if a NAME was given and does not exist.
+
+    An omitted target still falls back to the active one - that is convenience, not a
+    silent substitution for a name the user actually typed.
+    """
+    name = target or config.active_target()
+    t = config.target_get(name)
+    if t is None:
+        raise UnknownTarget(
+            "unknown target %r; known: %s" % (name, ", ".join(sorted(config.targets()))))
+    return name, t
+
+
 def build_env(target: str | None = None, overrides: dict | None = None) -> dict:
     """Turn config + target into the environment engine/audit.py reads.
 
@@ -112,8 +137,7 @@ def build_env(target: str | None = None, overrides: dict | None = None) -> dict:
     lives, so the panel and the MCP cannot drift apart on what a setting means.
     """
     cfg = {s["id"]: config.resolve(s["id"])[0] for s in config.SCHEMA}
-    tname = target or config.active_target()
-    t = config.target_get(tname) or {}
+    tname, t = resolve_target(target)
     o = overrides or {}
 
     env = dict(os.environ)
@@ -152,6 +176,7 @@ def build_env(target: str | None = None, overrides: dict | None = None) -> dict:
     env["AUDIT_NUM_PASSES"] = str(o.get("passes") or cfg.get("passes"))
     env["AUDIT_BATCH_SIZE"] = str(o.get("batchSize") or cfg.get("batchSize"))
     env["AUDIT_CHAT_TIMEOUT"] = str(cfg.get("chatTimeout"))
+    env["AUDIT_PROBE_TIMEOUT"] = str(cfg.get("probeTimeout"))
     env["AUDIT_CHAT_MAX_TOKENS"] = str(cfg.get("chatMaxTokens"))
     env["AUDIT_REQUIRE_SUBSTANTIVE"] = "1" if cfg.get("requireSubstantive") else "0"
     env["AUDIT_MAX_EMPTY_ROTATIONS"] = str(cfg.get("maxEmptyRotations"))
@@ -212,7 +237,13 @@ def start(target: str | None = None, overrides: dict | None = None, resume: bool
     log = runs_dir() / f"run-{run_id}.log"
     latest = runs_dir() / "last.log"
 
-    argv = [py, engine]
+    # -u keeps the engine's stdout UNBUFFERED. Redirected to a log file, Python block-buffers
+    # stdout (4-8KB), so every progress line that does not pass flush=True sits invisible in the
+    # buffer - exactly during the long waits you launched the run to watch. Measured 2026-09-25:
+    # a run sat silent for 7 minutes at the startup probe with 1047 bytes in the log, and
+    # `orch watch` could show nothing at all. Fixing it here covers every print in the engine,
+    # not just the ones somebody remembered to flush.
+    argv = [py, "-u", engine]
     use_resume = cfg.get("resume") if resume is None else resume
     if use_resume:
         argv.append("--resume")
@@ -491,8 +522,7 @@ def scan_target(target: str | None = None, on_progress=None, use_cache: bool = F
     a hung one without it. `use_cache` reuses a result from the last 60 seconds, for a UI that
     re-renders on every keypress.
     """
-    tname = target or config.active_target()
-    t = config.target_get(tname) or {}
+    tname, t = resolve_target(target)
     if use_cache:
         c = _scan_cache.get(tname)
         if c and (time.time() - c["at"]) < 60:

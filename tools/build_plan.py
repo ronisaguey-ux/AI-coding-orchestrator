@@ -74,17 +74,25 @@ def main() -> int:
 
     # A few categories have a mechanical proof available; give the executor the command
     # rather than a description, because a command is checkable and prose is not.
+    # ★ The README to grep is the one belonging to the repo UNDER AUDIT, never a fixed path.
+    # This hardcoded helpotron's README, so a harness finding was "verified" by grepping a
+    # DIFFERENT REPOSITORY's README - a command that looks like proof, runs clean, and is
+    # about another project entirely. The repo root comes from AUDIT_TARGET_DIR, falling back
+    # to the audit dir's own parent so the command at least stays inside the audited tree.
+    repo_root = os.environ.get("AUDIT_TARGET_DIR") or os.environ.get("PLAN_REPO_ROOT") or ""
+    readme = os.path.join(repo_root, "README.md") if repo_root else None
+
     for s in steps:
         base = os.path.basename(s["file"])
-        if s["category"] == "UNDOCUMENTED":
-            s["verify_command"] = (
-                f"grep -c '{re.escape(base)}' /home/roni/Roni_workspace/helpotron/README.md"
-                f"  # >0 after the fix; was 0 at audit time"
-            )
-        elif "README" in s["category"]:
-            s["verify_command"] = (
-                f"grep -c '{re.escape(base)}' /home/roni/Roni_workspace/helpotron/README.md"
-            )
+        if s["category"] not in ("UNDOCUMENTED",) and "README" not in s["category"]:
+            continue
+        if not readme:
+            # No root known: say so rather than emitting a command against some other repo.
+            s["verify_command"] = None
+            s["verify_note"] = "set AUDIT_TARGET_DIR to get a README grep for this repo"
+            continue
+        note = "  # >0 after the fix; was 0 at audit time" if s["category"] == "UNDOCUMENTED" else ""
+        s["verify_command"] = f"grep -c '{re.escape(base)}' {readme}{note}"
 
     steps.sort(key=lambda s: (SEV_ORDER.get(str(s["severity"]), 9), s["file"]))
 

@@ -71,16 +71,29 @@ def _tools_module(name: str):
     return p if p.exists() else None
 
 
-def _run_helper(script: str, args: list[str], timeout: int = 600) -> dict:
+def _run_helper(script: str, env: dict, args: list[str] | None = None, timeout: int = 900) -> dict:
+    """Run a tools/ helper with the environment it actually reads.
+
+    ⚠️ These helpers take NO command-line flags — they read env vars (VERIFY_ROOT, VERIFY_DIR,
+    PLAN_AUDIT_DIR). The first version of this wrapper passed `--findings`/`--target`, which the
+    helpers silently IGNORED, so every call ran against their hardcoded defaults: measured, a
+    `--findings /tmp/nonexistent` was accepted and the tool read a different directory and
+    reported 0 findings as if that were the answer. Passing an argument a program does not
+    parse is indistinguishable from the program working, which is why this is checked against
+    each helper's own source rather than assumed.
+    """
     p = _tools_module(script)
     if not p:
         return {"ok": False, "reason": f"tools/{script} is not present in this checkout"}
+    e = dict(os.environ)
+    e.update(env or {})
     try:
-        r = subprocess.run([runs.find_python(), str(p)] + args,
-                           cwd=str(config.ROOT), capture_output=True, text=True, timeout=timeout)
+        r = subprocess.run([runs.find_python(), str(p)] + list(args or []),
+                           cwd=str(config.ROOT), env=e,
+                           capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
         return {"ok": False, "reason": f"tools/{script} exceeded {timeout}s"}
-    return {"ok": r.returncode == 0, "exit": r.returncode,
+    return {"ok": r.returncode == 0, "exit": r.returncode, "env": {k: v for k, v in (env or {}).items()},
             "stdout": (r.stdout or "")[-8000:], "stderr": (r.stderr or "")[-3000:]}
 
 
@@ -268,22 +281,24 @@ TOOLS = [
           "decides SUPPORTED / REFUTED / UNVERIFIED from the code itself. A model cannot be trusted "
           "on its own findings, so this is the step that makes an audit usable. Writes "
           "verified_findings.json next to the run output.",
-          {"findings": S("Path to a findings json. Defaults to the run's own output."),
-           "target_dir": S("Repository root the citations are relative to.")}, None,
-          lambda a: _run_helper("verify_findings.py", _verify_args(a))),
+          {"findings": S("Directory holding pass_N/*.json. Defaults to the target's own output."),
+           "target": S("Target name. Defaults to the active one."),
+           "target_dir": S("Repository root the citations are relative to. Defaults to the target's dir.")}, None,
+          lambda a: _run_helper("verify_findings.py", _verify_env(a))),
 
     _tool("orch_build_plan",
           "Turn verified findings into an executable plan: one step per change, each with the file, "
           "the exact change, the command that proves it, and what 'done' means.",
-          {"verified": S("Path to verified_findings.json. Defaults to the run's output."),
-           "out": S("Where to write the plan.")}, None,
-          lambda a: _run_helper("build_plan.py", _plan_args(a))),
+          {"target": S("Target name. Defaults to the active one."),
+           "audit_dir": S("Directory holding verified_findings.json. Defaults to the target's output.")}, None,
+          lambda a: _run_helper("build_plan.py", _plan_env(a))),
 
     _tool("orch_cross_eval",
           "Cross-evaluate a plan: check its steps against the code and say which are real, which are "
           "already fixed, and which contradict each other.",
-          {"plan": S("Path to an execution plan json.")}, None,
-          lambda a: _run_helper("cross_eval.py", _cross_args(a))),
+          {"target": S("Target name. Defaults to the active one."),
+           "audit_dir": S("Directory holding the plan.")}, None,
+          lambda a: _run_helper("cross_eval.py", _cross_env(a))),
 
     # ── personas ─────────────────────────────────────────────────────────────
     _tool("orch_agents_list",
@@ -347,33 +362,31 @@ def _run_out_dir(a) -> Path:
     return Path(str(config.resolve("outputDir")[0]))
 
 
-def _verify_args(a):
-    args = []
-    out = _run_out_dir(a)
-    if a.get("findings"):
-        args += ["--findings", a["findings"]]
-    elif out.exists():
-        args += ["--findings", str(out)]
-    if a.get("target_dir"):
-        args += ["--target", a["target_dir"]]
-    elif config.active_target():
-        t = config.target_get(config.active_target()) or {}
-        if t.get("dir"):
-            args += ["--target", str(t["dir"])]
-    return args
+def _target_for(a) -> tuple[str, str]:
+    """(target name, repo root) for a call, defaulting to the active target."""
+    tname = a.get("target") or config.active_target()
+    t = config.target_get(tname) or {}
+    return tname, str(a.get("target_dir") or t.get("dir") or "")
 
 
-def _plan_args(a):
-    args = []
-    if a.get("verified"):
-        args += ["--verified", a["verified"]]
-    if a.get("out"):
-        args += ["--out", a["out"]]
-    return args
+def _verify_env(a) -> dict:
+    tname, root = _target_for(a)
+    # The verifier looks in <VERIFY_DIR> for the findings and resolves every cited path
+    # against <VERIFY_ROOT>. Both must be this target's, or it verifies one repo's findings
+    # against another repo's files and refutes everything.
+    return {"VERIFY_DIR": str(a.get("findings") or runs.out_dir(tname) / "pass_1"),
+            "VERIFY_ROOT": root}
 
 
-def _cross_args(a):
-    return ["--plan", a["plan"]] if a.get("plan") else []
+def _plan_env(a) -> dict:
+    tname, _ = _target_for(a)
+    # build_plan reads verified_findings.json from PLAN_AUDIT_DIR and writes the plan there.
+    return {"PLAN_AUDIT_DIR": str(a.get("audit_dir") or runs.out_dir(tname))}
+
+
+def _cross_env(a) -> dict:
+    tname, root = _target_for(a)
+    return {"CROSS_DIR": str(a.get("audit_dir") or runs.out_dir(tname)), "CROSS_ROOT": root}
 
 
 def _load_engine_lists(target: str | None):

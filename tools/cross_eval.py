@@ -16,13 +16,15 @@ import sys
 from collections import Counter
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+# ★ These paths must match where a run ACTUALLY writes (cli/runs.py out_dir() is per target:
+# audits_plans/<target>). They did not: harness pointed at audits_plans_harness and t2b at a
+# t2b/ dir that does not exist, so cross_eval read stale or missing passes and compared the
+# wrong things. Kept in one table so a repo move is one edit.
+_W = "/home/roni/Roni_workspace"
 REPOS = [
-    ("helpotron", "/home/roni/Roni_workspace/audits_plans",
-     "/home/roni/Roni_workspace/helpotron"),
-    ("harness", "/home/roni/Roni_workspace/audits_plans_harness",
-     "/home/roni/Roni_workspace/webchat_worker/harness"),
-    ("t2b", "/home/roni/Roni_workspace/audits_plans_t2b",
-     "/home/roni/Roni_workspace/t2b"),
+    ("helpotron", f"{_W}/audits_plans/helpotron", f"{_W}/helpotron"),
+    ("harness", f"{_W}/audits_plans/harness", f"{_W}/webchat_worker/harness"),
+    ("t2b", f"{_W}/audits_plans/t2b", f"{_W}/t2b"),
 ]
 
 
@@ -83,7 +85,13 @@ def main() -> int:
         print(f"  refuted share of checkable: "
               f"{100 * overall.get('REFUTED', 0) / total_checkable:.0f}%")
 
-    out = os.path.join(REPOS[0][1], "cross-eval.json")
+    # ★ Write where the summary belongs, and make the directory if the run has not created it.
+    # This crashed with FileNotFoundError whenever the first repo in the table had no pass yet:
+    # the whole cross-eval ran, printed every number, and then died on the last line, so the
+    # comparison existed only in scrollback. A report you cannot open later is not a report.
+    out_dir = os.environ.get("CROSS_OUT_DIR") or os.path.join(_W, "audits_plans")
+    os.makedirs(out_dir, exist_ok=True)
+    out = os.path.join(out_dir, "cross-eval.json")
     with open(out, "w") as fh:
         json.dump({"repos": summary,
                    "totals": dict(overall)}, fh, indent=2)

@@ -251,6 +251,47 @@ def test_empty_allowlist_is_explained():
     importlib.reload(config)
 
 
+def test_allowlist_holds_under_load():
+    """The model allowlist must keep applying when the system is under load.
+
+    This is the defect it was written for (2026-09-25). The chain was correctly filtered to
+    the allowlist (`ds` alone), `ds` answered two rounds, then one call timed out. A failure
+    adds +5 health and MAX_MODEL_HEALTH is 5, so every allowlisted model dropped out - and the
+    old `if not candidates: candidates = [PRIMARY_MODEL]` substituted `auto/best-reasoning`, an
+    aggregate alias that is NOT allowlisted, for every subsequent round. 10 calls carrying audit
+    prompts went to an unaudited provider, each burning 3x420s before failing.
+
+    A security control that lapses exactly when the system is stressed is not a control, so
+    `primary_model` may only be used when there is no approved set at all.
+    """
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("audit_engine", ROOT / "engine" / "audit.py")
+    eng = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(eng)
+    f = eng.resolve_llm_candidates
+    primary = eng.PRIMARY_MODEL
+
+    # The allowlist survives a model going unhealthy - the whole point.
+    check("allowlist holds when its model is unhealthy",
+          f([("ds", 85)], {"ds"}, primary, {"ds": eng.MAX_MODEL_HEALTH}) == ["ds"],
+          "an unhealthy allowlisted model must still be chosen")
+    check("allowlist holds when its model is cooling down",
+          f([("ds", 85)], {"ds"}, primary, {"ds": 99}) == ["ds"],
+          "a cooling allowlisted model must still be chosen")
+    check("allowlisted model still used when the chain was never probed",
+          f(None, {"ds"}, primary, {}) == ["ds"],
+          "a probed chain is not required to honour the allowlist")
+    check("primary_model is used only with no approved set",
+          f(None, set(), primary, {}) == [primary], "no allowlist means no restriction")
+
+    # Non-vacuity: the expression this replaced must actually leak, or the test proves nothing.
+    old = [m for m, _ in [("ds", 85)] if {"ds": eng.MAX_MODEL_HEALTH}.get(m, 0) < eng.MAX_MODEL_HEALTH]
+    old = old or [primary]
+    check("the OLD expression leaks to a non-allowlisted model (non-vacuous)",
+          old == [primary],
+          f"old={old} primary={primary} - fix would be untested if these differed")
+
+
 def test_probe_result_shape():
     """A probe result must carry every key a caller reads, on EVERY path.
 
@@ -360,6 +401,7 @@ def main() -> int:
     test_empty_allowlist_is_explained()
     test_probe_result_shape()
     test_pass_completion_requires_the_same_files()
+    test_allowlist_holds_under_load()
     print(f"\n  {PASSES} passed, {len(FAILS)} failed")
     for f in FAILS:
         print("   ✗ " + f)
