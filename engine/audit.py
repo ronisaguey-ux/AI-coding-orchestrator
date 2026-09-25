@@ -2396,9 +2396,49 @@ def save_state(state: dict):
     os.replace(tmp, STATE_FILE)
 
 
-def batch_result_path(pass_num: int, batch_idx: int) -> str:
-    pass_dir = os.path.join(OUTPUT_BASE, f"pass_{pass_num}")
+def batch_result_path(pass_num: int, batch_idx: int, output_base: str | None = None) -> str:
+    # output_base is overridable so a caller validating a saved pass can point at the
+    # directory it is checking. Defaults to this process's OUTPUT_BASE, which is what every
+    # other caller wants.
+    pass_dir = os.path.join(output_base or OUTPUT_BASE, f"pass_{pass_num}")
     return os.path.join(pass_dir, f"batch_{batch_idx:03d}.json")
+
+
+def pass_matches_this_run(pass_num: int, batches: list, output_base: str) -> bool:
+    """Is a saved pass_N a complete result FOR THESE FILES?
+
+    ★ This is the guard that stops one audit reporting another's work. It was originally
+    written as `os.path.exists(pass_N/summary.json)`, which is true for ANY summary in that
+    directory — so a stale summary from a different repository satisfied the resume check,
+    the run skipped its entire first pass, and the report's pass-1 page would have been
+    another project's findings. Measured 2026-09-25: a harness audit resumed straight to
+    pass 2 on top of helpotron batches sitting in the same output directory.
+
+    A batch entry is (label, content) and the SAVED "files" is the label alone
+    (`files: [bp[0] for bp in batch_files]`), so labels are compared — not the tuples.
+
+    Pure and module-level so the decision can be tested without running an audit.
+    """
+    summary_path = os.path.join(output_base, f"pass_{pass_num}", "summary.json")
+    if not os.path.exists(summary_path):
+        return False
+    want = [[os.path.basename(str(bp[0])) for bp in b] for b in batches]
+    have = []
+    for idx in range(len(batches)):
+        fp = batch_result_path(pass_num, idx, output_base)
+        if not os.path.exists(fp):
+            return False
+        try:
+            with open(fp) as fh:
+                d = json.load(fh)
+        except Exception:
+            return False
+        if d.get("pass") != pass_num or d.get("batch_idx") != idx:
+            return False
+        have.append([os.path.basename(str(x)) for x in (d.get("files") or [])])
+    if len(have) != len(want):
+        return False
+    return all(h == w for h, w in zip(have, want))
 
 
 def load_existing_batch(pass_num: int, batch_idx: int,
@@ -3108,14 +3148,37 @@ async def main():
         total_batches = len(batches)
         batch_histories = [[] for _ in batches]
 
-        # Determine resume point from existing pass summaries
+        # Determine resume point from existing pass summaries.
+        #
+        # ★ A summary.json ONLY means "this pass is done" if the batches in it audited the
+        # SAME FILES this run will audit. Checking for the file's existence alone made a stale
+        # summary from a DIFFERENT repository satisfy a new audit's resume check, so the run
+        # skipped its entire first pass and reported the other repository's findings as its
+        # own. Measured 2026-09-25: a harness audit resumed straight to pass 2 on top of
+        # helpotron batches (conftest.py, adminctl.py) sitting in the same output directory,
+        # and would have produced a report whose pass-1 page was a different project.
+        #
+        # This is the same guard load_existing_batch already applies per batch, applied one
+        # level up. Without it the failure is silent and looks like success.
         completed_passes = set()
+        stale_passes = set()
         if args.resume:
             for p in range(1, num_passes + 1):
                 summary_path = os.path.join(OUTPUT_BASE, f"pass_{p}", "summary.json")
-                if os.path.exists(summary_path):
+                if not os.path.exists(summary_path):
+                    continue
+                if pass_matches_this_run(p, batches, OUTPUT_BASE):
                     completed_passes.add(p)
+                else:
+                    stale_passes.add(p)
             print(f"\n[RESUME] Detected completed passes: {sorted(completed_passes)}")
+            if stale_passes:
+                # Say it out loud: a saved pass that belongs to a different file set is being
+                # re-run, and the reason matters because the alternative is a silent skip.
+                print(f"[RESUME] pass(es) {sorted(stale_passes)} have saved results for a "
+                      f"DIFFERENT file set - re-running them rather than reporting another "
+                      f"audit's findings. Use a separate output directory per repository to "
+                      f"keep this from happening.")
 
         all_results = []
         # Load fully completed passes from disk

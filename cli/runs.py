@@ -31,13 +31,30 @@ RUNS_SUBDIR = ".orch"
 
 # ── locating things ──────────────────────────────────────────────────────────
 
-def out_dir(target_label: str | None = None) -> Path:
-    base = str(config.resolve("outputDir")[0])
-    return Path(base)
+def out_dir(target: str | None = None) -> Path:
+    """The output directory for a target's runs.
+
+    ★ PER TARGET, not one shared directory. The engine decides a whole pass is complete by
+    looking for `pass_N/summary.json` and does not check whose audit produced it, so two
+    targets sharing one output dir means the second audit SKIPS its own pass 1 and reports the
+    first audit's findings as its own. Measured: a harness run resumed past its entire first
+    pass using helpotron batches sitting in the same directory.
+
+    A name is passed through unchanged so an explicit `outputDir` in an override still works
+    exactly as written; the target is only appended to the configured base.
+    """
+    base = Path(str(config.resolve("outputDir")[0]))
+    return base / target if target else base
 
 
 def runs_dir() -> Path:
-    d = out_dir() / RUNS_SUBDIR
+    """Where run records live. One directory for every target.
+
+    Deliberately NOT under a target's output dir: a run's record has to be findable no matter
+    which target it audited, and nesting it per target would mean `orch status` only saw the
+    active target's runs.
+    """
+    d = Path(str(config.resolve("outputDir")[0])) / RUNS_SUBDIR
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -126,7 +143,12 @@ def build_env(target: str | None = None, overrides: dict | None = None) -> dict:
         env.pop("DEEPSEEK_MODEL_FLASH", None)
 
     # Mapping: setting id -> engine env var.
-    env["AUDIT_OUTPUT_DIR"] = str(o.get("outputDir") or cfg.get("outputDir"))
+    # The engine gets the PER-TARGET directory. Passing the shared base here is what let one
+    # target's saved pass satisfy another target's resume check.
+    if o.get("outputDir"):
+        env["AUDIT_OUTPUT_DIR"] = str(o["outputDir"])
+    else:
+        env["AUDIT_OUTPUT_DIR"] = str(out_dir(tname))
     env["AUDIT_NUM_PASSES"] = str(o.get("passes") or cfg.get("passes"))
     env["AUDIT_BATCH_SIZE"] = str(o.get("batchSize") or cfg.get("batchSize"))
     env["AUDIT_CHAT_TIMEOUT"] = str(cfg.get("chatTimeout"))

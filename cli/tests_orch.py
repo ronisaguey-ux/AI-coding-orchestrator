@@ -277,6 +277,77 @@ def test_probe_result_shape():
     importlib.reload(runs)
 
 
+def test_pass_completion_requires_the_same_files():
+    """A saved pass counts as done ONLY if it audited the same files.
+
+    Measured before the fix: one stale summary.json from a DIFFERENT repository made a harness
+    audit skip its entire first pass and adopt helpotron batches (conftest.py, adminctl.py) as
+    its own results. The report would have looked complete. This is the phantom-pass class at
+    the scale of a whole pass.
+    """
+    import ast as _ast
+    import tempfile
+    engine = ROOT / "engine" / "audit.py"
+    tree = _ast.parse(engine.read_text())
+    ns: dict = {"os": os, "json": json, "OUTPUT_BASE": "/nonexistent-default"}
+    for n in tree.body:
+        if isinstance(n, _ast.FunctionDef) and n.name in ("pass_matches_this_run", "batch_result_path"):
+            exec(compile(_ast.Module(body=[n], type_ignores=[]), "<e>", "exec"), ns)
+    pmr = ns["pass_matches_this_run"]
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        (base / "pass_1").mkdir()
+        # this run will audit two batches of these files
+        batches = [[("/repo/a.py", "x"), ("/repo/b.py", "x")],
+                   [("/repo/c.py", "x")]]
+
+        # 1. no summary at all -> not complete
+        check("no summary means not complete", pmr(1, batches, str(base)) is False, "")
+
+        (base / "pass_1" / "summary.json").write_text("{}")
+        # 2. summary but no batches -> not complete
+        check("a summary without batches is not complete",
+              pmr(1, batches, str(base)) is False, "")
+
+        # 3. batches for DIFFERENT files -> not complete (the bug)
+        for i, files in enumerate([["helpotron/conftest.py"], ["helpotron/adminctl.py"]]):
+            (base / "pass_1" / f"batch_{i:03d}.json").write_text(json.dumps(
+                {"pass": 1, "batch_idx": i, "files": files}))
+        check("batches for other files are NOT complete",
+              pmr(1, batches, str(base)) is False, "adopted a different repo's results")
+
+        # 4. batches for the SAME files -> complete
+        for i, files in enumerate([["a.py", "b.py"], ["c.py"]]):
+            (base / "pass_1" / f"batch_{i:03d}.json").write_text(json.dumps(
+                {"pass": 1, "batch_idx": i, "files": files}))
+        check("batches for the same files ARE complete",
+              pmr(1, batches, str(base)) is True, "")
+
+        # 5. one batch of the pair mismatching -> not complete
+        (base / "pass_1" / "batch_001.json").write_text(json.dumps(
+            {"pass": 1, "batch_idx": 1, "files": ["something-else.py"]}))
+        check("one mismatching batch is enough to re-run the pass",
+              pmr(1, batches, str(base)) is False, "")
+
+        # 6. a batch claiming another pass index -> not complete
+        for i, files in enumerate([["a.py", "b.py"], ["c.py"]]):
+            (base / "pass_1" / f"batch_{i:03d}.json").write_text(json.dumps(
+                {"pass": 2, "batch_idx": i, "files": files}))
+        check("a batch stamped with another pass is not complete",
+              pmr(1, batches, str(base)) is False, "")
+
+        # 7. unparseable batch file -> not complete, never raises
+        (base / "pass_1" / "batch_000.json").write_text("{ not json")
+        try:
+            r = pmr(1, batches, str(base))
+            check("an unreadable batch is treated as not complete, without raising",
+                  r is False, f"got {r}")
+        except Exception as e:
+            check("an unreadable batch is treated as not complete, without raising",
+                  False, f"raised {e}")
+
+
 def main() -> int:
     print("orch tests\n")
     test_excludes_match_engine()
@@ -288,6 +359,7 @@ def main() -> int:
     test_no_terminal_does_not_crash()
     test_empty_allowlist_is_explained()
     test_probe_result_shape()
+    test_pass_completion_requires_the_same_files()
     print(f"\n  {PASSES} passed, {len(FAILS)} failed")
     for f in FAILS:
         print("   ✗ " + f)
