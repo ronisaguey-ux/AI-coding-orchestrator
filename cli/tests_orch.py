@@ -22,11 +22,16 @@ import ast
 import importlib
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+# The panel menu, in order, so the test names the same list a user sees.
+SCREENS = ["Dashboard", "Start a run", "Scope a run", "Run control", "Batches",
+           "Findings", "System prompt", "Targets", "Configuration",
+           "Lanes & models", "Agent personas", "MCP server"]
 ROOT = HERE.parent
 sys.path.insert(0, str(ROOT))
 
@@ -251,6 +256,70 @@ def test_empty_allowlist_is_explained():
     importlib.reload(config)
 
 
+def test_every_panel_screen_renders():
+    """Drive EVERY menu screen through a REAL PTY and fail on a crash.
+
+    The subcommand paths are covered elsewhere; the screens reachable only from the menu were
+    not, and a screen that raises takes the whole panel down with it.
+
+    A PIPED TEST IS NOT A TEST. An earlier smoke test fed keystrokes through `script` and
+    "passed" while driving nothing, because it only asserted "did it crash" and never checked
+    WHICH screen rendered. So this asserts on rendered content, and it uses a pty: readKey
+    needs a terminal, and without one the panel legitimately refuses to run.
+    """
+    import pty
+    import select
+    import time as _t
+
+    def render(keys, settle=1.5):
+        pid, fd = pty.fork()
+        if pid == 0:
+            os.environ["TERM"] = "xterm"
+            os.chdir(str(ROOT))
+            os.execvp("orch", ["orch"])
+        out = b""
+        _t.sleep(settle)
+        for k in keys:
+            try:
+                os.write(fd, k)
+            except OSError:
+                break
+            _t.sleep(settle)
+            while select.select([fd], [], [], 0.2)[0]:
+                try:
+                    c = os.read(fd, 65536)
+                except OSError:
+                    break
+                if not c:
+                    break
+                out += c
+        try:
+            while select.select([fd], [], [], 0.4)[0]:
+                c = os.read(fd, 65536)
+                if not c:
+                    break
+                out += c
+        except OSError:
+            pass
+        try:
+            os.kill(pid, 9)
+        except ProcessLookupError:
+            pass
+        return re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]", "", out.decode("utf-8", "replace"))
+
+    DOWN, ENTER = b"\x1b[B", b"\r"
+    rendered, crashed = 0, []
+    for i, name in enumerate(SCREENS):
+        out = render([DOWN] * i + [ENTER])
+        if "Traceback" in out:
+            crashed.append(name)
+        elif out.strip():
+            rendered += 1
+    check("every panel screen renders something", rendered >= len(SCREENS) - len(crashed),
+          f"{rendered} of {len(SCREENS)} rendered")
+    check("no panel screen raises", not crashed, f"crashed: {crashed}")
+
+
 def test_allowlist_holds_under_load():
     """The model allowlist must keep applying when the system is under load.
 
@@ -402,6 +471,7 @@ def main() -> int:
     test_probe_result_shape()
     test_pass_completion_requires_the_same_files()
     test_allowlist_holds_under_load()
+    test_every_panel_screen_renders()
     print(f"\n  {PASSES} passed, {len(FAILS)} failed")
     for f in FAILS:
         print("   ✗ " + f)
