@@ -8,7 +8,8 @@ The orchestrator density-packs independent plan findings into disjoint-file batc
 
 ## Key Components
 
-- **`audit.py`**: Audit stage — parses the multi-agent audit report into a structure-preserving JSON consumed by the cross-eval stage.
+- **`engine/audit.py`**: Audit stage — the live multi-agent audit engine (the process `cli/runs.py` actually starts). Parses the audit report into a structure-preserving JSON consumed by the cross-eval stage.
+  - ⚠️ A root-level `audit.py` used to sit here and was documented as this stage, but it was a 92-line one-shot converter for a single historical report (`multi_agent_oculus_audit_8_27.md`) that no longer exists. It has been **deleted**; its content is preserved as `engine/audit_report_to_json.legacy.py`. Do not look for a root `audit.py`.
 - **`cross_eval.py`**: Cross-evaluation & plan-synthesis stage — deploys parallel subagents to validate, deduplicate and root-cause audit findings into a master remediation plan.
 - **`config.py`**: Layered configuration engine (`defaults < profile < config file < environment < CLI`). Location-derived roots allow cloning and execution without path editing.
 - **`lanes.py`**: Multi-lane routing across local gateways, routers, and free pools (e.g. DeepSeek, Gemini, OmniRoute, OpenRouter Free). Distinguishes transport failure (`ok=False`) from considered empty model output, preventing premature escalations. Features per-model cooldowns, SSE parsing, and dead-lane parking.
