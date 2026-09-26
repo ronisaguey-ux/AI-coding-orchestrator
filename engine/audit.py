@@ -2007,7 +2007,7 @@ def build_base_system_prompt(task_prompt: str, source_of_truth: str, readme: str
         f"## SOURCE OF TRUTH (Authoritative Spec)\n{source_of_truth[:SOT_TRUNCATE]}\n\n"
         if include_sot
         else "## SOURCE OF TRUTH\n[Not provided — audit for code-level correctness, "
-             "READ MME alignment, and runtime safety only; SoT conformance is the SOT Specialist's lane.]\n\n"
+             "README alignment, and runtime safety only; SoT conformance is the SOT Specialist's lane.]\n\n"
     )
     # DOMAIN CONTEXT goes FIRST, immediately after the role line, because it is the frame
     # every other instruction is read through. A model that believes it is auditing a
