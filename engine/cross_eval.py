@@ -1321,7 +1321,7 @@ def build_subagent_user_prompt(agent: dict, findings_chunk: list[dict], graphify
         sev = f.get("severity", "MEDIUM")
         cat = f.get("category", "GENERAL")
         desc = f.get("finding", "")[:180]
-        ctx = graphify.build_file_context(fp, max_funcs=5) if graphify.has_data() else ""
+        ctx = graphify.build_file_context(fp, max_funcs=5) if (graphify and graphify.has_data()) else ""
         lines.append(f"### {fid} | {sev} | {cat} | `{fp}`")
         lines.append(f"Description: {desc}")
         if ctx:
@@ -1739,7 +1739,10 @@ async def main():
 
     # Load Graphify
     graphify = get_graphify()
-    log_message(f"[main] Graphify loaded: {graphify.has_data()} ({len(graphify.nodes)} nodes)")
+    if graphify is None:
+        log_message("[main] Graphify: NOT LOADED - continuing without call-graph context")
+    else:
+        log_message(f"[main] Graphify loaded: {graphify.has_data()} ({len(graphify.nodes)} nodes)")
 
     # Load Audit Findings from pass checkpoints or report
     all_findings = []
