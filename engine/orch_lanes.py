@@ -470,6 +470,23 @@ def default_lanes(cfg=None) -> list[Lane]:
         # only lever that matters now the stealth model is gone. If it 502s again, re-check
         # both signals rather than waiting - and only list a model that actually BILLS
         # (V4.1-Flash returns insufficient balance; the $5 voucher is scope-limited).
+        # 10-05 (Bob): "run the cross eval using the free ai repo connected to the
+        # orchestrator". free-ai (github.com/ronisaguey-ux/free-ai) is a ranked
+        # fallback ROUTER over every free provider we have, including this box's own
+        # webchat gateways and our paid-but-free-tier keys. It runs as a local
+        # OpenAI-compatible server, so it is an API lane like any other: no tab, no
+        # mutex, no anti-ban gap.
+        # ONE lane on purpose. It is a router, not a provider - adding several would
+        # multiply its own upstream load and cool the providers it fronts. Its whole
+        # value is that a caller asks once and it walks the ranked chain.
+        # It needs NO key (it holds ours) and it fails OPEN per model, so a dead
+        # upstream is skipped inside the router rather than burning this lane's budget.
+        Lane("freeai", "http://127.0.0.1:8790/v1/chat/completions",
+             ["freeai"],
+             # A router call can be a whole chain of upstream attempts. It is the one
+             # lane that legitimately needs a long budget.
+             60, 180, prompt_cap=24000, timeout=300),
+
         Lane("bitdeer", "https://api-inference.bitdeer.ai/v1/chat/completions",
              ["deepseek-ai/DeepSeek-V4-Flash", "deepseek-ai/DeepSeek-V4.1-Flash",
               "zai-org/GLM-5.3-Flash", "Qwen/Qwen3.8-27B", "zai-org/GLM-5.3"],
