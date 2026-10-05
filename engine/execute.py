@@ -13,7 +13,7 @@ State: audits_plans/exec_state_8_27.json (per step_id: pending -> applied ->
 green|escalated). Usage: python3 execute.py [--resume] [--batch N]
 [--only-step ID] [--limit N]
 """
-import argparse, asyncio, json, os, re, subprocess, sys, time
+import argparse, asyncio, json, os, re, shutil, subprocess, sys, time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -273,8 +273,32 @@ def load_state() -> dict:
     if STATE_FILE.exists():
         try:
             st = json.loads(STATE_FILE.read_text())
-        except Exception:
-            return {"steps": {}}
+        except Exception as exc:
+            # A state file that EXISTS but cannot be read is not an empty plan.
+            # Returning {"steps": {}} here told the engine that all 14k step
+            # records are unknown, so it re-ran the whole plan from step 0 and
+            # then saved that memory copy over the file: save_state_serialized
+            # re-reads the same unreadable bytes, takes `disk = None`, skips the
+            # merge, and writes whatever this run happened to touch. Every green
+            # not re-derived in that pass is destroyed. Refuse to start instead,
+            # and keep the bytes so the run can be recovered - the same rule
+            # _atomic_state.AtomicState.read() already follows.
+            bak = STATE_FILE.with_suffix(
+                STATE_FILE.suffix + f".unreadable.{int(time.time())}.bak")
+            try:
+                shutil.copy2(STATE_FILE, bak)
+            except OSError:
+                bak = None
+            raise RuntimeError(
+                f"state file {STATE_FILE} exists but could not be read "
+                f"({type(exc).__name__}: {exc}); refusing to start with an empty "
+                f"plan — that would overwrite every recorded step result. "
+                + (f"A copy was kept at {bak}." if bak else
+                   "No copy could be kept.")) from exc
+        if not isinstance(st, dict):
+            raise RuntimeError(
+                f"state file {STATE_FILE} is a {type(st).__name__}, not a JSON "
+                f"object; refusing to start (an unreadable plan is not an empty one)")
         # 09-15: normalise escalated residue at LOAD time, not at save time.
         # Patching the merge in save_state_serialized did not work because several
         # code paths call save_state() directly, which writes the memory copy
@@ -3394,7 +3418,36 @@ async def run_group(session, steps: list, st: dict) -> dict:
             # run_step allowed MAX_ROUNDS, so a step's retry budget depended
             # on whether packing happened to place it alone in a batch.
             if rec["rounds"] >= MAX_ROUNDS:
-                if escalate(sid, rec,
+                # 09-17: THIS site lacked the artifact read its twin has. The apply
+                # above SUCCEEDED (ok=True) and _capture_landed already stamped the
+                # content as present; only the verify lane said red. Retiring here
+                # without reading the file is how a step whose work LANDED gets
+                # filed as a failure — the exact defect run_step:rounds_exhausted
+                # (see _applied_edits_landed) was fixed for on 09-17 and which the
+                # live state then needed a load-time recovery pass to undo. Read the
+                # target first; the edit is the evidence.
+                if _applied_edits_landed(rec):
+                    rec["status"] = "green"
+                    rec["resolved_by"] = (
+                        "round budget exhausted and the verify lane was not green, but "
+                        "the step's edit IS present on disk (read off the file at the "
+                        "round limit) - recorded green instead of yellow")
+                    _la4 = dict(rec.get("last_apply") or {})
+                    _la4["verified_by"] = "run_group:verify_red_exhausted:content-on-disk"
+                    rec["last_apply"] = _la4
+                    rec["yellow_watch_review"] = {
+                        "verdict": "recovered",
+                        "evidence": "content verified on disk at the round limit",
+                    }
+                    await save_state_serialized(st)
+                    try:
+                        await orch_git.git_commit_step(sid, rec)
+                    except Exception as ge:
+                        print(f"[step {sid}] git commit failed: {str(ge)[:180]}", flush=True)
+                    print(f"[group] step {sid} rounds exhausted and verify was not green "
+                          f"but the applied edit IS on disk — green instead of yellow",
+                          flush=True)
+                elif escalate(sid, rec,
                             f"verify verdict not green after {rec['rounds']}/{MAX_ROUNDS} "
                             f"rounds; verify said {str(v.get('reason'))[:120]!r} "
                             f"(apply ok={ok}, files={files[:2]})",

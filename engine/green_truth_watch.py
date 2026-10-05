@@ -44,7 +44,13 @@ def edits_present(edits) -> bool:
 
 def rescue_commit(sid: str, edits) -> bool:
     """Retry the per-step commit for a green the hook missed (lock contention).
-    Returns True when the commit lands (=> the green was real, keep it)."""
+    Returns True when the commit lands (=> the green was real, keep it).
+
+    09-17: the commit carries a PATHSPEC for the same reason orch_git does. A
+    bare `git commit -m msg` commits the whole index, so a file another process
+    had staged — including `webchat-api/.env`, which lives inside this repo —
+    was swept into the rescue commit and pushed to origin/main on the line below.
+    """
     try:
         import subprocess
         files = []
@@ -59,7 +65,8 @@ def rescue_commit(sid: str, edits) -> bool:
         if r.returncode != 0:
             return False
         c = subprocess.run(["git", "commit", "-m",
-                            f"fix(step {sid}) [watch-rescue]: {len(files)} file(s)"],
+                            f"fix(step {sid}) [watch-rescue]: {len(files)} file(s)",
+                            "--"] + files,
                            cwd=REPO, capture_output=True, text=True, timeout=60)
         if c.returncode != 0:
             return False

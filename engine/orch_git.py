@@ -129,10 +129,22 @@ def _commit_blocking(sid: str, files: list[str]) -> None:
     # block, which the old code logged as `[git] commit <sid> failed:`. That is
     # noise, not a failure. Ask the index directly: nothing staged = nothing to
     # commit for this step, so return quietly.
-    staged = _run(["git", "diff", "--cached", "--quiet"])
+    staged = _run(["git", "diff", "--cached", "--quiet", "--"] + to_add)
     if staged.returncode == 0:
         return
-    c = _run(["git", "commit", "-m", msg])
+    # 09-17: COMMIT WITH A PATHSPEC. A bare `git commit -m msg` commits the WHOLE
+    # index, not only what this step staged. Anything another process had staged -
+    # a human's WIP, or a credentials file, since `webchat-api/.env` and the cookie
+    # jars live INSIDE this repo - rode into this step's commit and was then pushed
+    # to origin by _push_retry. Verified on a scratch repo: with `.env` staged by
+    # another process, `git commit -m msg` put the secret in the commit while
+    # `git commit -m msg -- stepfile.py` did not, and left `.env` staged for its
+    # owner. `git commit -- <paths>` commits the worktree content of those paths,
+    # which is exactly what the `git add` above staged.
+    #
+    # The index question above is scoped for the same reason: unscoped, another
+    # process's staged file made this step believe it had something to commit.
+    c = _run(["git", "commit", "-m", msg, "--"] + to_add)
     if c.returncode == 0:
         _push_retry(attempt=0)
     else:
@@ -142,7 +154,7 @@ def _commit_blocking(sid: str, files: list[str]) -> None:
         # transient index-lock case, then report BOTH streams.
         import time
         time.sleep(1.0)
-        c = _run(["git", "commit", "-m", msg])
+        c = _run(["git", "commit", "-m", msg, "--"] + to_add)
         if c.returncode == 0:
             _push_retry(attempt=0)
             return
