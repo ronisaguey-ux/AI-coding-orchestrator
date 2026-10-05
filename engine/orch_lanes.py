@@ -26,6 +26,7 @@ genuine empty model answer and means something completely different from
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import os
 import time
@@ -1118,10 +1119,31 @@ class LanePool:
     def __init__(self, cfg, lanes: list[Lane] | None = None, log=print):
         self.cfg = cfg
         self.lanes = lanes if lanes is not None else default_lanes(cfg)
-        self.pinned: str | None = None
         self.log = log
         self._idx = 0
         self._lock = asyncio.Lock()
+        # 09-18: `pinned` was a plain attribute on the pool, i.e. ONE slot shared
+        # by every worker. The queue driver starts one asyncio task per lane
+        # (orch_queue.drive_plan) and each runs execute_step_pinned, which does
+        # `POOL.pinned = lane` and clears it in a `finally`. Since a task's
+        # context is a copy, a ContextVar gives every worker its OWN pin, so
+        #   - two workers can no longer land on the same lane, and
+        #   - a worker that finishes first no longer wipes the pin out from under
+        #     the steps still in flight (which then free-roam the whole pool and
+        #     collide head-on with lanes other workers are already on).
+        # Assignment keeps working - execute.py still writes `POOL.pinned = lane`,
+        # which now lands in the writing task's own context.
+        self._pin: contextvars.ContextVar = contextvars.ContextVar(
+            f"orch_lane_pin_{id(self):x}", default=None)
+
+    @property
+    def pinned(self) -> str | None:
+        """The lane THIS worker is pinned to (None for an unpinned hop)."""
+        return self._pin.get()
+
+    @pinned.setter
+    def pinned(self, name: str | None) -> None:
+        self._pin.set(name)
 
     # -- health ----------------------------------------------------------
     def _ladder_s(self, lane: Lane, streak: int) -> int:
@@ -1543,7 +1565,26 @@ class LanePool:
                         if _is_webchat_transient(body):
                             self.log(f"[lanes] {lane.name} webchat transient "
                                      f"({_transient_reason(body)}) — hopping now")
-                            self._cool_model(lane, model)
+                            # The body MUST come along: this branch is the one and
+                            # only route by which the 09-17 BUSY exemption in
+                            # _cool_model ("still generating" -> busy, do not cool)
+                            # is reachable, because the 429 branch is the only other
+                            # call site that ever passes one. Without it _cool_model
+                            # classifies a BUSY tab as a dead model and ladder-cools
+                            # it. Measured shape: the gateway answers a still-generating
+                            # tab with HTTP 500 and the message "webchat tab still
+                            # generating from a previous request" (browser.js throws,
+                            # the /v1/chat/completions catch-all at server.js:3002
+                            # turns it into a 500), so this branch is exactly where
+                            # that lands. One BUSY benched the model for 90s AND the
+                            # lane for another 90s via the dead_until fallback at the
+                            # top of _call_lane - on a lane the 09-17 note measured
+                            # as busy on "almost every" draw. The other four
+                            # transients (stranded composer / send mutex / send did
+                            # not commit) really are unhealthy-tab signals and still
+                            # cool, because the exemption only matches "still
+                            # generating".
+                            self._cool_model(lane, model, body=body)
                             break
                         if attempt < retries:
                             await asyncio.sleep(3 * attempt)
