@@ -24,17 +24,22 @@ from pathlib import Path
 
 import pytest
 
-# This repo keeps the engine at the root and drops the `orch_` prefix; the live
-# deployment keeps them under scripts/ with the prefix. Support both so the same
-# test file is valid in either tree.
+# The engine lives in <repo>/engine/ (the live, self-contained set: execute.py
+# beside orch_config/orch_git/orch_lanes/orch_queue/orch_verify). The repo root
+# still carries stale duplicates, where `import execute` resolves the root
+# execute.py but its siblings come from engine/ — a Frankenstein import whose
+# failures say nothing about the running engine. Prefer engine/; fall back to the
+# root and to <repo>/scripts so the same file stays valid in either tree.
 _here = Path(__file__).resolve()
-SCRIPTS = _here.parents[2] / "scripts"
-if not (SCRIPTS / "execute.py").exists():
-    SCRIPTS = _here.parents[2]
+_ROOT = _here.parents[2]
+SCRIPTS = next((c for c in (_ROOT / "engine", _ROOT / "scripts", _ROOT)
+                if (c / "execute.py").exists()), _ROOT)
 sys.path.insert(0, str(SCRIPTS))
 os.environ.setdefault("ORCH_CONFIG", os.path.expanduser("~/.config/orch/orch.yaml"))
 
 execute = importlib.import_module("execute")
+assert Path(execute.__file__).parent == SCRIPTS, (
+    f"execute resolved to {execute.__file__}, expected a sibling of {SCRIPTS}")
 try:
     orch_lanes = importlib.import_module("orch_lanes")
 except ModuleNotFoundError:
@@ -43,16 +48,38 @@ except ModuleNotFoundError:
 
 # ---------------------------------------------------------------- B1 + B6 ---
 def test_b1_escalate_records_a_reason():
-    """Escalating must always leave a non-empty, readable reason on the record."""
-    rec = {"rounds": 3, "status": "pending",
-           "last_apply": {"rnd": 3, "ok": True, "edits": [{"file": "a.py"}]}}
-    status = execute.escalate("S#1", rec, "round budget exhausted (3/3)",
-                              site="test:site")
-    assert status == "escalated"
-    assert rec["status"] == "escalated"
-    assert rec["escalated_reason"].strip()
-    assert rec["escalated_by"] == "test:site"
-    assert rec["escalated_at"]
+    """Escalating must always leave a non-empty, readable reason on the record.
+
+    escalate() has TWO documented outcomes and the live config picks one:
+    `escalations_enabled: true` -> a terminal `escalated` for the escalation
+    persona; `false` (orch.yaml, the default) -> a code YELLOW carrying the same
+    reason. Both must leave a readable reason, so both are pinned — the test
+    previously asserted only the retired `escalated` shape and so could not pass
+    against the engine as it actually runs.
+    """
+    def _check(status_in):
+        rec = {"rounds": 3, "status": "pending",
+               "last_apply": {"rnd": 3, "ok": True, "edits": [{"file": "a.py"}]}}
+        status = execute.escalate("S#1", rec, "round budget exhausted (3/3)",
+                                  site="test:site")
+        assert status == "escalated"          # the sentinel every call site tests
+        assert rec["status"] == status_in
+        assert rec["escalated_reason"].strip()
+        if status_in == "escalated":
+            assert rec["escalated_by"] == "test:site"
+            assert rec["escalated_at"]
+        else:
+            assert rec["yellow_by"] == "test:site"
+            assert rec["yellow_justification"].strip()
+
+    on, off = execute.ESCALATIONS_ENABLED, execute.ESCALATIONS_ENABLED
+    try:
+        execute.ESCALATIONS_ENABLED = True
+        _check("escalated")
+        execute.ESCALATIONS_ENABLED = False
+        _check("yellow")
+    finally:
+        execute.ESCALATIONS_ENABLED = on
 
 
 def test_b1_escalate_without_a_reason_is_refused_in_strict_mode(monkeypatch):
@@ -68,7 +95,9 @@ def test_b1_escalate_without_a_reason_still_records_a_marker(monkeypatch):
     monkeypatch.setenv("ORCH_STRICT_ESCALATION", "0")
     rec = {"rounds": 3, "status": "pending"}
     execute.escalate("S#3", rec, "", site="test:noreason")
-    assert rec["status"] == "escalated"
+    # With the escalation phase off (the live config) the terminal is a code
+    # yellow; either way the site and the gap must be readable on the record.
+    assert rec["status"] in ("escalated", "yellow")
     assert "UNSPECIFIED" in rec["escalated_reason"]
     assert "test:noreason" in rec["escalated_reason"]
 
@@ -133,7 +162,17 @@ def test_b4_webchat_budgets_exceed_their_gateway_hard_caps():
     hard_cap_s = {"chatgpt": 180, "gemini": 300,
                   "deepseek": 240, "deepseek2": 240, "deepseek4": 240}
     lanes = {l.name: l for l in orch_lanes.default_lanes(execute.CFG)}
+    # A cap whose lane is not in the pool cannot be violated. chatgpt and gemini
+    # were pulled from the pool, and indexing them unconditionally raised
+    # KeyError before this test ever checked a budget. Report what went unchecked
+    # so a lane returning to the pool cannot silently skip its own cap.
+    unchecked = sorted(set(hard_cap_s) - set(lanes))
+    assert unchecked == [] or set(unchecked) <= {"chatgpt", "gemini"}, (
+        f"a documented webchat cap has no lane and it is not a known-pulled one: "
+        f"{unchecked} (pool: {sorted(lanes)})")
     for name, cap in hard_cap_s.items():
+        if name not in lanes:
+            continue
         assert lanes[name].timeout > cap, (
             f"{name}: engine budget {lanes[name].timeout}s <= gateway hard cap {cap}s "
             f"— the engine would kill a call the gateway is still serving")

@@ -580,13 +580,19 @@ def _apply_outcome(queue, sid, res, escalations: bool = False) -> str:
 
 async def drive_batch(queue: BatchQueue, roster: LaneRoster, handoff: StepHandoff,
                       execute_step, on_escalate, *, poll_s=None, log=None,
-                      max_stall_rounds=120):
+                      max_stall_rounds=120, on_step_done=None):
     """Drive ONE batch to completion. Returns when every step is terminal.
 
     Every available lane pulls steps from the shared queue; a lane that cools
     parks and its step is handed to a sibling with the history log; the
     escalation persona gets the last word on anything the lanes could not fix.
     Lanes sit idle when nothing is claimable — they never touch another batch.
+
+    `on_step_done(lane, sid, status)` is the optional per-step completion hook,
+    matching `drive_plan`. It was called below but never accepted as a parameter,
+    so EVERY completed step raised `NameError: name 'on_step_done' is not defined`
+    at the `if on_step_done:` line and took the whole batch down with it — measured
+    as 8 of this module's own tests failing on main.
     """
     poll_s = DEFAULT_POLL_S if poll_s is None else poll_s
     log = log or (lambda *a, **k: None)
