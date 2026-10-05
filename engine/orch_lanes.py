@@ -427,8 +427,18 @@ def default_lanes(cfg=None) -> list[Lane]:
         # Like bitdeer this is an API lane: no tab, no per-account mutex, no anti-ban gap, so
         # it can take concurrent calls - the throughput lever now the stealth model is gone.
         Lane("orcarouter", "https://api.orcarouter.ai/v1/chat/completions",
-             ["deepseek/deepseek-v4-flash-free", "orcarouter/free",
-              "tencent/hy3-free", "z-ai/glm-5.3-flash-free"],
+             # 10-05: the refreshed key lists FIVE catalogue models and can call
+             # exactly ONE of them. Measured live, each with a real completion:
+             #   orcarouter/free          200  'OK-free'
+             #   orcarouter/fusion        403  model_access_denied
+             #   orcarouter/fusion-flash  403  model_access_denied
+             #   orcarouter/fusion-mini   403  model_access_denied
+             #   orcarouter/auto          402  out of credits
+             # and the four ids the OLD key used (deepseek/deepseek-v4-flash-free,
+             # orcarouter/free, tencent/hy3-free, z-ai/glm-5.3-flash-free) mostly
+             # 403 now too. So list ONLY the id this key can actually serve: a
+             # denied model in the rotation burns a draw and a cooldown slot.
+             ["orcarouter/free"],
              45, 120, prompt_cap=24000, timeout=120,
              auth=_env_key("ORCAROUTER_API_KEY", "orcarouter_key.txt")),
 
