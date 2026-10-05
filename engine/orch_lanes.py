@@ -132,6 +132,30 @@ class Lane:
         return now >= self.dead_until and bool(self.available_models(now))
 
 
+def _env_key(env_var: str, file_name: str = "") -> str:
+    """A lane's API key, resolved at load time - never baked into the source.
+
+    Order: $<env_var> -> ~/.config/orch/<file_name> (0600) -> "".
+    An empty result DROPS the lane (see the filter at the end of default_lanes),
+    which is the right behaviour for a keyless lane: it must not sit in the pool
+    failing every draw, and a cooldown it earns is a slot wasted.
+
+    Any provider can be pointed at by setting its env var - adding a new API is
+    a config change, not a source edit.
+    """
+    tok = os.environ.get(env_var, "").strip()
+    if tok:
+        return tok
+    if file_name:
+        fp = Path(os.path.expanduser("~/.config/orch/")) / file_name
+        if fp.exists():
+            try:
+                return fp.read_text(encoding="utf-8").strip()
+            except OSError:
+                pass
+    return ""
+
+
 def _dahl_key() -> str:
     """Dahl API key: $DAHL_API_KEY, else the 0600 file at ~/.config/orch/dahl_key.txt.
 
@@ -405,7 +429,7 @@ def default_lanes(cfg=None) -> list[Lane]:
              ["deepseek/deepseek-v4-flash-free", "orcarouter/free",
               "tencent/hy3-free", "z-ai/glm-5.3-flash-free"],
              45, 120, prompt_cap=24000, timeout=120,
-             auth="***REMOVED-ORCAROUTER-KEY***"),
+             auth=_env_key("ORCAROUTER_API_KEY", "orcarouter_key.txt")),
 
         # 09-15 (data-driven pull): orcarouter is DEAD WEIGHT. Over 3 hours it
         # made 86 claims, failed 33 times, was ladder-cooled 44 times and
@@ -438,7 +462,7 @@ def default_lanes(cfg=None) -> list[Lane]:
         Lane("bitdeer", "https://api-inference.bitdeer.ai/v1/chat/completions",
              ["deepseek-ai/DeepSeek-V4-Flash"],
              60, 180, prompt_cap=24000, timeout=120,
-             auth="***REMOVED-BITDEER-KEY***"),
+             auth=_env_key("BITDEER_API_KEY", "bitdeer_key.txt")),
         # 09-13 (owner): ChatGPT webchat lane (Free account, text chat only —
         # image analysis is capped but text is unlimited). Gateway :8087 on the
         # owner's CDP 9224 Chrome. Four harness bugs had to be fixed first
@@ -692,7 +716,17 @@ def default_lanes(cfg=None) -> list[Lane]:
                               extra.get("auth", "")))
     if cfg is not None and cfg.exclude_lanes:
         lanes = [ln for ln in lanes if ln.name not in cfg.exclude_lanes]
-    return [ln for ln in lanes if ln.name != "openrouter" or ln.auth]
+    # 10-05 (Bob): "those shall NOT be hardcoded into the engine source, they're
+    # supposed to be configurable with any api via environment variables". Any
+    # REMOTE lane whose key did not resolve is dropped rather than pooled - a
+    # keyless lane fails every draw and burns a cooldown slot. Local gateway
+    # lanes (127.0.0.1) have no auth by design and are kept.
+    def _remote(ln) -> bool:
+        u = (ln.url or "")
+        return not (u.startswith("http://127.0.0.1") or u.startswith("http://localhost"))
+
+    return [ln for ln in lanes
+            if (not _remote(ln)) or ln.auth or ln.key_refresh]
 
 
 # ----------------------------------------------------------------- result ---
