@@ -461,7 +461,8 @@ def default_lanes(cfg=None) -> list[Lane]:
         # both signals rather than waiting - and only list a model that actually BILLS
         # (V4.1-Flash returns insufficient balance; the $5 voucher is scope-limited).
         Lane("bitdeer", "https://api-inference.bitdeer.ai/v1/chat/completions",
-             ["deepseek-ai/DeepSeek-V4-Flash"],
+             ["deepseek-ai/DeepSeek-V4-Flash", "deepseek-ai/DeepSeek-V4.1-Flash",
+              "zai-org/GLM-5.3-Flash", "Qwen/Qwen3.8-27B", "zai-org/GLM-5.3"],
              60, 180, prompt_cap=24000, timeout=120,
              auth=_env_key("BITDEER_API_KEY", "bitdeer_key.txt")),
         # 09-13 (owner): ChatGPT webchat lane (Free account, text chat only —
