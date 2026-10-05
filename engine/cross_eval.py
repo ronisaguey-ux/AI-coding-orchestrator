@@ -604,8 +604,11 @@ OUTPUT_BASE = "/home/roni/Roni_workspace/audits_plans"
 # web-verified date via PLAN_VERSION; direct invocations fall back to today.
 PLAN_VERSION = os.environ.get("PLAN_VERSION", f"{datetime.now().month}_{datetime.now().day}")
 AUDIT_REPORT = f"{OUTPUT_BASE}/multi_agent_oculus_audit_{PLAN_VERSION}.md"
-SOT_FILE = "/home/roni/Roni_workspace/oculus/OCULUS_IMPORTANT/OCULUS_SOURCE_OF_TRUTH_7_23.md"
-README_FILE = "/home/roni/Roni_workspace/oculus/OCULUS_IMPORTANT/oculus_readme.md"
+# 10-05: OCULUS_IMPORTANT/ held a DRIFTED copy (and is now gone entirely), so the
+# cross-eval was cross-referencing a document that is not the constitution. The
+# real one is docs/spec/, pinned by sha256 and enforced in CI.
+SOT_FILE = "/home/roni/Roni_workspace/oculus/docs/spec/OCULUS_SOURCE_OF_TRUTH_7_23.md"
+README_FILE = "/home/roni/Roni_workspace/oculus/README.md"  # 10-05: OCULUS_IMPORTANT/ is gone; the repo README is the real one
 GRAPH_FILE = "/home/roni/Roni_workspace/oculus/graphify-out/graph.json"
 MASTER_PLAN_FILE = f"{OUTPUT_BASE}/master_oculus_plan_{PLAN_VERSION}.md"
 CROSS_EVAL_STATE = f"{OUTPUT_BASE}/cross_eval_state.json"
@@ -795,11 +798,29 @@ def resolve_shim_target(source: str) -> str | None:
 
 
 _graphify: GraphifyDB | None = None
+_graphify_missing = False
 
-def get_graphify() -> GraphifyDB:
-    global _graphify
-    if _graphify is None:
-        _graphify = GraphifyDB(GRAPH_FILE)
+def get_graphify() -> GraphifyDB | None:
+    """The call-graph context, or None when there is no graph to read.
+
+    10-05: graphify-out/graph.json does not exist in the repo, so constructing
+    GraphifyDB unconditionally made the FIRST call to this raise inside a subagent
+    and every finding that touched the graph came back as a task exception - the
+    cross-eval reported "0 findings" for a reason that had nothing to do with the
+    findings. A missing graph is a missing INPUT: say so once and carry on.
+    """
+    global _graphify, _graphify_missing
+    if _graphify is None and not _graphify_missing:
+        if not os.path.exists(GRAPH_FILE):
+            _graphify_missing = True
+            log_message(f"[graph] {GRAPH_FILE} not found - running WITHOUT call-graph context")
+            return None
+        try:
+            _graphify = GraphifyDB(GRAPH_FILE)
+        except Exception as e:
+            _graphify_missing = True
+            log_message(f"[graph] could not load {GRAPH_FILE}: {e} - running WITHOUT call-graph context")
+            return None
     return _graphify
 
 # ─── RUNTIME RATE LIMITING & METRICS ─────────────────────────────────────────
