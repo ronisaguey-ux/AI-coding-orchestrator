@@ -131,8 +131,8 @@ OUTPUT_BASE = AUDIT_DIR
 # web-verified date via PLAN_VERSION; direct invocations fall back to today.
 PLAN_VERSION = os.environ.get("PLAN_VERSION", f"{datetime.now().month}_{datetime.now().day}")
 AUDIT_REPORT = f"{OUTPUT_BASE}/multi_agent_oculus_audit_{PLAN_VERSION}.md"
-SOT_FILE = f"{REPO_ROOT}/OCULUS_IMPORTANT/OCULUS_SOURCE_OF_TRUTH_7_23.md"
-README_FILE = f"{REPO_ROOT}/OCULUS_IMPORTANT/oculus_readme.md"
+SOT_FILE = f"{REPO_ROOT}/docs/spec/OCULUS_SOURCE_OF_TRUTH_7_23.md"  # 10-05: OCULUS_IMPORTANT/ held a drifted copy and is gone
+README_FILE = f"{REPO_ROOT}/README.md"  # 10-05: OCULUS_IMPORTANT/ is gone
 GRAPH_FILE = f"{REPO_ROOT}/graphify-out/graph.json"
 MASTER_PLAN_FILE = f"{OUTPUT_BASE}/master_oculus_plan_{PLAN_VERSION}.md"
 CROSS_EVAL_STATE = f"{OUTPUT_BASE}/cross_eval_state.json"
@@ -323,10 +323,28 @@ def resolve_shim_target(source: str) -> str | None:
 
 _graphify: GraphifyDB | None = None
 
-def get_graphify() -> GraphifyDB:
-    global _graphify
-    if _graphify is None:
-        _graphify = GraphifyDB(GRAPH_FILE)
+_graphify_missing = False
+
+def get_graphify() -> GraphifyDB | None:
+    """The call-graph context, or None when there is no graph to read.
+
+    10-05: graphify-out/graph.json does not exist, so constructing GraphifyDB
+    unconditionally raised inside every subagent and each finding came back as
+    'Task Exception' - a run that reports ZERO findings for a reason that has nothing
+    to do with the findings. A missing graph is a missing INPUT.
+    """
+    global _graphify, _graphify_missing
+    if _graphify is None and not _graphify_missing:
+        if not os.path.exists(GRAPH_FILE):
+            _graphify_missing = True
+            log_message(f"[graph] {GRAPH_FILE} not found - running WITHOUT call-graph context")
+            return None
+        try:
+            _graphify = GraphifyDB(GRAPH_FILE)
+        except Exception as e:
+            _graphify_missing = True
+            log_message(f"[graph] could not load {GRAPH_FILE}: {e} - running WITHOUT call-graph context")
+            return None
     return _graphify
 
 # ─── RUNTIME RATE LIMITING & METRICS ─────────────────────────────────────────
@@ -814,7 +832,7 @@ def build_subagent_user_prompt(agent: dict, findings_chunk: list[dict], graphify
         sev = f.get("severity", "MEDIUM")
         cat = f.get("category", "GENERAL")
         desc = f.get("finding", "")[:180]
-        ctx = graphify.build_file_context(fp, max_funcs=5) if graphify.has_data() else ""
+        ctx = graphify.build_file_context(fp, max_funcs=5) if (graphify and graphify.has_data()) else ""
         lines.append(f"### {fid} | {sev} | {cat} | `{fp}`")
         lines.append(f"Description: {desc}")
         if ctx:
@@ -1209,7 +1227,7 @@ async def main():
 
     # Load Graphify
     graphify = get_graphify()
-    log_message(f"[main] Graphify loaded: {graphify.has_data()} ({len(graphify.nodes)} nodes)")
+    log_message("[main] Graphify: NOT LOADED - continuing without call-graph context") if graphify is None else log_message(f"[main] Graphify loaded: {graphify.has_data()} ({len(graphify.nodes)} nodes)")
 
     # Load Audit Findings from pass checkpoints or report
     all_findings = []
