@@ -764,22 +764,70 @@ async def drive_plan(batches, records, roster, handoff, execute_step, *,
     inflight: dict = {}
     esc_attempts: dict = {}
 
+    # 10-05 BATCH-0 STARVATION (measured: 5,635 claims in 12 min, ALL batch 0, and
+    # 1,049 of 1,336 steps never looked at once).
+    #
+    # A rotating cursor over `order` does NOT fix this, and that is worth recording:
+    # `order` is BATCH-ORDERED, the scan runs forward from the cursor, and it stops
+    # at the first claimable step. Batch 0's steps are claimable, so whichever index
+    # the cursor lands on, the walk still crosses batch 0 before batch 1 and takes a
+    # batch-0 step - and then re-anchors the cursor to that step's own position. The
+    # cursor can never leave batch 0. The rotation has to be over BATCHES, not over
+    # positions in the flat list.
+    #
+    # So: give each worker the next batch in turn and let it take the first
+    # claimable step THERE. Every batch gets a turn, a worker still never idles when
+    # work exists, and the "a batch is an accounting boundary, not a work boundary"
+    # rule is preserved - the cursor is only a fairness device.
+    _batch_cursor = {"i": 0}
+    # 10-06 SECOND STARVATION, and it is the one that actually stalled the run.
+    # Rotating over BATCHES fixed the first half of the problem and left the second half
+    # untouched: inside a batch the walk still started at member 0, and a step that is
+    # claimed and comes back NON-TERMINAL stays `pending` - so it is claimable again on
+    # the very next pass, at the same index. The engine therefore re-took the first
+    # claimable step of each batch forever and never advanced down the batch.
+    #
+    # Measured on the live 10-5 run: 585 pending in the queue, 511 of them never written
+    # to the state file at all, and 0 of those 511 appear anywhere in 3 hours of engine
+    # logs - not one claim. Meanwhile claims ran at ~65/hour, which is ~3 per batch per
+    # hour: the same handful of steps, round after round.
+    #
+    # So the walk needs its own cursor PER BATCH: each claim starts one step further
+    # along the batch than the last, and wraps. A never-tried step is reached as soon as
+    # its turn comes round, and a step that just answered cannot be handed straight back
+    # to itself.
+    _batch_pos: dict = {}
+
     def claim(holder):
         kinds = ("escalate", "execute") if on_escalate else ("execute",)
-        for kind in kinds:
-            for sid in order:
-                if sid in inflight:
+        if not live_batches:
+            return None
+        n = len(live_batches)
+        start_bi = _batch_cursor["i"] % n
+        # Walk every live batch once, beginning where the last claim left off.
+        for off in range(n):
+            bi = live_batches[(start_bi + off) % n]
+            mem = members[bi]
+            for kind in kinds:
+                if not mem:
                     continue
-                st = status(sid)
-                if kind == "execute" and st != "pending":
-                    continue
-                if kind == "escalate" and st != "escalated":
-                    continue
-                fs = step_files(steps_by_id.get(sid))
-                if res.can_reserve(fs, holder):
-                    res.reserve(fs, holder)
-                    inflight[sid] = holder
-                    return sid, kind
+                base = _batch_pos.get(bi, 0) % len(mem)
+                for k in range(len(mem)):
+                    sid = mem[(base + k) % len(mem)]
+                    if sid in inflight:
+                        continue
+                    st = status(sid)
+                    if kind == "execute" and st != "pending":
+                        continue
+                    if kind == "escalate" and st != "escalated":
+                        continue
+                    fs = step_files(steps_by_id.get(sid))
+                    if res.can_reserve(fs, holder):
+                        res.reserve(fs, holder)
+                        inflight[sid] = holder
+                        _batch_pos[bi] = (base + k + 1) % len(mem)
+                        _batch_cursor["i"] = (start_bi + off + 1) % n
+                        return sid, kind
         return None
 
     def release(sid):

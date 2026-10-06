@@ -943,6 +943,51 @@ def load_state() -> dict:
                       flush=True)
         except Exception as _e:
             print(f"[eng] transport-requeue pass skipped: {str(_e)[:120]}", flush=True)
+
+        # 10-05 LIVELOCK FIX (measured: CE105-0476 re-claimed 1,947 times in 30s).
+        # A step that is PENDING at/over the round cap is unworkable by construction:
+        # `claim_task` refuses to hand a lane a step whose round budget is spent
+        # (orch_queue.py: rounds >= MAX_ROUNDS -> continue). So it can never be
+        # claimed... EXCEPT when it is claimed by a path that does not run that
+        # guard, or when a pass has just reset its rounds. Either way the step sits
+        # pending, gets re-claimed, returns without advancing, and is re-claimed in
+        # a tight loop that holds a worker and burns CPU at ~65 claims/second while
+        # nothing is ever tried on the code.
+        #
+        # The retired reason already exists on these records (run_step wrote
+        # yellow_reason + yellow_at at pre_loop_max_rounds) - its STATUS was what got
+        # lost. Restore the terminal state instead of re-deriving it: this is a
+        # re-statement of a verdict the executor already made, never a new one.
+        # A record with no such verdict is NOT touched here - it belongs to the
+        # re-queue passes above, which give it a real attempt.
+        try:
+            _cap = 0
+            for _r in (st.get("steps") or {}).values():
+                if _r.get("status") != "pending":
+                    continue
+                if int(_r.get("rounds") or 0) < MAX_ROUNDS:
+                    continue
+                _why = str(_r.get("yellow_reason") or _r.get("resolved_by") or "").strip()
+                if not _why:
+                    continue
+                _r["status"] = "yellow"
+                _r["yellow_justification"] = _r.get("yellow_justification") or _clip_reason(_why)
+                _r["resolved_by"] = _r.get("resolved_by") or ("code yellow: " + _clip_reason(_why)[:200])
+                _r["yellow_at"] = _r.get("yellow_at") or time.strftime("%Y-%m-%dT%H:%M:%S")
+                _r["yellow_by"] = _r.get("yellow_by") or "load_state:rounds_cap_livelock"
+                if not _r.get("yellow_watch_review"):
+                    _r["yellow_watch_review"] = {
+                        "verdict": "checked, not recoverable",
+                        "evidence": ("pending at the round cap with no lane able to claim it; "
+                                     "the executor's own verdict was restored rather than re-run"),
+                    }
+                _cap += 1
+            if _cap:
+                print(f"[eng] retired {_cap} pending step(s) at the round cap back to yellow "
+                      f"(pending at rounds>={MAX_ROUNDS} is unclaimable and only livelocks)",
+                      flush=True)
+        except Exception as _e:
+            print(f"[eng] rounds-cap livelock pass skipped: {str(_e)[:120]}", flush=True)
         return st
     return {"steps": {}}
 
@@ -1631,6 +1676,31 @@ async def repair_with_retry(session, system: str, user: str, max_retries: int = 
                 "Re-send the COMPLETE JSON object now, starting with '{' and ending with '}'. "
                 "If it is too long, send ONE edit at a time and keep every old_string SHORT "
                 "(a few unique lines, never a whole file). Do not apologise, do not explain."})
+            seen.add(res.lane)
+            continue
+        # 10-05: a TOOL-CALL reply is not a refusal either, and it was the single
+        # biggest waste in the 10_5 run. Measured on /tmp/lane_empty_debug.jsonl:
+        # 35 of 37 "empty/no-edits" records were not empty at all - they were
+        # {"tool":"see_next_chunk","params":{"path":"..."}}, i.e. the lane asking
+        # for more of a file. The ds gateways serve up to 8 passthrough fetches,
+        # but an API lane (openrouter, dahl) has NO gateway to serve it, so the
+        # tool call reached the engine verbatim and was counted as a hop. Each one
+        # cost a full send and a round.
+        # Tell that lane the truth: the tool is not available here, the file above
+        # is what it has, and the answer must be the edits JSON.
+        _tc = (res.content or "").strip()
+        if _tc.startswith("{") and '"tool"' in _tc[:200] and '"edits"' not in _tc:
+            history.append({"role": "assistant", "content": _tc[:2000]})
+            history.append({"role": "user", "content":
+                "You replied with a tool call, but NO TOOL IS AVAILABLE in this session. "
+                "The file content above (including any numbered chunks and the explicit "
+                "'--- end of <file>' marker) is everything you can see, and a 'see_next_chunk' "
+                "marker means a long LINE was cut, not that lines are missing. "
+                "Answer with ONE JSON object now:\n"
+                '{"edits":[{"file":"<path>","old_string":"<exact text from the file above>",'
+                '"new_string":"<replacement>"}],"notes":"<terse>"}\n'
+                "If the file genuinely cannot supply a unique old_string, say "
+                'cannot-fix with the reason instead. Reply with JSON only."'})
             seen.add(res.lane)
             continue
         # 09-12: a PROSE reply is not a refusal either. Measured on this dump: a
@@ -2568,8 +2638,35 @@ async def run_step(session, step: dict, st: dict) -> dict:
                              "(already_satisfied_action=escalate)",
                              site="run_step:already_satisfied")
                 else:
-                    rec["status"] = "pending"
+                    # 10-05: "cannot-fix" is a VERDICT, not a no-answer. The lane
+                    # looked at the file and declined; re-asking the same question
+                    # never produces a different answer. Leaving it pending with the
+                    # round incremented is only safe if the increment is visible to
+                    # the picker - and on CE105-0487 it was not: the step came back
+                    # pending at the SAME round and was re-claimed and re-answered
+                    # cannot-fix forever (measured: 3 claims in 2 minutes, and the
+                    # same shape as the 0476 livelock at 1,947/30s).
+                    # The verdict is terminal the moment a majority of the budget
+                    # has produced it. Below that, keep the retry - one lane's
+                    # cannot-fix can be another's fixable step.
                     rec["rounds"] = rnd + 1
+                    if rec["rounds"] >= MAX_ROUNDS:
+                        escalate(sid, rec,
+                                 f"lane verdict 'cannot-fix' at round "
+                                 f"{rec['rounds']}/{MAX_ROUNDS} (already_satisfied_action="
+                                 f"{already_satisfied_action}); the lane looked at the file "
+                                 f"and declined. Target file(s): "
+                                 f"{', '.join(files) or 'not recorded'}. The lane said, in "
+                                 f"its own words: {str(res.content or '')[:200]}",
+                                 site="run_step:already_satisfied")
+                        try:
+                            await orch_git.git_commit_step(sid, rec)
+                        except Exception as ge:
+                            print(f"[step {sid}] git commit failed: {str(ge)[:180]}", flush=True)
+                        await save_state_serialized(st)
+                        print(f"[step {sid}] lane verdict already-satisfied -> {rec['status']}",
+                              flush=True)
+                        return rec
                 try:
                     await orch_git.git_commit_step(sid, rec)
                 except Exception as ge:
@@ -2921,11 +3018,25 @@ def _lane_cool_seconds(err: str) -> int:
     queue and a sibling lane takes it, handed the history log.
     """
     e = (err or "").lower()
-    if "429" in e or "rate limit" in e or "rate_limit" in e or "too frequent" in e:
-        return int(os.environ.get("ORCH_LANE_COOL_RATE_S", "900"))
-    if "timeout" in e or "timed out" in e:
-        return int(os.environ.get("ORCH_LANE_COOL_TIMEOUT_S", "120"))
-    return int(os.environ.get("ORCH_LANE_COOL_ERROR_S", "60"))
+    # 10-05: same redesign as orch_lanes._cool_model, and for the same measured reason -
+    # a cooldown is a BENCHING and a benched lane produces nothing. The old numbers here
+    # were flat and hard (900s on any 429, 120s on any timeout) with no decay and no
+    # distinction between "this will pass" and "this lane is dead".
+    #
+    # PERMANENT is the only case that deserves a long park: the lane cannot serve until a
+    # human fixes the key, the balance or the model id, so retrying only burns hops.
+    if any(k in e for k in ("401", "402", "403", "404", "insufficient balance",
+                            "invalid api key", "unauthorized", "not currently offered",
+                            "authentication")):
+        return int(os.environ.get("ORCH_LANE_COOL_PERMANENT_S", "3600"))
+    # CAPACITY is a real "come back later" - price it, and honour Retry-After when given.
+    if any(k in e for k in ("429", "rate limit", "rate_limit", "too frequent",
+                            "quota", "capacity", "free_rate_limited")):
+        _ra = re.search(r"retry[- _]?after[^0-9]{0,4}(\d{1,4})", e)
+        return int(_ra.group(1)) if _ra else int(
+            os.environ.get("ORCH_LANE_COOL_RATE_S", "180"))
+    # TRANSIENT: a timeout, a 5xx or an empty stream. One hop costs less than a bench.
+    return int(os.environ.get("ORCH_LANE_COOL_TRANSIENT_S", "0"))
 
 
 async def execute_step_pinned(session, lane: str, step: dict, st: dict) -> "oq.StepOutcome":

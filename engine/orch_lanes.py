@@ -29,6 +29,7 @@ import asyncio
 import contextvars
 import json
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -476,22 +477,45 @@ def default_lanes(cfg=None) -> list[Lane]:
         # webchat gateways and our paid-but-free-tier keys. It runs as a local
         # OpenAI-compatible server, so it is an API lane like any other: no tab, no
         # mutex, no anti-ban gap.
-        # ONE lane on purpose. It is a router, not a provider - adding several would
-        # multiply its own upstream load and cool the providers it fronts. Its whole
-        # value is that a caller asks once and it walks the ranked chain.
         # It needs NO key (it holds ours) and it fails OPEN per model, so a dead
         # upstream is skipped inside the router rather than burning this lane's budget.
-        Lane("freeai", "http://127.0.0.1:8790/v1/chat/completions",
-             ["freeai"],
-             # A router call can be a whole chain of upstream attempts. It is the one
-             # lane that legitimately needs a long budget.
-             60, 180, prompt_cap=24000, timeout=300),
+        #
+        # 10-05: "ONE lane on purpose" USED TO BE HERE, AND IT WAS WRONG. The note
+        # claimed more lanes "would multiply its own upstream load and cool the
+        # providers it fronts". That was a guess; I measured it instead.
+        #
+        # freeai with a REALISTIC engine prompt (~11K chars, the edits contract):
+        #   conc= 8  ->  8/8 HTTP 200,  6/8 returned valid edits, 16s wall
+        #   conc=16  -> 16/16 HTTP 200, 12/16 returned valid edits, 33s wall
+        #   conc=24  -> 24/24 HTTP 200, 22/24 returned valid edits, 25s wall
+        # A trivial-prompt probe is even cleaner: 32/32 in 11.6s.
+        #
+        # Meanwhile the engine was using it as ONE serial worker taking MINUTES per
+        # step, at a measured 77 steps/hour across the whole 7-lane pool. The router
+        # is not the constraint - the lane COUNT is. So freeai gets the same
+        # treatment the stealth model got: several lanes on one endpoint, each its
+        # own pool identity, cooldown and in-flight call.
+        #
+        # A lane NAME is the pool's identity and cooldown key, so these must have
+        # distinct names. ORCH_FREEWISE_LANES sets the count (default 12).
+        # A router call can be a whole chain of upstream attempts, so it legitimately
+        # needs a long budget.
+        *[Lane("freeai" if i == 0 else f"freeai{i+1}",
+               "http://127.0.0.1:8790/v1/chat/completions",
+               ["freeai"], 60, 180, prompt_cap=24000, timeout=120)
+          for i in range(max(1, int(os.environ.get("ORCH_FREEWISE_LANES", "4"))))],
 
-        Lane("bitdeer", "https://api-inference.bitdeer.ai/v1/chat/completions",
+        # 10-05 KILL SWITCH: the $5 bitdeer voucher is SPENT. Measured during the
+        # 10_5 plan run: 155 failures, every one HTTP 402
+        # "insufficient balance", each burning a hop and a worker slot to return
+        # nothing. A lane that fails 100% of its draws is worse than an absent one.
+        # ORCH_BITDEER_ENABLED=1 brings it back the moment credit is added.
+        *([Lane("bitdeer", "https://api-inference.bitdeer.ai/v1/chat/completions",
              ["deepseek-ai/DeepSeek-V4-Flash", "deepseek-ai/DeepSeek-V4.1-Flash",
               "zai-org/GLM-5.3-Flash", "Qwen/Qwen3.8-27B", "zai-org/GLM-5.3"],
              60, 180, prompt_cap=24000, timeout=120,
-             auth=_env_key("BITDEER_API_KEY", "bitdeer_key.txt")),
+             auth=_env_key("BITDEER_API_KEY", "bitdeer_key.txt"))]
+           if os.environ.get("ORCH_BITDEER_ENABLED", "0") == "1" else []),
         # 09-13 (owner): ChatGPT webchat lane (Free account, text chat only —
         # image analysis is capped but text is unlimited). Gateway :8087 on the
         # owner's CDP 9224 Chrome. Four harness bugs had to be fixed first
@@ -1184,6 +1208,10 @@ class LanePool:
         self.log = log
         self._idx = 0
         self._lock = asyncio.Lock()
+        # 10-05: per-lane timestamp of the last failure, so a streak can DECAY. Without
+        # it only a success reset the count, so a lane that hiccuped once an hour climbed
+        # the same ladder forever and was benched for longer each time.
+        self._last_fail_ts: dict[str, float] = {}
         # 09-18: `pinned` was a plain attribute on the pool, i.e. ONE slot shared
         # by every worker. The queue driver starts one asyncio task per lane
         # (orch_queue.drive_plan) and each runs execute_step_pinned, which does
@@ -1230,6 +1258,29 @@ class LanePool:
             self.log(f"[lanes] gemini/{model} issue ignored — no cooldown "
                      f"(Bob rule: cooldowns are omniroute-only)")
             return
+        # 10-05 (owner: "do the fix properly"): freeai must NOT be ladder-cooled.
+        #
+        # Measured during the 10_5 run: the engine had 18 lanes but only 1-4 were
+        # claiming work in any given minute, because six or more sat in cooldown at
+        # all times - I logged ladder-cools of 60s, 345s, 360s, 645s, 1245s and one
+        # at 1800s. A benched lane produces nothing, and with a median step time of
+        # 196s that is why 18 lanes delivered ~144 steps/hour.
+        #
+        # A cooldown answers the question "when will THIS lane be healthy again". For
+        # freeai that question does not apply: it is a ROUTER, and a failure is one
+        # of the providers BEHIND it being slow or full. The router already fails
+        # open and walks its own ranked chain on the next request, so benching the
+        # lane punishes the wrong component. There are also 12 freeai lanes on the
+        # same endpoint, which means the retry cost is one hop, not one outage.
+        #
+        # So: no cooldown. Let the next pick retry it. The lanes exist precisely so a
+        # bad upstream is absorbed by a sibling instead of parking the pool.
+        if lane.name.startswith("freeai"):
+            lane.model_fails[model] = 0
+            lane.model_dead.pop(model, None)
+            self.log(f"[lanes] {lane.name}/{model} hiccup ignored — no cooldown "
+                     f"(freeai is a router; a sibling lane retries)")
+            return
         # 09-17: a lane that REFUSED a draw because its tab is still generating is not
         # failing - it is busy, and it will answer if we come back. Measured on chatgpt:
         # it needs ~360s per generation, so at the engine's draw rate it is busy almost
@@ -1240,6 +1291,37 @@ class LanePool:
             self.log(f"[lanes] {lane.name}/{model} busy (still generating) — "
                      f"no cooldown, retry on the next pick")
             return
+        # 10-05 REDESIGN (owner: "redesign the cooling ladder to work more effectively").
+        #
+        # What was wrong, measured on the 10_5 run: a cooldown is a BENCHING, and a
+        # benched lane produces nothing. The engine had 18 lanes and only 1-4 claiming
+        # per minute because 6+ sat cooled at all times - logged cooldowns of 60s,
+        # 345s, 360s, 645s, 1245s and 1800s, almost all of them on TRANSIENT errors
+        # (timeouts, 5xx, empty stream) that the very next attempt would have survived.
+        #
+        # A transient failure costs one HOP. Benching the lane costs MINUTES. The old
+        # ladder got that trade backwards, and it never decayed: a lane that hiccuped
+        # once an hour climbed the same streak forever because only a SUCCESS reset it.
+        #
+        # New policy - classify first, then price the cooldown:
+        #   TRANSIENT  (timeout, conn error, 5xx, empty/stall, upstream overload)
+        #       -> NO cooldown for the first two consecutive failures (retry on the next
+        #          pick); beyond that a SHORT bounded cool so a genuinely sick lane is
+        #          not hammered. Never the 60->360->1245 escalation.
+        #   CAPACITY   (429, quota, rate limit, free-pool-full)
+        #       -> honour an explicit Retry-After when present, else a bounded cool. This
+        #          is a real "come back later", but priced, not escalated blindly.
+        #   PERMANENT  (401/402/403/404, invalid key, insufficient balance)
+        #       -> park it long. The lane cannot serve until a human intervenes, and
+        #          retrying only burns hops.
+        # Streak DECAY: a failure more than STREAK_DECAY_S after the previous one starts
+        # a fresh count, so an occasional hiccup never accumulates into a long bench.
+        _now = time.time()
+        _prev_ts = self._last_fail_ts.get(lane.name)
+        _streak_decay = int(os.environ.get("ORCH_STREAK_DECAY_S", "900"))
+        if _prev_ts is not None and (_now - _prev_ts) > _streak_decay:
+            lane.model_fails[model] = 0
+        self._last_fail_ts[lane.name] = _now
         lane.model_fails[model] = lane.model_fails.get(model, 0) + 1
         streak = lane.model_fails[model]
         # 09-06: a per-DAY provider quota does not recover on the streak
@@ -1261,6 +1343,22 @@ class LanePool:
         # contains "rate_limit" — so a broad match gave an API lane the 15-min
         # WEBCHAT cooldown instead of its own 45s ladder and parked it for
         # nothing. Restrict this to the webchat lanes and the exact phrasing.
+        # Failure class. Checked most-specific-first: a body can carry both a code and
+        # prose, and the permanent/capacity signals are the ones that change behaviour.
+        _PERM = ("401", "402", "403", "404", "insufficient balance", "invalid api key",
+                 "unauthorized", "not currently offered", "model not found",
+                 "authentication", "invalid_api_key", "no such model")
+        # "overloaded" / "temporarily" are deliberately NOT capacity: an upstream saying
+        # it is overloaded right now is the textbook transient hiccup - the next request
+        # usually succeeds, and the old ladder benched a lane for it (measured: freeai's
+        # "Upstream error from Nvidia: Service temporarily overloaded" was one of the
+        # biggest sources of idle lanes).
+        _CAP = ("429", "rate limit", "rate_limit", "too frequent", "quota",
+                "capacity", "free_rate_limited", "free model capacity",
+                "at concurrency cap")
+        _kind = ("permanent" if any(k in low for k in _PERM)
+                 else "capacity" if any(k in low for k in _CAP)
+                 else "transient")
         _webchat = lane.name in ("deepseek", "deepseek2", "deepseek4",
                                  "deepseek5", "gemini", "kimi", "chatgpt", "notegpt")
         if _webchat and ("too frequent" in low or "messages too frequent" in low
@@ -1281,11 +1379,31 @@ class LanePool:
                 or "limit_rpd" in low):
             cool = _secs_to_utc_midnight()
             note = "DAILY quota exhausted - out until 00:00 UTC"
+        elif _kind == "permanent":
+            cool = int(os.environ.get("ORCH_COOL_PERMANENT_S", "3600"))
+            note = "PERMANENT (key/model/balance) - parked until a human fixes it"
+        elif _kind == "capacity":
+            _ra = re.search(r"retry[- _]?after[^0-9]{0,4}(\d{1,4})", low)
+            cool = int(_ra.group(1)) if _ra else int(
+                os.environ.get("ORCH_COOL_CAPACITY_S", "180"))
+            note = "capacity/rate limit (bounded)"
         else:
-            cool = self._ladder_s(lane, streak)
-            note = f"streak {streak}"
+            # TRANSIENT. Two free retries, then a short bounded cool. This is the
+            # branch that used to escalate to 1800s on a single timeout.
+            if streak <= 2:
+                cool = 0
+                note = f"transient (streak {streak}) - no cooldown, retry next pick"
+            else:
+                cool = min(int(os.environ.get("ORCH_COOL_TRANSIENT_MAX_S", "180")),
+                           30 * (streak - 2))
+                note = f"transient (streak {streak})"
+        if cool <= 0:
+            lane.model_dead.pop(model, None)
+            self.log(f"[lanes] {lane.name}/{model} {note}")
+            return
+        cool = min(cool, int(os.environ.get("ORCH_COOL_MAX_S", "3600")))
         lane.model_dead[model] = time.time() + cool
-        self.log(f"[lanes] {lane.name}/{model} ladder-cooled {cool}s ({note})")
+        self.log(f"[lanes] {lane.name}/{model} cooled {cool}s ({note})")
 
     def _pick(self, exclude: set[str]) -> Lane | None:
         # 09-14 (owner, per-step batch queue): a worker holds ONE lane for the
