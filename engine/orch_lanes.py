@@ -498,13 +498,17 @@ def default_lanes(cfg=None) -> list[Lane]:
         # own pool identity, cooldown and in-flight call.
         #
         # A lane NAME is the pool's identity and cooldown key, so these must have
-        # distinct names. ORCH_FREEWISE_LANES sets the count (default 12).
+        # distinct names. ORCH_FREEWISE_LANES sets the count (default 2).
+        # 10-06: 4 was too many. free-ai's whole chain is 19 keyless models and 4 concurrent
+        # engine lanes drove EVERY kilo id to streak=11, cooled the chain, and made free-ai
+        # answer 503 "every model is cooling down" to 21 steps. A keyless chain is shared
+        # capacity: 2 consumers is what it carries.
         # A router call can be a whole chain of upstream attempts, so it legitimately
         # needs a long budget.
         *[Lane("freeai" if i == 0 else f"freeai{i+1}",
                "http://127.0.0.1:8790/v1/chat/completions",
                ["freeai"], 60, 180, prompt_cap=24000, timeout=120)
-          for i in range(max(1, int(os.environ.get("ORCH_FREEWISE_LANES", "4"))))],
+          for i in range(max(1, int(os.environ.get("ORCH_FREEWISE_LANES", "2"))))],
 
         # 10-05 KILL SWITCH: the $5 bitdeer voucher is SPENT. Measured during the
         # 10_5 plan run: 155 failures, every one HTTP 402
