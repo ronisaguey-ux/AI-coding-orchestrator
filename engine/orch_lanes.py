@@ -274,7 +274,6 @@ def default_lanes(cfg=None) -> list[Lane]:
                             "dots-studio/dots-3-note-preview:free",
                             "liquid/lfm-2.5-2.6b:free",
                             "nvidia/nemotron-3.5-lightning:free",
-                            "thinkingmachines/inkling-small:free",
                             "poolside/laguna-s-2.1:free",
                             "poolside/laguna-xs-2.1:free",
                             "cohere/north-mini-code:free",
