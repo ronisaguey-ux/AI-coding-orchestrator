@@ -72,6 +72,14 @@ _TRANSPORT_MARKERS = (
     # is not supported`, i.e. the whole round budget went on a model the provider had
     # already withdrawn. Those steps never received a considered answer.
     "http 401", "[401]", "is not supported (HTTP", "model is not supported",
+    # 10-06: free-ai answers 503 "every model is cooling down" when its whole keyless
+    # chain is rate-limited. That is the pool being empty, not a verdict about the code.
+    # Measured: 2 of the last 6 steps burned rounds on it.
+    "every model is cooling", "model is cooling down",
+    # 10-06: a provider that gates a :free model to its own app ("only available on
+    # agentic harnesses") is the same class - reached, but could not answer. OpenRouter
+    # served this for inkling:free and opencode zen serves it for big-pickle.
+    "only available on agentic harnesses", "can only be used from within",
 )
 
 
