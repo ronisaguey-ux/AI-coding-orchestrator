@@ -47,16 +47,24 @@ def _pat() -> str:
 
 
 def _remote_with_token() -> str:
-    """Ensure origin embeds the PAT so pushes never prompt."""
+    """Return the push remote, routed through the commit-condom proxy.
+
+    The engine used to embed the PAT in origin's URL
+    (``https://x-access-token:<pat>@github.com/...``). That form does NOT match
+    the proxy's ``url.https://github.com/.insteadOf`` rewrite, so it went
+    straight to GitHub and skipped the gate entirely.
+
+    The remote is now the plain HTTPS URL. The machine-wide rewrite sends it to
+    the local commit-condom proxy, which holds the real PAT and enforces the
+    push policy. No credential is embedded here, so there is nothing to leak
+    into a log or a pushed ref.
+    """
     out = _run(["git", "remote", "get-url", "origin"]).stdout.strip()
-    token = _pat()
-    if not token:
-        return out  # will fail later with a clear error
-    if "x-access-token:" in out and token in out:
-        return out
-    new = f"https://x-access-token:{token}@github.com/ronisaguey-ux/OCULUS.git"
-    _run(["git", "remote", "set-url", "origin", new])
-    return new
+    if "x-access-token:" in out:
+        plain = re.sub(r"https://x-access-token:[^@]+@", "https://", out)
+        _run(["git", "remote", "set-url", "origin", plain])
+        return plain
+    return out
 
 
 def _files_of(rec: dict) -> list[str]:
