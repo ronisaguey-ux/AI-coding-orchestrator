@@ -26,26 +26,6 @@ def _run(cmd, cwd=None, timeout=120):
                           timeout=timeout, check=False)
 
 
-def _pat() -> str:
-    """Read the orchestration PAT.
-
-    Prefer $ORCH_GIT_PAT, then the 0600 file at ~/.config/orch/pat.txt, then the
-    token already embedded in origin. `gh auth token` is deliberately NOT used:
-    gh is not logged in on this box (returns empty), which silently disabled
-    every push (engine committed locally, origin never advanced)."""
-    tok = os.environ.get("ORCH_GIT_PAT", "").strip()
-    if tok:
-        return tok
-    p = Path(os.path.expanduser("~/.config/orch/pat.txt"))
-    if p.exists():
-        tok = p.read_text(encoding="utf-8").strip()
-        if tok:
-            return tok
-    out = _run(["git", "remote", "get-url", "origin"]).stdout.strip()
-    m = re.search(r"x-access-token:([^@]+)@", out)
-    return m.group(1) if m else ""
-
-
 def _remote_with_token() -> str:
     """Return the push remote, routed through the commit-condom proxy.
 
