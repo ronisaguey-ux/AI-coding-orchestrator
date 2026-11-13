@@ -1,0 +1,61 @@
+{
+  "enginePy": "/home/roni/Roni_workspace/AI-coding-orchestrator/engine/audit.py",
+  "python": "",
+  "aggregateUrl": "http://127.0.0.1:8090/v1",
+  "apiKeyName": "DEEPSEEK_API_KEY",
+  "apiKeyValue": "harness",
+  "outputDir": "/home/roni/Roni_workspace/audits_plans",
+  "passes": 2,
+  "batchSize": 5,
+  "concurrency": 8,
+  "resume": true,
+  "chatTimeout": 300,
+  "chatMaxTokens": 8000,
+  "requireSubstantive": true,
+  "maxEmptyRotations": 2,
+  "modelAllowlist": [
+    "or-nvidia/nemotron-3-ultra-550b-a55b:free",
+    "or-nvidia/nemotron-3-super-120b-a12b:free",
+    "or-nvidia/nemotron-3.5-lightning:free",
+    "or-poolside/laguna-s-2.1:free",
+    "or-nex-agi/nex-n2.5-pro:free"
+  ],
+  "primaryModel": "auto/best-reasoning",
+  "targets": {
+    "helpotron": {
+      "dir": "/home/roni/Roni_workspace/helpotron",
+      "label": "helpotron",
+      "readme": "/home/roni/Roni_workspace/helpotron/README.md",
+      "sot": "",
+      "graph": "",
+      "includeFiles": "/home/roni/Roni_workspace/helpotron/server/api_keys.py,/home/roni/Roni_workspace/helpotron/server/security.py,/home/roni/Roni_workspace/helpotron/server/credits.py,/home/roni/Roni_workspace/helpotron/server/payments.py,/home/roni/Roni_workspace/helpotron/server/admin.py,/home/roni/Roni_workspace/helpotron/server/admin_audit.py,/home/roni/Roni_workspace/helpotron/server/overlord_agent.py,/home/roni/Roni_workspace/helpotron/server/datalake.py,/home/roni/Roni_workspace/helpotron/server/user_settings_service.py,/home/roni/Roni_workspace/helpotron/extension/background.js,/home/roni/Roni_workspace/helpotron/extension/content.js,/home/roni/Roni_workspace/helpotron/server/metering.py,/home/roni/Roni_workspace/helpotron/server/llm.py,/home/roni/Roni_workspace/helpotron/server/humanize_skill.py,/home/roni/Roni_workspace/helpotron/server/resource_guard.py",
+      "extraRoots": "",
+      "task": ""
+    },
+    "t2b": {
+      "dir": "/home/roni/Roni_workspace/t2b",
+      "label": "t2b",
+      "readme": "/home/roni/Roni_workspace/t2b/README.md",
+      "sot": "",
+      "graph": "",
+      "includeFiles": "/home/roni/Roni_workspace/t2b/roofing-lead-bot/api/consent.py,/home/roni/Roni_workspace/t2b/roofing-lead-bot/api/leads.py,/home/roni/Roni_workspace/t2b/roofing-lead-bot/api/auth.py,/home/roni/Roni_workspace/t2b/roofing-lead-bot/app.py,/home/roni/Roni_workspace/t2b/roofing-lead-bot/config.py,/home/roni/Roni_workspace/t2b/roofing-lead-bot/ai_filter.py,/home/roni/Roni_workspace/t2b/roofing-lead-bot/judge.py,/home/roni/Roni_workspace/t2b/roofing-lead-bot/delivery.py,/home/roni/Roni_workspace/t2b/roofing-lead-bot/channels.py,/home/roni/Roni_workspace/t2b/frontend/assets/js/consumer.js",
+      "extraRoots": "",
+      "task": ""
+    },
+    "harness": {
+      "dir": "/home/roni/Roni_workspace/webchat_worker/harness",
+      "label": "webchat-to-api-harness",
+      "readme": "/home/roni/Roni_workspace/webchat_worker/harness/README.md",
+      "sot": "",
+      "graph": "",
+      "includeFiles": "/home/roni/Roni_workspace/webchat_worker/harness/src/tools/tools.js,/home/roni/Roni_workspace/webchat_worker/harness/src/tools/sandbox.js,/home/roni/Roni_workspace/webchat_worker/harness/src/tools/limits.js,/home/roni/Roni_workspace/webchat_worker/harness/cli/hub.js,/home/roni/Roni_workspace/webchat_worker/harness/cli/hub-server.js,/home/roni/Roni_workspace/webchat_worker/harness/cli/gates.js,/home/roni/Roni_workspace/webchat_worker/harness/cli/daemon.js,/home/roni/Roni_workspace/webchat_worker/harness/cli/launchconfig.js,/home/roni/Roni_workspace/webchat_worker/harness/cli/settings.js,/home/roni/Roni_workspace/webchat_worker/harness/server.js,/home/roni/Roni_workspace/webchat_worker/harness/src/browser/browser.js,/home/roni/Roni_workspace/webchat_worker/harness/src/runtime/subagents.js,/home/roni/Roni_workspace/webchat_worker/harness/src/models/webchat-models.js,/home/roni/Roni_workspace/webchat_worker/harness/src/core/config.js,/home/roni/Roni_workspace/webchat_worker/harness/src/tools/mcp-server.js",
+      "extraRoots": "",
+      "task": ""
+    }
+  },
+  "activeTarget": "helpotron",
+  "dashboard": {
+    "refreshSeconds": 5,
+    "showPacing": true
+  }
+}
